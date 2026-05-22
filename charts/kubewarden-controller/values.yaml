@@ -336,7 +336,7 @@ auditScanner:
     tag: v1.36.0-beta.1
     pullPolicy: IfNotPresent
   cronJob:
-    schedule: "*/60 * * * *" # every 60 minutes
+    schedule: "0 * * * *" # every 60 minutes
     failedJobsHistoryLimit: 5
     successfulJobsHistoryLimit: 3
   containerRestartPolicy: Never
