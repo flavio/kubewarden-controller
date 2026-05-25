@@ -5,7 +5,7 @@ pub(crate) mod field_mask;
 mod reflector;
 
 use anyhow::{Result, anyhow};
-use cached::proc_macro::cached;
+use cached::macros::cached;
 use k8s_openapi::api::authorization::v1::SubjectAccessReviewStatus;
 use kube::core::ObjectList;
 use kubewarden_policy_sdk::host_capabilities::kubernetes::SubjectAccessReview as KWSubjectAccessReview;
@@ -99,7 +99,7 @@ pub(crate) async fn get_resource(
 }
 
 #[cached(
-    time = 5,
+    ttl = 5,
     result = true,
     sync_writes = "default",
     key = "String",
@@ -185,7 +185,7 @@ pub(crate) async fn can_i(
 }
 
 #[cached(
-    time = 5,
+    ttl = 5,
     result = true,
     // We can use the request type as key because cached requires the key to implement Hash + Eq
     // traits. As we already implement these traits, there is no need to have a custom logic for key

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use cached::proc_macro::cached;
+use cached::macros::cached;
 use kubewarden_policy_sdk::host_capabilities::oci::ManifestDigestResponse;
 use policy_fetcher::{
     oci_client::{
@@ -85,7 +85,7 @@ impl Client {
 //   * the cache is time bound: cached values are purged after 60 seconds
 //   * only successful results are cached
 #[cached(
-    time = 60,
+    ttl = 60,
     result = true,
     sync_writes = "default",
     key = "String",
@@ -113,7 +113,7 @@ pub(crate) async fn get_oci_digest_cached(
 //   * the cache is time bound: cached values are purged after 60 seconds
 //   * only successful results are cached
 #[cached(
-    time = 60,
+    ttl = 60,
     result = true,
     sync_writes = "default",
     key = "String",
@@ -128,7 +128,7 @@ pub(crate) async fn get_oci_manifest_cached(
 }
 
 #[cached(
-    time = 60,
+    ttl = 60,
     result = true,
     sync_writes = "default",
     key = "String",
