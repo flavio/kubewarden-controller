@@ -306,18 +306,14 @@ pub async fn fetch_sigstore_remote_data(
     let image_name = reference.whole();
     let image_oci_ref = OciReference::from_str(&image_name)
         .map_err(VerifyError::FailedToFetchTrustedLayersError)?;
-    let (cosign_signature_image, source_image_digest) = cosign_client
+    let (_, source_image_digest) = cosign_client
         .triangulate(&image_oci_ref, &sigstore_auth)
         .await
         .map_err(VerifyError::FailedToFetchTrustedLayersError)?;
 
     // get trusted layers
     let layers = cosign_client
-        .trusted_signature_layers(
-            &sigstore_auth,
-            &source_image_digest,
-            &cosign_signature_image,
-        )
+        .trusted_signature_layers(&sigstore_auth, &image_oci_ref)
         .await
         .map_err(|e| match e {
             SigstoreError::RegistryPullManifestError { image: _, error: _ } => {

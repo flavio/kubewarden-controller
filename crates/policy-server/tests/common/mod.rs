@@ -20,7 +20,7 @@ static START: Once = Once::new();
 /// Common setup for tests. This function should be called at the beginning of each test.
 pub(crate) fn setup() {
     START.call_once(|| {
-        // Add common setup code here
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     });
 }
 
