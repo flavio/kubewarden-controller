@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use anyhow::{Result, anyhow};
-use cached::proc_macro::cached;
+use cached::macros::cached;
 use itertools::Itertools;
 use kubewarden_policy_sdk::host_capabilities::verification::{
     KeylessInfo, KeylessPrefixInfo, VerificationResponse,
@@ -266,7 +266,7 @@ impl Client {
 //   * the cache is time bound: cached values are purged after 60 seconds
 //   * only successful results are cached
 #[cached(
-    time = 60,
+    ttl = 60,
     result = true,
     sync_writes = "default",
     key = "String",
@@ -293,7 +293,7 @@ pub(crate) async fn get_sigstore_pub_key_verification_cached(
 //   * the cache is time bound: cached values are purged after 60 seconds
 //   * only successful results are cached
 #[cached(
-    time = 60,
+    ttl = 60,
     result = true,
     sync_writes = "default",
     key = "String",
@@ -320,7 +320,7 @@ pub(crate) async fn get_sigstore_keyless_verification_cached(
 //   * the cache is time bound: cached values are purged after 60 seconds
 //   * only successful results are cached
 #[cached(
-    time = 60,
+    ttl = 60,
     result = true,
     sync_writes = "default",
     key = "String",
@@ -347,7 +347,7 @@ pub(crate) async fn get_sigstore_keyless_prefix_verification_cached(
 //   * the cache is time bound: cached values are purged after 60 seconds
 //   * only successful results are cached
 #[cached(
-    time = 60,
+    ttl = 60,
     result = true,
     sync_writes = "default",
     key = "String",
@@ -403,7 +403,7 @@ fn get_sigstore_certificate_verification_cache_key(
 }
 
 #[cached(
-    time = 60,
+    ttl = 60,
     result = true,
     sync_writes = "default",
     key = "String",
