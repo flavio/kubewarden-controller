@@ -17,7 +17,7 @@ async-trait = "0.1"
 base64 = { workspace = true }
 cfg-if = "1.0"
 directories = "6.0"
-docker_credential = { git = "https://github.com/flavio/docker_credential.git", branch = "fix-handle-config-without-auth-field" }
+docker_credential = "1.4"
 futures = { workspace = true }
 hex = { workspace = true }
 lazy_static = { workspace = true }
