@@ -34,7 +34,7 @@ func TestClusterAdmissionPolicyDefault(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, constants.DefaultPolicyServer, policy.GetPolicyServer())
-	assert.Contains(t, policy.GetFinalizers(), constants.KubewardenFinalizer)
+	assert.NotContains(t, policy.GetFinalizers(), constants.KubewardenFinalizer)
 }
 
 func TestClusterAdmissionPolicyValidateCreate(t *testing.T) {

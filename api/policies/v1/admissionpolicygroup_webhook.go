@@ -19,7 +19,6 @@ import (
 	"fmt"
 
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	"github.com/go-logr/logr"
@@ -58,9 +57,6 @@ func (d *admissionPolicyGroupDefaulter) Default(_ context.Context, admissionPoli
 
 	if admissionPolicyGroup.Spec.PolicyServer == "" {
 		admissionPolicyGroup.Spec.PolicyServer = constants.DefaultPolicyServer
-	}
-	if admissionPolicyGroup.ObjectMeta.DeletionTimestamp == nil {
-		controllerutil.AddFinalizer(admissionPolicyGroup, constants.KubewardenFinalizer)
 	}
 
 	return nil
