@@ -132,6 +132,14 @@ func (r *policySubReconciler) reconcilePolicy(ctx context.Context, policy polici
 		return ctrl.Result{}, errors.Join(errors.New("cannot find policy server secret"), err)
 	}
 
+	// Add the controller's finalizer here to avoid webhook orphans
+	if !controllerutil.ContainsFinalizer(policy, constants.KubewardenFinalizer) {
+		controllerutil.AddFinalizer(policy, constants.KubewardenFinalizer)
+		if err = r.Update(ctx, policy); err != nil {
+			return ctrl.Result{}, fmt.Errorf("cannot add finalizer to policy: %w", err)
+		}
+	}
+
 	if err = r.reconcileWebhookConfiguration(ctx, policy, &secret, policyServer.NameWithPrefix()); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -148,7 +156,16 @@ func (r *policySubReconciler) reconcilePolicyServerUnavailable(ctx context.Conte
 	if err := r.deleteWebhookConfiguration(ctx, policy); err != nil {
 		return ctrl.Result{}, err
 	}
+
+	// The webhook is gone and the policy server is being deleted. We can remove
+	// the policy finalizer
+	controllerutil.RemoveFinalizer(policy, constants.KubewardenFinalizer)
+	controllerutil.RemoveFinalizer(policy, constants.KubewardenFinalizerPre114)
+	if err := r.Update(ctx, policy); err != nil {
+		return ctrl.Result{}, fmt.Errorf("cannot update policy: %w", err)
+	}
 	policy.SetStatus(policiesv1.PolicyStatusScheduled)
+
 	return ctrl.Result{}, nil
 }
 
