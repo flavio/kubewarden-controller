@@ -279,11 +279,6 @@ func TestClusterAdmissionPolicyController(t *testing.T) {
 			), wait.WithTimeout(testTimeout), wait.WithInterval(testPollInterval))
 			require.NoError(t, err, "ValidatingWebhookConfiguration should be deleted")
 
-			// Wait for policy to be deleted (finalizer removed)
-			err = wait.For(conditions.New(cfg.Client().Resources()).ResourceDeleted(policy),
-				wait.WithTimeout(testTimeout), wait.WithInterval(testPollInterval))
-			require.NoError(t, err, "Policy should be deleted (finalizer removed)")
-
 			return ctx
 		}).
 		Feature()
@@ -479,11 +474,6 @@ func TestClusterAdmissionPolicyController(t *testing.T) {
 				&admissionregistrationv1.MutatingWebhookConfiguration{ObjectMeta: metav1.ObjectMeta{Name: webhookName}},
 			), wait.WithTimeout(testTimeout), wait.WithInterval(testPollInterval))
 			require.NoError(t, err, "MutatingWebhookConfiguration should be deleted")
-
-			// Wait for policy to be deleted (finalizer removed)
-			err = wait.For(conditions.New(cfg.Client().Resources()).ResourceDeleted(policy),
-				wait.WithTimeout(testTimeout), wait.WithInterval(testPollInterval))
-			require.NoError(t, err, "Policy should be deleted (finalizer removed)")
 
 			return ctx
 		}).

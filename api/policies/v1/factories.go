@@ -110,12 +110,9 @@ func (f *AdmissionPolicyFactory) Build() *AdmissionPolicy {
 			Name:      f.name,
 			Namespace: f.namespace,
 			Finalizers: []string{
-				// On a real cluster the Kubewarden finalizer is added by our mutating
-				// webhook. This is not running now, hence we have to manually add the finalizer
-				constants.KubewardenFinalizer,
-				// By adding this finalizer automatically, we ensure that when
-				// testing removal of finalizers on deleted objects, that they will
-				// exist at all times
+				// Safety-net finalizer that prevents the API server from garbage-
+				// collecting the object during integration tests, so test assertions
+				// can observe the controller's behavior before deletion completes.
 				integrationTestsFinalizer,
 			},
 		},
@@ -224,12 +221,9 @@ func (f *ClusterAdmissionPolicyFactory) Build() *ClusterAdmissionPolicy {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: f.name,
 			Finalizers: []string{
-				// On a real cluster the Kubewarden finalizer is added by our mutating
-				// webhook. This is not running now, hence we have to manually add the finalizer
-				constants.KubewardenFinalizer,
-				// By adding this finalizer automatically, we ensure that when
-				// testing removal of finalizers on deleted objects, that they will
-				// exist at all times
+				// Safety-net finalizer that prevents the API server from garbage-
+				// collecting the object during integration tests, so test assertions
+				// can observe the controller's behavior before deletion completes.
 				integrationTestsFinalizer,
 			},
 		},
@@ -328,12 +322,9 @@ func (f *AdmissionPolicyGroupFactory) Build() *AdmissionPolicyGroup {
 			Name:      f.name,
 			Namespace: f.namespace,
 			Finalizers: []string{
-				// On a real cluster the Kubewarden finalizer is added by our mutating
-				// webhook. This is not running now, hence we have to manually add the finalizer
-				constants.KubewardenFinalizer,
-				// By adding this finalizer automatically, we ensure that when
-				// testing removal of finalizers on deleted objects, that they will
-				// exist at all times
+				// Safety-net finalizer that prevents the API server from garbage-
+				// collecting the object during integration tests, so test assertions
+				// can observe the controller's behavior before deletion completes.
 				integrationTestsFinalizer,
 			},
 		},
@@ -455,12 +446,9 @@ func (f *ClusterAdmissionPolicyGroupFactory) Build() *ClusterAdmissionPolicyGrou
 		ObjectMeta: metav1.ObjectMeta{
 			Name: f.name,
 			Finalizers: []string{
-				// On a real cluster the Kubewarden finalizer is added by our mutating
-				// webhook. This is not running now, hence we have to manually add the finalizer
-				constants.KubewardenFinalizer,
-				// By adding this finalizer automatically, we ensure that when
-				// testing removal of finalizers on deleted objects, that they will
-				// exist at all times
+				// Safety-net finalizer that prevents the API server from garbage-
+				// collecting the object during integration tests, so test assertions
+				// can observe the controller's behavior before deletion completes.
 				integrationTestsFinalizer,
 			},
 		},
