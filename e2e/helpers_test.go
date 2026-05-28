@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"context"
+	"slices"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -93,4 +94,9 @@ func verifyWebhookMetadata(labels, annotations map[string]string, policyName, po
 		return false
 	}
 	return true
+}
+
+// containsFinalizer checks if a finalizer exists in the finalizers list.
+func containsFinalizer(finalizers []string, finalizer string) bool {
+	return slices.Contains(finalizers, finalizer)
 }
