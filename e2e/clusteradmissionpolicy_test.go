@@ -622,22 +622,19 @@ func TestClusterAdmissionPolicyController(t *testing.T) {
 			err := cfg.Client().Resources().Delete(ctx, policyServer)
 			require.NoError(t, err)
 
-			// Verify finalizer is removed from policy
+			// Verify finalizer is removed from policy and status transitioned
+			// to Scheduled. The finalizer removal (metadata Update) and the
+			// status transition are separate API writes, so we must wait for
+			// both to converge before asserting.
 			err = wait.For(conditions.New(cfg.Client().Resources()).ResourceMatch(
 				&policiesv1.ClusterAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: policyName}},
 				func(object k8s.Object) bool {
 					p := object.(*policiesv1.ClusterAdmissionPolicy)
-					return !containsFinalizer(p.GetFinalizers(), constants.KubewardenFinalizer)
+					return !containsFinalizer(p.GetFinalizers(), constants.KubewardenFinalizer) &&
+						p.Status.PolicyStatus == policiesv1.PolicyStatusScheduled
 				},
 			), wait.WithTimeout(testTimeout), wait.WithInterval(testPollInterval))
-			require.NoError(t, err, "Finalizer should be removed when PolicyServer is deleted")
-
-			// Verify policy status transitioned to scheduled
-			var policy policiesv1.ClusterAdmissionPolicy
-			err = cfg.Client().Resources().Get(ctx, policyName, "", &policy)
-			require.NoError(t, err)
-			require.Equal(t, policiesv1.PolicyStatusScheduled, policy.Status.PolicyStatus,
-				"Policy should be scheduled after PolicyServer deletion")
+			require.NoError(t, err, "Finalizer should be removed and policy should be Scheduled after PolicyServer deletion")
 
 			return ctx
 		}).
