@@ -18,7 +18,6 @@ import (
 	"context"
 	"fmt"
 
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -58,9 +57,6 @@ func (d *clusterAdmissionPolicyGroupDefaulter) Default(_ context.Context, cluste
 
 	if clusterAdmissionPolicyGroup.Spec.PolicyServer == "" {
 		clusterAdmissionPolicyGroup.Spec.PolicyServer = constants.DefaultPolicyServer
-	}
-	if clusterAdmissionPolicyGroup.ObjectMeta.DeletionTimestamp == nil {
-		controllerutil.AddFinalizer(clusterAdmissionPolicyGroup, constants.KubewardenFinalizer)
 	}
 
 	return nil

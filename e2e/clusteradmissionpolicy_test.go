@@ -265,8 +265,18 @@ func TestClusterAdmissionPolicyController(t *testing.T) {
 			policy := ctx.Value(policyKey).(*policiesv1.ClusterAdmissionPolicy)
 			webhookName := policy.GetUniqueName()
 
+			// Fetch the latest policy state from the API. The object stored in
+			// context was captured before the controller added the finalizer.
+			var latestPolicy policiesv1.ClusterAdmissionPolicy
+			err := cfg.Client().Resources().Get(ctx, policy.GetName(), "", &latestPolicy)
+			require.NoError(t, err)
+
+			// Verify policy has finalizer before deletion
+			require.True(t, containsFinalizer(latestPolicy.GetFinalizers(), constants.KubewardenFinalizer),
+				"Policy should have finalizer before deletion")
+
 			// Delete the policy
-			err := cfg.Client().Resources().Delete(ctx, policy)
+			err = cfg.Client().Resources().Delete(ctx, &latestPolicy)
 			require.NoError(t, err)
 
 			// Wait for webhook to be deleted
@@ -457,8 +467,18 @@ func TestClusterAdmissionPolicyController(t *testing.T) {
 			policy := ctx.Value(policyKey).(*policiesv1.ClusterAdmissionPolicy)
 			webhookName := policy.GetUniqueName()
 
+			// Fetch the latest policy state from the API. The object stored in
+			// context was captured before the controller added the finalizer.
+			var latestPolicy policiesv1.ClusterAdmissionPolicy
+			err := cfg.Client().Resources().Get(ctx, policy.GetName(), "", &latestPolicy)
+			require.NoError(t, err)
+
+			// Verify policy has finalizer before deletion
+			require.True(t, containsFinalizer(latestPolicy.GetFinalizers(), constants.KubewardenFinalizer),
+				"Policy should have finalizer before deletion")
+
 			// Delete the policy
-			err := cfg.Client().Resources().Delete(ctx, policy)
+			err = cfg.Client().Resources().Delete(ctx, &latestPolicy)
 			require.NoError(t, err)
 
 			// Wait for webhook to be deleted
@@ -507,6 +527,13 @@ func TestClusterAdmissionPolicyController(t *testing.T) {
 			), wait.WithTimeout(testTimeout), wait.WithInterval(testPollInterval))
 			require.NoError(t, err, "Policy should have scheduled status")
 
+			// Verify policy does NOT have finalizer when scheduled (not active)
+			var policy policiesv1.ClusterAdmissionPolicy
+			err = cfg.Client().Resources().Get(ctx, policyName, "", &policy)
+			require.NoError(t, err)
+			require.False(t, containsFinalizer(policy.GetFinalizers(), constants.KubewardenFinalizer),
+				"Policy should NOT have finalizer when scheduled (not active)")
+
 			return ctx
 		}).
 		Assess("should set the policy status to active when the PolicyServer is created", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
@@ -546,5 +573,151 @@ func TestClusterAdmissionPolicyController(t *testing.T) {
 		}).
 		Feature()
 
-	testenv.Test(t, timeoutValidationFeature, validatingFeature, mutatingFeature, scheduledFeature)
+	policyServerDeletionFeature := features.New("PolicyServer deletion with active policies").
+		Setup(func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			// Add scheme
+			err := policiesv1.AddToScheme(cfg.Client().Resources().GetScheme())
+			require.NoError(t, err)
+
+			// Create PolicyServer
+			policyServerName := policiesv1.NewPolicyServerFactory().Build().Name
+			policyServer := policiesv1.NewPolicyServerFactory().
+				WithName(policyServerName).
+				Build()
+			err = createPolicyServerAndWaitForItsService(ctx, cfg, policyServer)
+			require.NoError(t, err)
+
+			// Create policy and wait for it to become active
+			policyName := policiesv1.NewClusterAdmissionPolicyFactory().Build().Name
+			policy := policiesv1.NewClusterAdmissionPolicyFactory().
+				WithName(policyName).
+				WithPolicyServer(policyServerName).
+				Build()
+			err = cfg.Client().Resources().Create(ctx, policy)
+			require.NoError(t, err)
+
+			// Wait for active status (implies finalizer is added)
+			err = wait.For(conditions.New(cfg.Client().Resources()).ResourceMatch(
+				&policiesv1.ClusterAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: policyName}},
+				func(object k8s.Object) bool {
+					p := object.(*policiesv1.ClusterAdmissionPolicy)
+					return p.Status.PolicyStatus == policiesv1.PolicyStatusActive
+				},
+			), wait.WithTimeout(testTimeout), wait.WithInterval(testPollInterval))
+			require.NoError(t, err, "Policy should transition to active status")
+
+			ctx = context.WithValue(ctx, policyServerNameKey, policyServerName)
+			ctx = context.WithValue(ctx, policyNameKey, policyName)
+
+			return ctx
+		}).
+		Assess("should have finalizer when policy is active", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			policyName := ctx.Value(policyNameKey).(string)
+
+			// Verify policy has finalizer when active
+			var policy policiesv1.ClusterAdmissionPolicy
+			err := cfg.Client().Resources().Get(ctx, policyName, "", &policy)
+			require.NoError(t, err)
+			require.True(t, containsFinalizer(policy.GetFinalizers(), constants.KubewardenFinalizer),
+				"Policy should have finalizer when active")
+
+			return ctx
+		}).
+		Assess("should remove finalizer when PolicyServer is deleted", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			policyServerName := ctx.Value(policyServerNameKey).(string)
+			policyName := ctx.Value(policyNameKey).(string)
+
+			// Delete the PolicyServer
+			policyServer := &policiesv1.PolicyServer{
+				ObjectMeta: metav1.ObjectMeta{Name: policyServerName, Namespace: namespace},
+			}
+			err := cfg.Client().Resources().Delete(ctx, policyServer)
+			require.NoError(t, err)
+
+			// Verify finalizer is removed from policy and status transitioned
+			// to Scheduled. The finalizer removal (metadata Update) and the
+			// status transition are separate API writes, so we must wait for
+			// both to converge before asserting.
+			err = wait.For(conditions.New(cfg.Client().Resources()).ResourceMatch(
+				&policiesv1.ClusterAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: policyName}},
+				func(object k8s.Object) bool {
+					p := object.(*policiesv1.ClusterAdmissionPolicy)
+					return !containsFinalizer(p.GetFinalizers(), constants.KubewardenFinalizer) &&
+						p.Status.PolicyStatus == policiesv1.PolicyStatusScheduled
+				},
+			), wait.WithTimeout(testTimeout), wait.WithInterval(testPollInterval))
+			require.NoError(t, err, "Finalizer should be removed and policy should be Scheduled after PolicyServer deletion")
+
+			return ctx
+		}).
+		Assess("should remove old finalizer from upgrade scenario", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			// Create a new PolicyServer for the upgrade test
+			upgradePSName := policiesv1.NewPolicyServerFactory().Build().Name
+			upgradePolicyName := policiesv1.NewPolicyServerFactory().Build().Name
+
+			policyServer := policiesv1.NewPolicyServerFactory().
+				WithName(upgradePSName).
+				Build()
+			err := createPolicyServerAndWaitForItsService(ctx, cfg, policyServer)
+			require.NoError(t, err)
+
+			// Create policy with BOTH old and new finalizers (simulating upgrade from pre-1.14)
+			policy := policiesv1.NewClusterAdmissionPolicyFactory().
+				WithName(upgradePolicyName).
+				WithPolicyServer(upgradePSName).
+				Build()
+
+			// Manually add both finalizers to simulate upgrade scenario
+			policy.SetFinalizers([]string{constants.KubewardenFinalizer, constants.KubewardenFinalizerPre114})
+			err = cfg.Client().Resources().Create(ctx, policy)
+			require.NoError(t, err)
+
+			// Wait for policy to become active
+			err = wait.For(conditions.New(cfg.Client().Resources()).ResourceMatch(
+				&policiesv1.ClusterAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: upgradePolicyName}},
+				func(object k8s.Object) bool {
+					p := object.(*policiesv1.ClusterAdmissionPolicy)
+					return p.Status.PolicyStatus == policiesv1.PolicyStatusActive
+				},
+			), wait.WithTimeout(testTimeout), wait.WithInterval(testPollInterval))
+			require.NoError(t, err)
+
+			// Delete the PolicyServer
+			err = cfg.Client().Resources().Delete(ctx, &policiesv1.PolicyServer{
+				ObjectMeta: metav1.ObjectMeta{Name: upgradePSName, Namespace: namespace},
+			})
+			require.NoError(t, err)
+
+			// Verify BOTH finalizers are removed (backward compatibility)
+			err = wait.For(conditions.New(cfg.Client().Resources()).ResourceMatch(
+				&policiesv1.ClusterAdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: upgradePolicyName}},
+				func(object k8s.Object) bool {
+					p := object.(*policiesv1.ClusterAdmissionPolicy)
+					return !containsFinalizer(p.GetFinalizers(), constants.KubewardenFinalizer) &&
+						!containsFinalizer(p.GetFinalizers(), constants.KubewardenFinalizerPre114)
+				},
+			), wait.WithTimeout(testTimeout), wait.WithInterval(testPollInterval))
+			require.NoError(t, err, "Both old and new finalizers should be removed (upgrade scenario)")
+
+			// Cleanup
+			_ = cfg.Client().Resources().Delete(ctx, &policiesv1.ClusterAdmissionPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: upgradePolicyName},
+			})
+
+			return ctx
+		}).
+		Teardown(func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			policyName := ctx.Value(policyNameKey).(string)
+
+			// Cleanup policy
+			policy := &policiesv1.ClusterAdmissionPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: policyName},
+			}
+			_ = cfg.Client().Resources().Delete(ctx, policy)
+
+			return ctx
+		}).
+		Feature()
+
+	testenv.Test(t, timeoutValidationFeature, validatingFeature, mutatingFeature, scheduledFeature, policyServerDeletionFeature)
 }

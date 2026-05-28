@@ -48,7 +48,7 @@ type policySubReconciler struct {
 
 func (r *policySubReconciler) reconcile(ctx context.Context, policy policiesv1.Policy) (ctrl.Result, error) {
 	if policy.GetDeletionTimestamp() != nil {
-		return r.reconcilePolicyDeletion(ctx, policy)
+		return ctrl.Result{}, r.removePolicyWebhooksAndFinalizers(ctx, policy)
 	}
 
 	reconcileResult, reconcileErr := r.reconcilePolicy(ctx, policy)
@@ -132,6 +132,14 @@ func (r *policySubReconciler) reconcilePolicy(ctx context.Context, policy polici
 		return ctrl.Result{}, errors.Join(errors.New("cannot find policy server secret"), err)
 	}
 
+	// Add the controller's finalizer here to avoid webhook orphans
+	if !controllerutil.ContainsFinalizer(policy, constants.KubewardenFinalizer) {
+		controllerutil.AddFinalizer(policy, constants.KubewardenFinalizer)
+		if err = r.Update(ctx, policy); err != nil {
+			return ctrl.Result{}, fmt.Errorf("cannot add finalizer to policy: %w", err)
+		}
+	}
+
 	if err = r.reconcileWebhookConfiguration(ctx, policy, &secret, policyServer.NameWithPrefix()); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -145,10 +153,12 @@ func (r *policySubReconciler) reconcilePolicy(ctx context.Context, policy polici
 // It removes the webhook configuration to prevent orphaned webhooks from blocking
 // admission requests, then sets the policy status as scheduled.
 func (r *policySubReconciler) reconcilePolicyServerUnavailable(ctx context.Context, policy policiesv1.Policy) (ctrl.Result, error) {
-	if err := r.deleteWebhookConfiguration(ctx, policy); err != nil {
+	if err := r.removePolicyWebhooksAndFinalizers(ctx, policy); err != nil {
 		return ctrl.Result{}, err
 	}
+
 	policy.SetStatus(policiesv1.PolicyStatusScheduled)
+
 	return ctrl.Result{}, nil
 }
 
@@ -176,21 +186,36 @@ func (r *policySubReconciler) deleteWebhookConfiguration(ctx context.Context, po
 	return r.reconcileValidatingWebhookConfigurationDeletion(ctx, policy)
 }
 
-func (r *policySubReconciler) reconcilePolicyDeletion(ctx context.Context, policy policiesv1.Policy) (ctrl.Result, error) {
+// removePolicyWebhooksAndFinalizers removes the webhook configurations, which
+// means that the policy can be safely deleted. Therefore, it also removes the
+// policy finalizers.
+func (r *policySubReconciler) removePolicyWebhooksAndFinalizers(ctx context.Context, policy policiesv1.Policy) error {
 	if err := r.deleteWebhookConfiguration(ctx, policy); err != nil {
-		return ctrl.Result{}, err
-	}
-	// Remove the old finalizer used to ensure that the policy server created
-	// before this controller version is delete as well. As the upgrade path
-	// supported by the Kubewarden project does not allow jumping versions, we
-	// can safely remove this line of code after a few releases.
-	controllerutil.RemoveFinalizer(policy, constants.KubewardenFinalizerPre114)
-	controllerutil.RemoveFinalizer(policy, constants.KubewardenFinalizer)
-	if err := r.Update(ctx, policy); err != nil {
-		return ctrl.Result{}, fmt.Errorf("cannot update admission policy: %w", err)
+		return err
 	}
 
-	return ctrl.Result{}, nil
+	finalizerRemoved := false
+	if controllerutil.ContainsFinalizer(policy, constants.KubewardenFinalizer) {
+		controllerutil.RemoveFinalizer(policy, constants.KubewardenFinalizer)
+		finalizerRemoved = true
+	}
+	// Remove the old finalizer used to ensure that the policy server created
+	// before this controller version is deleted as well.
+	// TODO:
+	// As the upgrade path supported by the Kubewarden project does not
+	// allow jumping versions, we can safely remove this line of code after a few
+	// releases.
+	if controllerutil.ContainsFinalizer(policy, constants.KubewardenFinalizerPre114) {
+		controllerutil.RemoveFinalizer(policy, constants.KubewardenFinalizerPre114)
+		finalizerRemoved = true
+	}
+	if finalizerRemoved {
+		if err := r.Update(ctx, policy); err != nil {
+			return fmt.Errorf("cannot update policy: %w", err)
+		}
+	}
+
+	return nil
 }
 
 func (r *policySubReconciler) setPolicyModeStatus(ctx context.Context, policy policiesv1.Policy) error {
