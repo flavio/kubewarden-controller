@@ -265,12 +265,18 @@ func TestClusterAdmissionPolicyController(t *testing.T) {
 			policy := ctx.Value(policyKey).(*policiesv1.ClusterAdmissionPolicy)
 			webhookName := policy.GetUniqueName()
 
+			// Fetch the latest policy state from the API. The object stored in
+			// context was captured before the controller added the finalizer.
+			var latestPolicy policiesv1.ClusterAdmissionPolicy
+			err := cfg.Client().Resources().Get(ctx, policy.GetName(), "", &latestPolicy)
+			require.NoError(t, err)
+
 			// Verify policy has finalizer before deletion
-			require.True(t, containsFinalizer(policy.GetFinalizers(), constants.KubewardenFinalizer),
+			require.True(t, containsFinalizer(latestPolicy.GetFinalizers(), constants.KubewardenFinalizer),
 				"Policy should have finalizer before deletion")
 
 			// Delete the policy
-			err := cfg.Client().Resources().Delete(ctx, policy)
+			err = cfg.Client().Resources().Delete(ctx, &latestPolicy)
 			require.NoError(t, err)
 
 			// Wait for webhook to be deleted
@@ -461,12 +467,18 @@ func TestClusterAdmissionPolicyController(t *testing.T) {
 			policy := ctx.Value(policyKey).(*policiesv1.ClusterAdmissionPolicy)
 			webhookName := policy.GetUniqueName()
 
+			// Fetch the latest policy state from the API. The object stored in
+			// context was captured before the controller added the finalizer.
+			var latestPolicy policiesv1.ClusterAdmissionPolicy
+			err := cfg.Client().Resources().Get(ctx, policy.GetName(), "", &latestPolicy)
+			require.NoError(t, err)
+
 			// Verify policy has finalizer before deletion
-			require.True(t, containsFinalizer(policy.GetFinalizers(), constants.KubewardenFinalizer),
+			require.True(t, containsFinalizer(latestPolicy.GetFinalizers(), constants.KubewardenFinalizer),
 				"Policy should have finalizer before deletion")
 
 			// Delete the policy
-			err := cfg.Client().Resources().Delete(ctx, policy)
+			err = cfg.Client().Resources().Delete(ctx, &latestPolicy)
 			require.NoError(t, err)
 
 			// Wait for webhook to be deleted
