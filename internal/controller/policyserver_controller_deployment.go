@@ -694,7 +694,10 @@ func getPolicyServerContainer(policyServer *policiesv1.PolicyServer) corev1.Cont
 				MountPath: policyStoreVolumePath,
 			},
 		},
-		Env: append([]corev1.EnvVar{
+		// user-provided vars from Spec.Env come first, controller-managed vars are
+		// appended last so they always take precedence (kubelet applies
+		// "last wins" semantics when duplicate names are present)
+		Env: append(policyServer.Spec.Env, []corev1.EnvVar{
 			{
 				Name:  "KUBEWARDEN_CERT_FILE",
 				Value: filepath.Join(secretsContainerPath, constants.ServerCert),
@@ -723,7 +726,7 @@ func getPolicyServerContainer(policyServer *policiesv1.PolicyServer) corev1.Cont
 				Name:  "KUBEWARDEN_SIGSTORE_CACHE_DIR",
 				Value: sigstoreCacheDirPath,
 			},
-		}, policyServer.Spec.Env...),
+		}...),
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
 				HTTPGet: &corev1.HTTPGetAction{
