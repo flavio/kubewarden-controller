@@ -138,6 +138,15 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 	}).SetupWithManager(k8sManager)
 	Expect(err).ToNot(HaveOccurred())
 
+	err = (&DefaultsApplierReconciler{
+		Client:               k8sManager.GetClient(),
+		Scheme:               k8sManager.GetScheme(),
+		Log:                  ctrl.Log.WithName("defaults-applier-test"),
+		DeploymentsNamespace: deploymentsNamespace,
+		ConfigMapName:        constants.DefaultDefaultsConfigMapName,
+	}).SetupWithManager(k8sManager)
+	Expect(err).ToNot(HaveOccurred())
+
 	// Create the integration tests deployments namespace
 	err = k8sClient.Create(ctx, &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{

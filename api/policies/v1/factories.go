@@ -9,8 +9,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
-
-	"github.com/kubewarden/adm-controller/internal/constants"
 )
 
 const (
@@ -142,6 +140,7 @@ type ClusterAdmissionPolicyFactory struct {
 	mode                  PolicyMode
 	timeoutSeconds        *int32
 	timeoutEvalSeconds    *int32
+	withoutFinalizers     bool
 }
 
 func NewClusterAdmissionPolicyFactory() *ClusterAdmissionPolicyFactory {
@@ -216,16 +215,25 @@ func (f *ClusterAdmissionPolicyFactory) WithTimeoutEvalSeconds(timeout *int32) *
 	return f
 }
 
+func (f *ClusterAdmissionPolicyFactory) WithoutFinalizers() *ClusterAdmissionPolicyFactory {
+	f.withoutFinalizers = true
+	return f
+}
+
 func (f *ClusterAdmissionPolicyFactory) Build() *ClusterAdmissionPolicy {
+	var finalizers []string
+	if !f.withoutFinalizers {
+		finalizers = []string{
+			// Safety-net finalizer that prevents the API server from garbage-
+			// collecting the object during integration tests, so test assertions
+			// can observe the controller's behavior before deletion completes.
+			integrationTestsFinalizer,
+		}
+	}
 	clusterAdmissionPolicy := ClusterAdmissionPolicy{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: f.name,
-			Finalizers: []string{
-				// Safety-net finalizer that prevents the API server from garbage-
-				// collecting the object during integration tests, so test assertions
-				// can observe the controller's behavior before deletion completes.
-				integrationTestsFinalizer,
-			},
+			Name:       f.name,
+			Finalizers: finalizers,
 		},
 		Spec: ClusterAdmissionPolicySpec{
 			ContextAwareResources: f.contextAwareResources,
@@ -482,6 +490,7 @@ type PolicyServerBuilder struct {
 	webhookPort                    *int32
 	readinessProbePort             *int32
 	metricsPort                    *int32
+	withoutFinalizers              bool
 }
 
 func NewPolicyServerFactory() *PolicyServerBuilder {
@@ -545,19 +554,25 @@ func (f *PolicyServerBuilder) WithMetricsPort(port int32) *PolicyServerBuilder {
 	return f
 }
 
+func (f *PolicyServerBuilder) WithoutFinalizers() *PolicyServerBuilder {
+	f.withoutFinalizers = true
+	return f
+}
+
 func (f *PolicyServerBuilder) Build() *PolicyServer {
+	var finalizers []string
+	if !f.withoutFinalizers {
+		finalizers = []string{
+			// Safety-net finalizer that prevents the API server from garbage-
+			// collecting the object during integration tests, so test assertions
+			// can observe the controller's behavior before deletion completes.
+			integrationTestsFinalizer,
+		}
+	}
 	policyServer := PolicyServer{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: f.name,
-			Finalizers: []string{
-				// On a real cluster the Kubewarden finalizer is added by our mutating
-				// webhook. This is not running now, hence we have to manually add the finalizer
-				constants.KubewardenFinalizer,
-				// By adding this finalizer automatically, we ensure that when
-				// testing removal of finalizers on deleted objects, that they will
-				// exist at all times
-				integrationTestsFinalizer,
-			},
+			Name:       f.name,
+			Finalizers: finalizers,
 		},
 		Spec: PolicyServerSpec{
 			Image:                          policyServerRepository() + ":" + policyServerVersion(),
