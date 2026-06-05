@@ -7,9 +7,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
-	"slices"
 	"strconv"
-	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -332,35 +330,6 @@ func configuresInsecureSources(policyServer *policiesv1.PolicyServer, admissionC
 	}
 }
 
-// applyManagedKeys removes keys that were previously managed (recorded in the tracking
-// annotation/label) but are no longer present in the desired user-defined map, then applies
-// the new desired keys and records the current managed set in the tracking annotation.
-//
-// Parameters:
-//   - existing: the current annotation/label map on the object (mutated in-place).
-//   - desired: the user-defined map from spec (may be nil).
-//   - trackingAnnotations: the annotation map where the tracking key is stored (may differ from
-//     existing when we track label keys inside the annotation map).
-//   - trackingKey: the annotation key used to store the comma-separated list of managed keys.
-func applyManagedKeys(existing map[string]string, desired map[string]string, trackingAnnotations map[string]string, trackingKey string) {
-	// Remove keys that were managed last time but are no longer desired.
-	if prev, found := trackingAnnotations[trackingKey]; found && prev != "" {
-		for _, key := range strings.Split(prev, ",") {
-			if _, stillDesired := desired[key]; !stillDesired {
-				delete(existing, key)
-			}
-		}
-	}
-
-	// Apply desired keys (user-defined values first; system values will overwrite after this call).
-	for key, value := range desired {
-		existing[key] = value
-	}
-
-	// Record the current set of managed keys.
-	trackingAnnotations[trackingKey] = strings.Join(slices.Collect(maps.Keys(desired)), ",")
-}
-
 func configureLabelsAndAnnotations(policyServerDeployment *appsv1.Deployment, policyServer *policiesv1.PolicyServer, configMapVersion string) {
 	// --- Annotations ---
 	if policyServerDeployment.ObjectMeta.Annotations == nil {
@@ -371,7 +340,7 @@ func configureLabelsAndAnnotations(policyServerDeployment *appsv1.Deployment, po
 		policyServerDeployment.ObjectMeta.Annotations,
 		policyServer.Spec.Annotations,
 		policyServerDeployment.ObjectMeta.Annotations,
-		constants.PolicyServerDeploymentManagedAnnotationKeysAnnotation,
+		constants.ManagedAnnotationKeysAnnotation,
 	)
 	// System annotation always wins.
 	policyServerDeployment.ObjectMeta.Annotations[constants.PolicyServerDeploymentConfigVersionAnnotation] = configMapVersion
@@ -386,7 +355,7 @@ func configureLabelsAndAnnotations(policyServerDeployment *appsv1.Deployment, po
 		policyServerDeployment.Labels,
 		policyServer.Spec.Labels,
 		policyServerDeployment.ObjectMeta.Annotations,
-		constants.PolicyServerDeploymentManagedLabelKeysAnnotation,
+		constants.ManagedLabelKeysAnnotation,
 	)
 	// System labels always win.
 	policyServerDeployment.Labels[constants.PolicyServerLabelKey] = policyServer.Name
