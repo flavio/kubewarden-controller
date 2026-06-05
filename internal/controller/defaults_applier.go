@@ -178,16 +178,29 @@ func copySpec(src, dst client.Object) {
 	}
 }
 
-// applyManagedMetadata restores labels and annotations from the ConfigMap YAML
-// into the live object, and injects the ownership label.
+// applyManagedMetadata merges labels and annotations from the ConfigMap YAML into the live
+// object, preserving keys set by other controllers or tools. Previously managed keys that are
+// no longer present in the desired object are removed. The ownership label is always injected.
 func applyManagedMetadata(desired, live client.Object) {
-	labels := desired.GetLabels()
+	// Ensure annotation map exists on live (needed to store label-key tracking).
+	annotations := live.GetAnnotations()
+	if annotations == nil {
+		annotations = make(map[string]string)
+	}
+
+	// Labels: merge desired keys, remove stale managed keys, then stamp the ownership label.
+	labels := live.GetLabels()
 	if labels == nil {
 		labels = make(map[string]string)
 	}
+	applyManagedKeys(labels, desired.GetLabels(), annotations, constants.ManagedLabelKeysAnnotation)
 	labels[constants.DefaultsManagedByLabelKey] = constants.DefaultsManagedByLabelValue
+
+	// Annotations: merge desired keys, remove stale managed keys.
+	applyManagedKeys(annotations, desired.GetAnnotations(), annotations, constants.ManagedAnnotationKeysAnnotation)
+
 	live.SetLabels(labels)
-	live.SetAnnotations(desired.GetAnnotations())
+	live.SetAnnotations(annotations)
 }
 
 // cleanupStale removes managed resources that are not in the desired set.
