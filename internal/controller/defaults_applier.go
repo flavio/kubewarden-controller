@@ -12,6 +12,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
+	"k8s.io/apimachinery/pkg/util/sets"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -34,6 +35,7 @@ type DefaultsApplierReconciler struct {
 	Log                  logr.Logger
 	DeploymentsNamespace string
 	ConfigMapName        string
+	decoder              runtime.Decoder
 }
 
 // Reconcile watches the defaults ConfigMap and applies the resources it contains.
@@ -52,11 +54,10 @@ func (r *DefaultsApplierReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, fmt.Errorf("failed to get ConfigMap: %w", err)
 	}
 
-	decoder := serializer.NewCodecFactory(r.Scheme).UniversalDeserializer()
-	desired := make(map[resourceKey]bool)
+	desired := sets.New[resourceKey]()
 
 	for key, yamlData := range cm.Data {
-		obj, gvk, err := decoder.Decode([]byte(yamlData), nil, nil)
+		obj, gvk, err := r.decoder.Decode([]byte(yamlData), nil, nil)
 		if err != nil {
 			log.Error(err, "failed to decode resource from ConfigMap", "key", key)
 			// Don't fail the whole reconciliation for one bad entry
@@ -80,7 +81,7 @@ func (r *DefaultsApplierReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 			name:      clientObj.GetName(),
 			namespace: clientObj.GetNamespace(),
 		}
-		desired[rk] = true
+		desired.Insert(rk)
 
 		// Apply the resource with ownership label injected
 		if applyErr := r.applyResource(ctx, clientObj); applyErr != nil {
@@ -98,6 +99,8 @@ func (r *DefaultsApplierReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 // SetupWithManager registers the reconciler with the manager.
 func (r *DefaultsApplierReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.decoder = serializer.NewCodecFactory(r.Scheme).UniversalDeserializer()
+
 	if err := ctrl.NewControllerManagedBy(mgr).
 		For(&corev1.ConfigMap{}).
 		WithEventFilter(predicate.NewPredicateFuncs(func(object client.Object) bool {
@@ -188,7 +191,7 @@ func applyManagedMetadata(desired, live client.Object) {
 }
 
 // cleanupStale removes managed resources that are not in the desired set.
-func (r *DefaultsApplierReconciler) cleanupStale(ctx context.Context, desired map[resourceKey]bool) error {
+func (r *DefaultsApplierReconciler) cleanupStale(ctx context.Context, desired sets.Set[resourceKey]) error {
 	managedSelector := client.MatchingLabels{
 		constants.DefaultsManagedByLabelKey: constants.DefaultsManagedByLabelValue,
 	}
@@ -217,7 +220,7 @@ func (r *DefaultsApplierReconciler) cleanupStale(ctx context.Context, desired ma
 				namespace: item.GetNamespace(),
 			}
 
-			if !desired[rk] {
+			if !desired.Has(rk) {
 				r.Log.Info("Deleting stale managed resource", "resource", rk)
 				if deleteErr := r.Delete(ctx, item); deleteErr != nil && !apierrors.IsNotFound(deleteErr) {
 					return fmt.Errorf("failed to delete stale resource %s: %w", rk, deleteErr)
@@ -231,7 +234,7 @@ func (r *DefaultsApplierReconciler) cleanupStale(ctx context.Context, desired ma
 
 // cleanupAll removes all managed resources (called when ConfigMap is absent).
 func (r *DefaultsApplierReconciler) cleanupAll(ctx context.Context) error {
-	return r.cleanupStale(ctx, make(map[resourceKey]bool))
+	return r.cleanupStale(ctx, sets.New[resourceKey]())
 }
 
 // resourceKey uniquely identifies a Kubernetes resource.

@@ -68,8 +68,9 @@ var _ = Describe("DefaultsApplierReconciler", func() {
 		}
 	})
 
-	Context("when ConfigMap does not exist", func() {
-		It("should delete all managed resources when they exist", func() {
+	Context("when ConfigMap is deleted", func() {
+		It("should delete all managed resources", func() {
+			// First create all the managed resources by creating the ConfigMap with one entry
 			ps := policiesv1.NewPolicyServerFactory().WithName(policyServerName).WithoutFinalizers().Build()
 			policyServerYAML := marshalPolicyServer(ps)
 
@@ -88,6 +89,7 @@ var _ = Describe("DefaultsApplierReconciler", func() {
 				return k8sClient.Get(ctx, types.NamespacedName{Name: policyServerName}, &policiesv1.PolicyServer{})
 			}, timeout, pollInterval).Should(Succeed())
 
+			// Now delete the ConfigMap and verify that the managed PolicyServer is also deleted
 			Expect(k8sClient.Delete(ctx, cm)).To(Succeed())
 
 			Eventually(func() bool {
@@ -192,6 +194,9 @@ var _ = Describe("DefaultsApplierReconciler", func() {
 				return k8sClient.Get(ctx, types.NamespacedName{Name: policyName}, &policiesv1.ClusterAdmissionPolicy{})
 			}, timeout, pollInterval).Should(Succeed())
 
+			// Now remove the "policy" key from the ConfigMap and verify that the
+			// corresponding ClusterAdmissionPolicy is deleted while the PolicyServer
+			// remains
 			Expect(k8sClient.Get(ctx, configMapNsName, cm)).To(Succeed())
 			delete(cm.Data, "policy")
 			Expect(k8sClient.Update(ctx, cm)).To(Succeed())
