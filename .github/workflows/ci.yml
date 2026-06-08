@@ -362,7 +362,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@25435dc8dd3baed7417e0c96d3fe89013a5b2e09 # v2.81.3
+        uses: taiki-e/install-action@0631aa6515c7d545823c67cfae7ef4fc7f490154 # v2.81.8
         with:
           tool: cargo-llvm-cov
       - name: Install cosign # this is needed by some of the e2e tests
@@ -410,7 +410,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Check spelling with typos
-        uses: crate-ci/typos@44e2070e6017f834bf069503acb35ca0ca0b75f2 # v1.47.1
+        uses: crate-ci/typos@37bb98842b0d8c4ffebdb75301a13db0267cef89 # v1.47.2
 
   charts:
     name: Helm unittest
