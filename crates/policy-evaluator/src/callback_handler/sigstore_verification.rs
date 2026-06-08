@@ -267,7 +267,6 @@ impl Client {
 //   * only successful results are cached
 #[cached(
     ttl = 60,
-    result = true,
     sync_writes = "default",
     key = "String",
     convert = r#"{ format!("{}{:?}{:?}", image, pub_keys, annotations)}"#,
@@ -294,7 +293,6 @@ pub(crate) async fn get_sigstore_pub_key_verification_cached(
 //   * only successful results are cached
 #[cached(
     ttl = 60,
-    result = true,
     sync_writes = "default",
     key = "String",
     convert = r#"{ format!("{}{:?}{:?}", image, keyless, annotations)}"#,
@@ -321,7 +319,6 @@ pub(crate) async fn get_sigstore_keyless_verification_cached(
 //   * only successful results are cached
 #[cached(
     ttl = 60,
-    result = true,
     sync_writes = "default",
     key = "String",
     convert = r#"{ format!("{}{:?}{:?}", image, keyless_prefix, annotations)}"#,
@@ -348,7 +345,6 @@ pub(crate) async fn get_sigstore_keyless_prefix_verification_cached(
 //   * only successful results are cached
 #[cached(
     ttl = 60,
-    result = true,
     sync_writes = "default",
     key = "String",
     convert = r#"{ format!("{}{:?}{:?}{:?}", image, owner, repo, annotations)}"#,
@@ -404,7 +400,6 @@ fn get_sigstore_certificate_verification_cache_key(
 
 #[cached(
     ttl = 60,
-    result = true,
     sync_writes = "default",
     key = "String",
     convert = r#"{ format!("{}", get_sigstore_certificate_verification_cache_key(image, certificate, certificate_chain, require_rekor_bundle, annotations.as_ref()))}"#,

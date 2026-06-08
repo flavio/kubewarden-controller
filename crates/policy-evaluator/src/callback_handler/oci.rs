@@ -86,7 +86,6 @@ impl Client {
 //   * only successful results are cached
 #[cached(
     ttl = 60,
-    result = true,
     sync_writes = "default",
     key = "String",
     convert = r#"{ format!("{}", img) }"#,
@@ -114,7 +113,6 @@ pub(crate) async fn get_oci_digest_cached(
 //   * only successful results are cached
 #[cached(
     ttl = 60,
-    result = true,
     sync_writes = "default",
     key = "String",
     convert = r#"{ format!("{}", img) }"#,
@@ -129,7 +127,6 @@ pub(crate) async fn get_oci_manifest_cached(
 
 #[cached(
     ttl = 60,
-    result = true,
     sync_writes = "default",
     key = "String",
     convert = r#"{ format!("{}", img) }"#,
