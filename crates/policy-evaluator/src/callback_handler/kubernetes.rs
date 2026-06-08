@@ -100,7 +100,6 @@ pub(crate) async fn get_resource(
 
 #[cached(
     ttl = 5,
-    result = true,
     sync_writes = "default",
     key = "String",
     convert = r#"{ format!("get_resource_cached({},{}),{},{:?}", api_version, kind, name, namespace) }"#,
@@ -186,7 +185,6 @@ pub(crate) async fn can_i(
 
 #[cached(
     ttl = 5,
-    result = true,
     // We can use the request type as key because cached requires the key to implement Hash + Eq
     // traits. As we already implement these traits, there is no need to have a custom logic for key
     // generation. If we do that, we will only convert it into a type (e.g. string)  that
