@@ -7,7 +7,7 @@ use crate::{
     policy_evaluator::{
         PolicyEvaluatorPre, PolicyExecutionMode, errors::InvalidUserInputError, stack_pre::StackPre,
     },
-    runtimes::{rego, wapc, wasi_cli},
+    runtimes::{ferricel, rego, wapc, wasi_cli},
 };
 
 /// Configure behavior of wasmtime [epoch-based interruptions](https://docs.rs/wasmtime/latest/wasmtime/struct.Config.html#method.epoch_interruption)
@@ -254,6 +254,11 @@ impl PolicyEvaluatorBuilder {
                     self.resource_limits,
                 );
                 StackPre::from(rego_stack_pre)
+            }
+            PolicyExecutionMode::Ferricel => {
+                let ferricel_stack_pre = ferricel::StackPre::new(engine, module)
+                    .map_err(PolicyEvaluatorBuilderError::NewFerricelStackPre)?;
+                StackPre::from(ferricel_stack_pre)
             }
         };
 

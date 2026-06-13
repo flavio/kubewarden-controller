@@ -53,6 +53,9 @@ pub enum PolicyEvaluatorBuilderError {
     #[error("execution mode not convertible to a Rego based execution mode")]
     ExecutionModeNotRegoCompatible,
 
+    #[error("execution mode '{0}' is not supported for direct evaluation")]
+    UnsupportedExecutionMode(crate::policy_evaluator::PolicyExecutionMode),
+
     #[error("protocol_version is only applicable to a Kubewarden policy")]
     InvokeWapcProtocolVersion(#[source] crate::runtimes::wapc::errors::WapcRuntimeError),
 
@@ -73,6 +76,9 @@ pub enum PolicyEvaluatorBuilderError {
 
     #[error("error when building rego precompiled stack")]
     NewRegoStackPre(#[source] wasmtime::Error),
+
+    #[error("error when building ferricel precompiled stack: {0}")]
+    NewFerricelStackPre(#[source] crate::runtimes::ferricel::errors::FerricelRuntimeError),
 }
 
 #[derive(Error, Debug)]
