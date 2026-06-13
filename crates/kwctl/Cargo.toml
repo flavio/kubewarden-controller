@@ -14,6 +14,7 @@ clap-documentation = { workspace = true }
 clap_complete      = "4.5"
 color-print        = "0.3"
 directories        = "6.0.0"
+ferricel-core      = { workspace = true }
 flate2             = "1.1"
 hex                = { workspace = true }
 humansize          = "2.1"
