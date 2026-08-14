@@ -10,6 +10,17 @@ use crate::{
 
 const EXIT_SUCCESS: i32 = 0;
 
+/// Maximum bytes a policy may write to stdout or stderr.
+/// Protects the host from memory exhaustion caused by a runaway or
+/// malicious policy.
+/// 4 MiB is well above any realistic output: stdout carries the JSON
+/// AdmissionResponse (typically a few KB, tens of KB with large mutation
+/// patches; Kubernetes objects themselves are capped at ~1.5 MiB by etcd),
+/// and stderr carries policy logs. Expected steady-state usage is well
+/// under 1 MiB per evaluation; the cap only bounds the worst case, at
+/// most 8 MiB (stdout + stderr) per in-flight evaluation.
+const MAX_OUTPUT_PIPE_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+
 pub(crate) struct Context {
     pub(crate) wasi_ctx: WasiP1Ctx,
     pub(crate) stdin_pipe: WasiPipe,
@@ -66,8 +77,8 @@ impl Stack {
         input: &[u8],
         args: &[&str],
     ) -> std::result::Result<RunResult, WasiRuntimeError> {
-        let stdout_pipe = MemoryOutputPipe::new(usize::MAX);
-        let stderr_pipe = MemoryOutputPipe::new(usize::MAX);
+        let stdout_pipe = MemoryOutputPipe::new(MAX_OUTPUT_PIPE_BYTES);
+        let stderr_pipe = MemoryOutputPipe::new(MAX_OUTPUT_PIPE_BYTES);
         let stdin_pipe = WasiPipe::new(input);
 
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
