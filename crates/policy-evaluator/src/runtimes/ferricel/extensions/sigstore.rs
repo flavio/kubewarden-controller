@@ -1,13 +1,13 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use ferricel_types::extensions::{BuilderChainDecl, BuilderStep, ExtensionDecl};
 use kubewarden_policy_sdk::host_capabilities::verification::{KeylessInfo, KeylessPrefixInfo};
 use serde_json::Value;
 
-use super::helpers::{require_channel, send_and_recv};
-use crate::{callback_requests::CallbackRequestType, evaluation_context::EvaluationContext};
-
-const CHANNEL_ERR: &str = "kw.sigstore: callback channel is not set";
+use crate::{
+    callback_requests::CallbackRequestType, evaluation_context::EvaluationContext,
+    runtimes::ferricel::extensions::helpers::call_host,
+};
 
 /// `BuilderChainDecl` for the `kw.sigstore` library.
 ///
@@ -247,13 +247,16 @@ pub fn digest_extension() -> ExtensionDecl {
 }
 
 // ─── Handlers ────────────────────────────────────────────────────────────────
+//
+// All five verify variants are dispatched under the "oci"/"v2/verify" host
+// capability (see `host_capabilities()` in `extensions.rs`), matching how the
+// waPC/Wasi `host_callback` handles the internally-tagged
+// `SigstoreVerificationInputV2` payload for the same operation.
 
 pub(crate) fn pub_key_verify_handler(
-    eval_ctx: &EvaluationContext,
+    eval_ctx: &Arc<EvaluationContext>,
     builder_map: &Value,
 ) -> Result<Value, String> {
-    let channel = require_channel(eval_ctx).ok_or(CHANNEL_ERR)?;
-
     let image = builder_map["image"]
         .as_str()
         .ok_or_else(|| "kw.sigstore.pubKeyVerify: missing 'image'".to_string())?
@@ -270,8 +273,10 @@ pub(crate) fn pub_key_verify_handler(
 
     let annotations = parse_annotations(builder_map);
 
-    send_and_recv(
-        channel,
+    call_host(
+        eval_ctx,
+        "oci",
+        "v2/verify",
         CallbackRequestType::SigstorePubKeyVerify {
             image,
             pub_keys,
@@ -282,11 +287,9 @@ pub(crate) fn pub_key_verify_handler(
 }
 
 pub(crate) fn keyless_verify_handler(
-    eval_ctx: &EvaluationContext,
+    eval_ctx: &Arc<EvaluationContext>,
     builder_map: &Value,
 ) -> Result<Value, String> {
-    let channel = require_channel(eval_ctx).ok_or(CHANNEL_ERR)?;
-
     let image = builder_map["image"]
         .as_str()
         .ok_or_else(|| "kw.sigstore.keylessVerify: missing 'image'".to_string())?
@@ -298,8 +301,10 @@ pub(crate) fn keyless_verify_handler(
 
     let annotations = parse_annotations(builder_map);
 
-    send_and_recv(
-        channel,
+    call_host(
+        eval_ctx,
+        "oci",
+        "v2/verify",
         CallbackRequestType::SigstoreKeylessVerify {
             image,
             keyless,
@@ -310,11 +315,9 @@ pub(crate) fn keyless_verify_handler(
 }
 
 pub(crate) fn keyless_prefix_verify_handler(
-    eval_ctx: &EvaluationContext,
+    eval_ctx: &Arc<EvaluationContext>,
     builder_map: &Value,
 ) -> Result<Value, String> {
-    let channel = require_channel(eval_ctx).ok_or(CHANNEL_ERR)?;
-
     let image = builder_map["image"]
         .as_str()
         .ok_or_else(|| "kw.sigstore.keylessPrefixVerify: missing 'image'".to_string())?
@@ -341,8 +344,10 @@ pub(crate) fn keyless_prefix_verify_handler(
 
     let annotations = parse_annotations(builder_map);
 
-    send_and_recv(
-        channel,
+    call_host(
+        eval_ctx,
+        "oci",
+        "v2/verify",
         CallbackRequestType::SigstoreKeylessPrefixVerify {
             image,
             keyless_prefix,
@@ -353,11 +358,9 @@ pub(crate) fn keyless_prefix_verify_handler(
 }
 
 pub(crate) fn github_actions_verify_handler(
-    eval_ctx: &EvaluationContext,
+    eval_ctx: &Arc<EvaluationContext>,
     builder_map: &Value,
 ) -> Result<Value, String> {
-    let channel = require_channel(eval_ctx).ok_or(CHANNEL_ERR)?;
-
     let image = builder_map["image"]
         .as_str()
         .ok_or_else(|| "kw.sigstore.githubActionsVerify: missing 'image'".to_string())?
@@ -373,8 +376,10 @@ pub(crate) fn github_actions_verify_handler(
 
     let annotations = parse_annotations(builder_map);
 
-    send_and_recv(
-        channel,
+    call_host(
+        eval_ctx,
+        "oci",
+        "v2/verify",
         CallbackRequestType::SigstoreGithubActionsVerify {
             image,
             owner,
@@ -386,11 +391,9 @@ pub(crate) fn github_actions_verify_handler(
 }
 
 pub(crate) fn certificate_verify_handler(
-    eval_ctx: &EvaluationContext,
+    eval_ctx: &Arc<EvaluationContext>,
     builder_map: &Value,
 ) -> Result<Value, String> {
-    let channel = require_channel(eval_ctx).ok_or(CHANNEL_ERR)?;
-
     let image = builder_map["image"]
         .as_str()
         .ok_or_else(|| "kw.sigstore.certificateVerify: missing 'image'".to_string())?
@@ -414,8 +417,10 @@ pub(crate) fn certificate_verify_handler(
 
     let annotations = parse_annotations(builder_map);
 
-    send_and_recv(
-        channel,
+    call_host(
+        eval_ctx,
+        "oci",
+        "v2/verify",
         CallbackRequestType::SigstoreCertificateVerify {
             image,
             certificate,

@@ -56,6 +56,20 @@ fn build_evaluator(
     callback_channel: Option<tokio::sync::mpsc::Sender<CallbackRequest>>,
     ctx_aware_resources: BTreeSet<ContextAwareResource>,
 ) -> policy_evaluator::policy_evaluator::PolicyEvaluator {
+    build_evaluator_with_host_capabilities(
+        wasm,
+        callback_channel,
+        ctx_aware_resources,
+        HostCapabilities::AllowAll,
+    )
+}
+
+fn build_evaluator_with_host_capabilities(
+    wasm: &[u8],
+    callback_channel: Option<tokio::sync::mpsc::Sender<CallbackRequest>>,
+    ctx_aware_resources: BTreeSet<ContextAwareResource>,
+    host_capabilities: HostCapabilities,
+) -> policy_evaluator::policy_evaluator::PolicyEvaluator {
     let pre = PolicyEvaluatorBuilder::new()
         .policy_contents(wasm)
         .execution_mode(PolicyExecutionMode::Ferricel)
@@ -66,7 +80,7 @@ fn build_evaluator(
         callback_channel,
         ctx_aware_resources_allow_list: ctx_aware_resources,
         epoch_deadline: None,
-        host_capabilities: HostCapabilities::AllowAll,
+        host_capabilities,
     };
     pre.rehydrate(&eval_ctx)
         .unwrap_or_else(|e| panic!("cannot rehydrate evaluator: {e}"))
@@ -281,7 +295,18 @@ async fn test_simple_validation(
     let _ = shutdown_tx.send(());
 }
 
-const VAP_WITH_VARIABLES: &str = r#"
+/// Compile and evaluate a VAP that uses CEL variables to compute intermediate
+/// values before the final validation expression.
+#[rstest]
+#[case::accept("deployment_accept.json", true, None)]
+#[case::reject("deployment_reject.json", false, Some("too many replicas"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_with_variables(
+    #[case] request_filename: &str,
+    #[case] expected_allowed: bool,
+    #[case] expected_message: Option<&str>,
+) {
+    let vap = r#"
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -297,23 +322,12 @@ spec:
       messageExpression: "'Deployment ' + object.metadata.name + ' has too many replicas'"
 "#;
 
-/// Compile and evaluate a VAP that uses CEL variables to compute intermediate
-/// values before the final validation expression.
-#[rstest]
-#[case::accept("deployment_accept.json", true, None)]
-#[case::reject("deployment_reject.json", false, Some("too many replicas"))]
-#[tokio::test(flavor = "multi_thread")]
-async fn test_with_variables(
-    #[case] request_filename: &str,
-    #[case] expected_allowed: bool,
-    #[case] expected_message: Option<&str>,
-) {
     let (mocksvc, handle) = tower_test::mock::pair::<Request<Body>, Response<Body>>();
     let client = Client::new(mocksvc, "default");
     namespace_scenario(handle).await;
     let (shutdown_tx, callback_channel) = setup_callback_handler(Some(client), None).await;
 
-    let wasm = compile_vap(VAP_WITH_VARIABLES);
+    let wasm = compile_vap(vap);
     let mut evaluator = build_evaluator(&wasm, Some(callback_channel), BTreeSet::new());
     let request =
         ValidateRequest::AdmissionRequest(Box::new(load_admission_request(request_filename)));
@@ -339,7 +353,12 @@ async fn test_with_variables(
     let _ = shutdown_tx.send(());
 }
 
-const VAP_WITH_REQUEST_BINDING: &str = r#"
+/// Compile and evaluate a VAP that accesses the `request` binding
+/// (e.g., `request.operation`). The deployment fixtures use operation CREATE
+/// so the policy accepts them.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_request_binding_accept() {
+    let vap = r#"
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -350,17 +369,12 @@ spec:
       message: "only CREATE operations are allowed"
 "#;
 
-/// Compile and evaluate a VAP that accesses the `request` binding
-/// (e.g., `request.operation`). The deployment fixtures use operation CREATE
-/// so the policy accepts them.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_request_binding_accept() {
     let (mocksvc, handle) = tower_test::mock::pair::<Request<Body>, Response<Body>>();
     let client = Client::new(mocksvc, "default");
     namespace_scenario(handle).await;
     let (shutdown_tx, callback_channel) = setup_callback_handler(Some(client), None).await;
 
-    let wasm = compile_vap(VAP_WITH_REQUEST_BINDING);
+    let wasm = compile_vap(vap);
     let mut evaluator = build_evaluator(&wasm, Some(callback_channel), BTreeSet::new());
     let request = ValidateRequest::AdmissionRequest(Box::new(load_admission_request(
         "deployment_accept.json",
@@ -394,7 +408,15 @@ async fn test_raw_request_is_rejected() {
     );
 }
 
-const VAP_WITH_NAMESPACE_OBJECT: &str = r#"
+/// On DELETE, Kubernetes typically sends `object: null` (the resource being
+/// deleted is only available via `oldObject`), but `request.namespace` is
+/// still populated. `namespaceObject` must be derived from `request.namespace`
+/// rather than `object.metadata.namespace`, otherwise it would incorrectly be
+/// treated as cluster-scoped and skipped for every DELETE of a namespaced
+/// resource. This is a regression test for that behavior.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_namespace_object_is_fetched_on_delete_with_null_object() {
+    let vap = r#"
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -405,20 +427,12 @@ spec:
       message: "unexpected namespace"
 "#;
 
-/// On DELETE, Kubernetes typically sends `object: null` (the resource being
-/// deleted is only available via `oldObject`), but `request.namespace` is
-/// still populated. `namespaceObject` must be derived from `request.namespace`
-/// rather than `object.metadata.namespace`, otherwise it would incorrectly be
-/// treated as cluster-scoped and skipped for every DELETE of a namespaced
-/// resource. This is a regression test for that behavior.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_namespace_object_is_fetched_on_delete_with_null_object() {
     let (mocksvc, handle) = tower_test::mock::pair::<Request<Body>, Response<Body>>();
     let client = Client::new(mocksvc, "default");
     namespace_scenario(handle).await;
     let (shutdown_tx, callback_channel) = setup_callback_handler(Some(client), None).await;
 
-    let wasm = compile_vap(VAP_WITH_NAMESPACE_OBJECT);
+    let wasm = compile_vap(vap);
     let mut evaluator = build_evaluator(&wasm, Some(callback_channel), BTreeSet::new());
     let request = ValidateRequest::AdmissionRequest(Box::new(load_admission_request(
         "deployment_delete.json",
@@ -436,20 +450,6 @@ async fn test_namespace_object_is_fetched_on_delete_with_null_object() {
     let _ = shutdown_tx.send(());
 }
 
-const VAP_WITH_PARAMS: &str = r#"
-apiVersion: admissionregistration.k8s.io/v1
-kind: ValidatingAdmissionPolicy
-metadata:
-  name: params-replicas
-spec:
-  paramKind:
-    apiVersion: v1
-    kind: ConfigMap
-  validations:
-    - expression: "object.spec.replicas <= int(params.data.maxReplicas)"
-      message: "too many replicas"
-"#;
-
 /// A VAP that uses `paramKind`/`paramRef` requires the `kw.k8s.get` extension.
 /// The policy fetches a ConfigMap via the callback channel and uses its data
 /// to evaluate the validation expression.
@@ -465,12 +465,26 @@ async fn test_params(
     #[case] expected_allowed: bool,
     #[case] expected_message: Option<&str>,
 ) {
+    let vap = r#"
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: params-replicas
+spec:
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  validations:
+    - expression: "object.spec.replicas <= int(params.data.maxReplicas)"
+      message: "too many replicas"
+"#;
+
     let (mocksvc, handle) = tower_test::mock::pair::<Request<Body>, Response<Body>>();
     let client = Client::new(mocksvc, "default");
     params_scenario(handle).await;
     let (shutdown_tx, callback_channel) = setup_callback_handler(Some(client), None).await;
 
-    let wasm = compile_vap(VAP_WITH_PARAMS);
+    let wasm = compile_vap(vap);
     let ctx_aware_resources = BTreeSet::from([ContextAwareResource {
         api_version: "v1".to_owned(),
         kind: "ConfigMap".to_owned(),
@@ -507,13 +521,115 @@ async fn test_params(
     let _ = shutdown_tx.send(());
 }
 
+// ─── Authorization gating tests ──────────────────────────────────────────────
+//
+// Regression tests confirming that every extension family (`kw.k8s.get`,
+// `kw.k8s.list`, `kw.oci`, `kw.net`, `kw.crypto`, `kw.sigstore`) routes
+// through the single authorization gate for the callback channel
+// (`runtimes::callback::host_callback_typed`): a policy cannot use a host
+// capability, nor read a Kubernetes resource type, that its
+// `EvaluationContext` denies.
+//
+// Each validation expression compares the extension call's result against a
+// literal that can never match (e.g. `{'ok': true}`). This is deliberate:
+// when a handler is denied, it never reaches the callback channel (enforced
+// by the panicking mock below) and the extension call returns
+// `{"error": "..."}` to the compiled wasm module. Rather than depend on how
+// the wasm module's generated bytecode happens to react to that error shape
+// (which varies across extension families), the equality comparison gives a
+// reliable, deterministic `false` in every case, so the validation
+// predictably rejects with our own `message:` field -- which we assert on
+// below. The exact denial reason (host-capability vs. Kubernetes-resource) is
+// covered precisely by the `runtimes::callback` unit tests
+// (`typed_host_capability_denied_returns_denial_error` and
+// `typed_kubernetes_resource_denied_when_not_in_allow_list`).
+#[rstest]
+#[case::kw_k8s_get_without_host_capability(
+    HostCapabilities::DenyAll,
+    "kw.k8s.apiVersion('v1').kind('ConfigMap').namespace('default').get('name') == {'ok': true}",
+    "kw.k8s.get denied: no host capability"
+)]
+#[case::kw_k8s_get_without_kubernetes_resource_grant(
+    HostCapabilities::AllowAll, // capability passes; empty resource allow-list denies
+    "kw.k8s.apiVersion('v1').kind('ConfigMap').namespace('default').get('name') == {'ok': true}",
+    "kw.k8s.get denied: no kubernetes resource grant"
+)]
+#[case::kw_k8s_list_without_host_capability(
+    HostCapabilities::DenyAll,
+    "kw.k8s.apiVersion('v1').kind('ConfigMap').namespace('default').list() == {'ok': true}",
+    "kw.k8s.list denied"
+)]
+#[case::kw_oci_manifest_without_host_capability(
+    HostCapabilities::DenyAll,
+    "kw.oci.image('image:latest').manifest() == {'ok': true}",
+    "kw.oci.manifest denied"
+)]
+#[case::kw_net_lookup_host_without_host_capability(
+    HostCapabilities::DenyAll,
+    "kw.net.lookupHost('example.com') == ['1.1.1.1']",
+    "kw.net.lookupHost denied"
+)]
+#[case::kw_crypto_verify_without_host_capability(
+    HostCapabilities::DenyAll,
+    "kw.crypto.certificate('cert.pem').verify() == {'ok': true}",
+    "kw.crypto.verify denied"
+)]
+#[case::kw_sigstore_pub_key_verify_without_host_capability(
+    HostCapabilities::DenyAll,
+    "kw.sigstore.image('img:latest').pubKey('pem').verify() == {'ok': true}",
+    "kw.sigstore.pubKeyVerify denied"
+)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_extension_denied_by_authorization_gate(
+    #[case] host_capabilities: HostCapabilities,
+    #[case] expression: &str,
+    #[case] message: &str,
+) {
+    let vap = format!(
+        r#"
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: authorization-gate-deny
+spec:
+  validations:
+    - expression: "{expression}"
+      message: "{message}"
+"#
+    );
+    let wasm = compile_vap(&vap);
+    let channel = spawn_direct_mock(|req| {
+        panic!("callback channel should not be reached when the request is denied: {req:?}")
+    });
+    let mut evaluator = build_evaluator_with_host_capabilities(
+        &wasm,
+        Some(channel),
+        BTreeSet::new(),
+        host_capabilities,
+    );
+
+    let response = tokio::task::block_in_place(|| {
+        evaluator.validate(
+            ValidateRequest::AdmissionRequest(Box::new(cluster_scoped_request())),
+            &PolicySettings::default(),
+        )
+    });
+
+    assert!(!response.allowed, "expected denial, got: {response:?}");
+    let actual_message = response.status.as_ref().and_then(|s| s.message.as_deref());
+    assert_eq!(
+        actual_message,
+        Some(message),
+        "expected rejection message {message:?}, got: {actual_message:?}"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Direct callback-channel mock helpers
 //
-// For kw.oci / kw.net / kw.crypto the ferricel runtime sends CallbackRequest
-// objects directly on the mpsc channel (no Kubernetes API involved).  We
-// bypass tower/kube entirely and handle the requests in a lightweight tokio
-// task.
+// For kw.oci / kw.net / kw.crypto requests arrive as CallbackRequest objects
+// on the mpsc channel (no Kubernetes API involved). We bypass tower/kube
+// entirely and handle the requests in a lightweight tokio task.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Spawn a direct mock that handles CallbackRequests by calling `handler`
@@ -560,7 +676,9 @@ fn cluster_scoped_request() -> AdmissionRequest {
 
 // ─── OCI tests ───────────────────────────────────────────────────────────────
 
-const VAP_OCI_MANIFEST: &str = r#"
+#[tokio::test(flavor = "multi_thread")]
+async fn test_oci_manifest() {
+    let vap = r#"
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -571,9 +689,7 @@ spec:
       message: "unexpected media type"
 "#;
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_oci_manifest() {
-    let wasm = compile_vap(VAP_OCI_MANIFEST);
+    let wasm = compile_vap(vap);
     let channel = spawn_direct_mock(|req| match req {
         CallbackRequestType::OciManifest { .. } => json!({
             "image": {
@@ -593,7 +709,9 @@ async fn test_oci_manifest() {
     assert!(response.allowed, "expected allowed, got: {response:?}");
 }
 
-const VAP_OCI_MANIFEST_DIGEST: &str = r#"
+#[tokio::test(flavor = "multi_thread")]
+async fn test_oci_manifest_digest() {
+    let vap = r#"
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -604,9 +722,7 @@ spec:
       message: "image must have a valid manifest digest"
 "#;
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_oci_manifest_digest() {
-    let wasm = compile_vap(VAP_OCI_MANIFEST_DIGEST);
+    let wasm = compile_vap(vap);
     let channel = spawn_direct_mock(|req| match req {
         CallbackRequestType::OciManifestDigest { .. } => json!("sha256:1234"),
         other => panic!("unexpected callback request: {other:?}"),
@@ -621,7 +737,9 @@ async fn test_oci_manifest_digest() {
     assert!(response.allowed, "expected allowed, got: {response:?}");
 }
 
-const VAP_OCI_MANIFEST_CONFIG: &str = r#"
+#[tokio::test(flavor = "multi_thread")]
+async fn test_oci_manifest_config() {
+    let vap = r#"
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -632,9 +750,7 @@ spec:
       message: "unexpected author"
 "#;
 
-#[tokio::test(flavor = "multi_thread")]
-async fn test_oci_manifest_config() {
-    let wasm = compile_vap(VAP_OCI_MANIFEST_CONFIG);
+    let wasm = compile_vap(vap);
     let channel = spawn_direct_mock(|req| match req {
         CallbackRequestType::OciManifestAndConfig { .. } => json!({
             "manifest": {},
@@ -655,7 +771,14 @@ async fn test_oci_manifest_config() {
 
 // ─── Net tests ───────────────────────────────────────────────────────────────
 
-const VAP_NET_LOOKUP_HOST: &str = r#"
+/// Verifies that `size()` works directly on the array returned by
+/// `kw.net.lookupHost` (i.e. `size(kw.net.lookupHost('example.com')) >= 1`).
+/// The mock returns `{"ips": ["1.1.1.1", "2.2.2.2"]}`; the handler extracts
+/// the `ips` array, giving `size == 2 >= 1` → allowed.
+/// Fixed in ferricel-core; see FERRICEL_ISSUES.md Issue 1.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_net_lookup_host() {
+    let vap = r#"
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -666,14 +789,7 @@ spec:
       message: "host must resolve to at least one address"
 "#;
 
-/// Verifies that `size()` works directly on the array returned by
-/// `kw.net.lookupHost` (i.e. `size(kw.net.lookupHost('example.com')) >= 1`).
-/// The mock returns `{"ips": ["1.1.1.1", "2.2.2.2"]}`; the handler extracts
-/// the `ips` array, giving `size == 2 >= 1` → allowed.
-/// Fixed in ferricel-core; see FERRICEL_ISSUES.md Issue 1.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_net_lookup_host() {
-    let wasm = compile_vap(VAP_NET_LOOKUP_HOST);
+    let wasm = compile_vap(vap);
     let channel = spawn_direct_mock(|req| match req {
         CallbackRequestType::DNSLookupHost { .. } => json!({"ips": ["1.1.1.1", "2.2.2.2"]}),
         other => panic!("unexpected callback request: {other:?}"),
@@ -690,7 +806,13 @@ async fn test_net_lookup_host() {
 
 // ─── Crypto tests ─────────────────────────────────────────────────────────────
 
-const VAP_CRYPTO_CERTIFICATE: &str = r#"
+/// Mirrors the cel-policy Go test:
+/// `kw.crypto.certificate('cert.pem').certificateChain('chain1.pem')
+///    .certificateChain('chain2.pem').notAfter(timestamp('2000-01-01T00:00:00Z'))
+///    .verify().isTrusted()`
+#[tokio::test(flavor = "multi_thread")]
+async fn test_crypto_verify_trusted() {
+    let vap = r#"
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -704,13 +826,7 @@ spec:
       message: "certificate must be trusted"
 "#;
 
-/// Mirrors the cel-policy Go test:
-/// `kw.crypto.certificate('cert.pem').certificateChain('chain1.pem')
-///    .certificateChain('chain2.pem').notAfter(timestamp('2000-01-01T00:00:00Z'))
-///    .verify().isTrusted()`
-#[tokio::test(flavor = "multi_thread")]
-async fn test_crypto_verify_trusted() {
-    let wasm = compile_vap(VAP_CRYPTO_CERTIFICATE);
+    let wasm = compile_vap(vap);
     let channel = spawn_direct_mock(|req| match req {
         CallbackRequestType::CryptoIsCertificateTrusted { .. } => {
             json!({"trusted": true, "reason": ""})
@@ -775,7 +891,11 @@ fn trusted_sigstore_response() -> serde_json::Value {
     json!({"is_trusted": true, "digest": "sha256:abc123"})
 }
 
-const VAP_SIGSTORE_PUBKEY: &str = r#"
+/// `kw.sigstore.image(...).annotation(k,v).pubKey(p1).pubKey(p2).verify().isTrusted()`
+/// Exercises MapEntry (annotation) + pubKey accumulation.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_sigstore_pubkey_verify() {
+    let vap = r#"
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -792,11 +912,7 @@ spec:
       message: "image must be signed with a trusted public key"
 "#;
 
-/// `kw.sigstore.image(...).annotation(k,v).pubKey(p1).pubKey(p2).verify().isTrusted()`
-/// Exercises MapEntry (annotation) + pubKey accumulation.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_sigstore_pubkey_verify() {
-    let wasm = compile_vap(VAP_SIGSTORE_PUBKEY);
+    let wasm = compile_vap(vap);
     let channel = spawn_direct_mock(|req| match req {
         CallbackRequestType::SigstorePubKeyVerify {
             image,
@@ -828,7 +944,11 @@ async fn test_sigstore_pubkey_verify() {
     assert!(response.allowed, "expected allowed, got: {response:?}");
 }
 
-const VAP_SIGSTORE_KEYLESS: &str = r#"
+/// `kw.sigstore.image(...).keyless(i1,s1).keyless(i2,s2).verify().isTrusted()`
+/// Exercises keyless accumulation + zip to Vec<KeylessInfo>.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_sigstore_keyless_verify() {
+    let vap = r#"
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -844,11 +964,7 @@ spec:
       message: "image must be signed with a trusted keyless signature"
 "#;
 
-/// `kw.sigstore.image(...).keyless(i1,s1).keyless(i2,s2).verify().isTrusted()`
-/// Exercises keyless accumulation + zip to Vec<KeylessInfo>.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_sigstore_keyless_verify() {
-    let wasm = compile_vap(VAP_SIGSTORE_KEYLESS);
+    let wasm = compile_vap(vap);
     let channel = spawn_direct_mock(|req| match req {
         CallbackRequestType::SigstoreKeylessVerify { image, keyless, .. } => {
             assert_eq!(image, "registry.example.com/app:latest");
@@ -869,7 +985,11 @@ async fn test_sigstore_keyless_verify() {
     assert!(response.allowed, "expected allowed, got: {response:?}");
 }
 
-const VAP_SIGSTORE_KEYLESS_PREFIX: &str = r#"
+/// `kw.sigstore.image(...).keylessPrefix(i1,u1).keylessPrefix(i2,u2).verify().isTrusted()`
+/// Exercises keylessPrefix accumulation + zip to Vec<KeylessPrefixInfo>.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_sigstore_keyless_prefix_verify() {
+    let vap = r#"
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -885,11 +1005,7 @@ spec:
       message: "image must be signed with a trusted keyless-prefix signature"
 "#;
 
-/// `kw.sigstore.image(...).keylessPrefix(i1,u1).keylessPrefix(i2,u2).verify().isTrusted()`
-/// Exercises keylessPrefix accumulation + zip to Vec<KeylessPrefixInfo>.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_sigstore_keyless_prefix_verify() {
-    let wasm = compile_vap(VAP_SIGSTORE_KEYLESS_PREFIX);
+    let wasm = compile_vap(vap);
     let channel = spawn_direct_mock(|req| match req {
         CallbackRequestType::SigstoreKeylessPrefixVerify {
             image,
@@ -914,7 +1030,11 @@ async fn test_sigstore_keyless_prefix_verify() {
     assert!(response.allowed, "expected allowed, got: {response:?}");
 }
 
-const VAP_SIGSTORE_GITHUB_ACTION_OWNER: &str = r#"
+/// `kw.sigstore.image(...).githubAction('myorg').verify().isTrusted()`
+/// Exercises the 1-arg githubAction overload (owner only, no repo).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_sigstore_github_action_owner_only() {
+    let vap = r#"
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -929,11 +1049,7 @@ spec:
       message: "image must be signed via GitHub Actions for org myorg"
 "#;
 
-/// `kw.sigstore.image(...).githubAction('myorg').verify().isTrusted()`
-/// Exercises the 1-arg githubAction overload (owner only, no repo).
-#[tokio::test(flavor = "multi_thread")]
-async fn test_sigstore_github_action_owner_only() {
-    let wasm = compile_vap(VAP_SIGSTORE_GITHUB_ACTION_OWNER);
+    let wasm = compile_vap(vap);
     let channel = spawn_direct_mock(|req| match req {
         CallbackRequestType::SigstoreGithubActionsVerify {
             image, owner, repo, ..
@@ -957,7 +1073,11 @@ async fn test_sigstore_github_action_owner_only() {
     assert!(response.allowed, "expected allowed, got: {response:?}");
 }
 
-const VAP_SIGSTORE_GITHUB_ACTION_OWNER_REPO: &str = r#"
+/// `kw.sigstore.image(...).githubAction('myorg','myrepo').verify().isTrusted()`
+/// Exercises the 2-arg githubAction overload (owner + repo).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_sigstore_github_action_owner_repo() {
+    let vap = r#"
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -972,11 +1092,7 @@ spec:
       message: "image must be signed via GitHub Actions for myorg/myrepo"
 "#;
 
-/// `kw.sigstore.image(...).githubAction('myorg','myrepo').verify().isTrusted()`
-/// Exercises the 2-arg githubAction overload (owner + repo).
-#[tokio::test(flavor = "multi_thread")]
-async fn test_sigstore_github_action_owner_repo() {
-    let wasm = compile_vap(VAP_SIGSTORE_GITHUB_ACTION_OWNER_REPO);
+    let wasm = compile_vap(vap);
     let channel = spawn_direct_mock(|req| match req {
         CallbackRequestType::SigstoreGithubActionsVerify {
             image, owner, repo, ..
@@ -1000,7 +1116,12 @@ async fn test_sigstore_github_action_owner_repo() {
     assert!(response.allowed, "expected allowed, got: {response:?}");
 }
 
-const VAP_SIGSTORE_CERTIFICATE: &str = r#"
+/// `kw.sigstore.image(...).certificate(pem).certificateChain(c1).certificateChain(c2)
+///    .requireRekorBundle(true).verify().isTrusted()`
+/// Exercises certificate + certificateChain accumulation + requireRekorBundle.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_sigstore_certificate_verify() {
+    let vap = r#"
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -1018,12 +1139,7 @@ spec:
       message: "image must be signed with the trusted certificate"
 "#;
 
-/// `kw.sigstore.image(...).certificate(pem).certificateChain(c1).certificateChain(c2)
-///    .requireRekorBundle(true).verify().isTrusted()`
-/// Exercises certificate + certificateChain accumulation + requireRekorBundle.
-#[tokio::test(flavor = "multi_thread")]
-async fn test_sigstore_certificate_verify() {
-    let wasm = compile_vap(VAP_SIGSTORE_CERTIFICATE);
+    let wasm = compile_vap(vap);
     let channel = spawn_direct_mock(|req| match req {
         CallbackRequestType::SigstoreCertificateVerify {
             image,
