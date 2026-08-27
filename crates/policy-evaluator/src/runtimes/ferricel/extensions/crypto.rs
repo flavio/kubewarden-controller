@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use ferricel_types::extensions::{BuilderChainDecl, BuilderStep, ExtensionDecl};
 use kubewarden_policy_sdk::host_capabilities::{
     crypto::{Certificate, CertificateEncoding},
@@ -5,10 +7,10 @@ use kubewarden_policy_sdk::host_capabilities::{
 };
 use serde_json::Value;
 
-use super::helpers::{require_channel, send_and_recv};
-use crate::{callback_requests::CallbackRequestType, evaluation_context::EvaluationContext};
-
-const CHANNEL_ERR: &str = "kw.crypto: callback channel is not set";
+use crate::{
+    callback_requests::CallbackRequestType, evaluation_context::EvaluationContext,
+    runtimes::ferricel::extensions::helpers::call_host,
+};
 
 /// `BuilderChainDecl` for the `kw.crypto` library.
 ///
@@ -90,11 +92,9 @@ pub fn reason_extension() -> ExtensionDecl {
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
 pub(crate) fn verify_handler(
-    eval_ctx: &EvaluationContext,
+    eval_ctx: &Arc<EvaluationContext>,
     builder_map: &Value,
 ) -> Result<Value, String> {
-    let channel = require_channel(eval_ctx).ok_or(CHANNEL_ERR)?;
-
     let cert_pem = builder_map["cert"]
         .as_str()
         .ok_or_else(|| "kw.crypto.verify: missing 'cert' field in builder map".to_string())?;
@@ -124,8 +124,10 @@ pub(crate) fn verify_handler(
         not_after,
     };
 
-    send_and_recv(
-        channel,
+    call_host(
+        eval_ctx,
+        "crypto",
+        "v1/is_certificate_trusted",
         CallbackRequestType::CryptoIsCertificateTrusted { request },
     )
     .map_err(|e| format!("kw.crypto.verify: {e}"))

@@ -1,9 +1,10 @@
+use std::sync::Arc;
+
 use serde_json::Value;
-use tokio::sync::oneshot;
 
 use crate::{
-    callback_requests::{CallbackRequest, CallbackRequestType, CallbackResponse},
-    evaluation_context::EvaluationContext,
+    callback_requests::CallbackRequestType, evaluation_context::EvaluationContext,
+    runtimes::callback::host_callback_typed,
 };
 
 // ─── Handler helpers ──────────────────────────────────────────────────────────
@@ -25,32 +26,25 @@ pub(crate) fn parse_field_masks(map: &Value) -> Option<std::collections::BTreeSe
     })
 }
 
-/// Return the callback channel, or `None` if it is not set.
-pub(crate) fn require_channel(
-    eval_ctx: &EvaluationContext,
-) -> Option<&tokio::sync::mpsc::Sender<CallbackRequest>> {
-    eval_ctx.callback_channel.as_ref()
-}
-
-/// Send a `CallbackRequest` via the channel and synchronously wait for the response.
-pub(crate) fn send_and_recv(
-    channel: &tokio::sync::mpsc::Sender<CallbackRequest>,
+/// Authorize and dispatch a `CallbackRequestType` built from a ferricel
+/// extension handler, synchronously waiting for the response.
+///
+/// This routes through [`host_callback_typed`] -- the single authorization
+/// gate (host-capability + Kubernetes-resource checks) for the callback
+/// channel, which waPC/Wasi policies also reach via their `host_callback`
+/// adapter -- so no gating logic lives in the ferricel handlers themselves.
+///
+/// Returns an error if the callback channel is not set; the channel handling
+/// is part of the shared dispatch path, so the error is the very same one
+/// waPC/Wasi guests get when no callback channel is available.
+pub(crate) fn call_host(
+    eval_ctx: &Arc<EvaluationContext>,
+    namespace: &str,
+    operation: &str,
     request_type: CallbackRequestType,
 ) -> Result<Value, String> {
-    let (tx, rx) = oneshot::channel::<anyhow::Result<CallbackResponse>>();
-    let req = CallbackRequest {
-        request: request_type,
-        response_channel: tx,
-    };
+    let payload = host_callback_typed(namespace, operation, request_type, eval_ctx)
+        .map_err(|e| e.to_string())?;
 
-    channel
-        .try_send(req)
-        .map_err(|e| format!("failed to send request via callback channel: {e}"))?;
-
-    match rx.blocking_recv() {
-        Ok(Ok(response)) => serde_json::from_slice(&response.payload)
-            .map_err(|e| format!("failed to deserialize response: {e}")),
-        Ok(Err(e)) => Err(format!("callback returned error: {e}")),
-        Err(e) => Err(format!("callback channel closed: {e}")),
-    }
+    serde_json::from_slice(&payload).map_err(|e| format!("failed to deserialize response: {e}"))
 }

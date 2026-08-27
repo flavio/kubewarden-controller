@@ -56,6 +56,16 @@ pub fn compiler_extension_decls() -> Vec<ExtensionDecl> {
 /// than being omitted from the map -- this way CEL expressions that call
 /// those functions receive a clear error message instead of a silent "extension
 /// not found" panic from the wasm runtime.
+///
+/// Every handler that performs a host call routes through
+/// [`crate::runtimes::callback::host_callback_typed`] -- the single
+/// authorization gate for the callback channel, which waPC/Wasi policies also
+/// reach via their `host_callback` adapter. This enforces both the
+/// host-capability allow list (`eval_ctx.host_capabilities`) and, for
+/// `kw.k8s.get`/`kw.k8s.list`, the Kubernetes resource allow list
+/// (`eval_ctx.ctx_aware_resources_allow_list`), so a ferricel policy can never
+/// use a host capability or read a Kubernetes resource that its
+/// `EvaluationContext` denies.
 pub(crate) fn build_extensions(eval_ctx: &EvaluationContext) -> HashMap<ExtensionKey, ExtensionFn> {
     let mut m: HashMap<ExtensionKey, ExtensionFn> = HashMap::new();
 
