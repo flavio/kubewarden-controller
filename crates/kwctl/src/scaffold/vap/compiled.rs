@@ -290,13 +290,11 @@ mod tests {
         let vap_data = open_vap_data("vap/vap-without-variables.yml", "vap/vap-binding.yml");
         let result = vap_compiled(vap_data, &wasm_path);
 
-        match result {
-            Ok(_) => panic!("expected an error but got Ok"),
-            Err(e) => assert!(
-                e.to_string().contains("metadata.yml already exists"),
-                "unexpected error: {e}"
-            ),
-        }
+        let e = result.expect_err("expected an error");
+        assert!(
+            e.to_string().contains("metadata.yml already exists"),
+            "unexpected error: {e}"
+        );
     }
 
     /// VAPs that use no host-capability extensions (kw.oci / kw.net / etc.)
