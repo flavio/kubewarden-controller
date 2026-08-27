@@ -279,9 +279,9 @@ mod tests {
         #[case] expected: bool,                      // expected detection result
     ) {
         let tmp = wasm_file_fn();
-        let result = ferricel_policy_detector(tmp.path().to_path_buf());
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), expected);
+        let result = ferricel_policy_detector(tmp.path().to_path_buf())
+            .expect("failed to detect ferricel policy");
+        assert_eq!(result, expected);
     }
 
     #[rstest]
