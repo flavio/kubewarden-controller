@@ -163,6 +163,14 @@ fn fetch_namespace_object(
         return Ok(Value::Null);
     }
 
+    // Intentionally bypasses the `kubernetes/get_resource` host-capability and
+    // Kubernetes-resource authorization gate (see
+    // `runtimes::callback::host_callback_typed`): this fetch implements VAP's
+    // built-in `namespaceObject` CEL binding, which is runtime infrastructure
+    // rather than a policy-invoked capability. Gating it would force every
+    // ferricel policy evaluating a namespaced resource to be explicitly
+    // granted access to `v1/Namespace`, even though the policy itself never
+    // calls `kw.k8s.get`/`list`.
     let channel = match &eval_ctx.callback_channel {
         Some(ch) => ch,
         None => {

@@ -1,10 +1,12 @@
+use std::sync::Arc;
+
 use ferricel_types::extensions::ExtensionDecl;
 use serde_json::Value;
 
-use super::helpers::{require_channel, send_and_recv};
-use crate::{callback_requests::CallbackRequestType, evaluation_context::EvaluationContext};
-
-const CHANNEL_ERR: &str = "kw.net.lookupHost: callback channel is not set";
+use crate::{
+    callback_requests::CallbackRequestType, evaluation_context::EvaluationContext,
+    runtimes::ferricel::extensions::helpers::call_host,
+};
 
 /// `ExtensionDecl` for `kw.net.lookupHost`.
 ///
@@ -26,18 +28,22 @@ pub fn lookup_host_extension() -> ExtensionDecl {
 // ─── Handler ─────────────────────────────────────────────────────────────────
 
 pub(crate) fn lookup_host_handler(
-    eval_ctx: &EvaluationContext,
+    eval_ctx: &Arc<EvaluationContext>,
     args: &[Value],
 ) -> Result<Value, String> {
-    let channel = require_channel(eval_ctx).ok_or(CHANNEL_ERR)?;
     let host = args
         .first()
         .and_then(|v| v.as_str())
         .ok_or_else(|| "kw.net.lookupHost: expected a string argument".to_string())?
         .to_owned();
 
-    let response = send_and_recv(channel, CallbackRequestType::DNSLookupHost { host })
-        .map_err(|e| format!("kw.net.lookupHost: {e}"))?;
+    let response = call_host(
+        eval_ctx,
+        "net",
+        "v1/dns_lookup_host",
+        CallbackRequestType::DNSLookupHost { host },
+    )
+    .map_err(|e| format!("kw.net.lookupHost: {e}"))?;
 
     // The callback returns `{"ips": ["1.1.1.1", ...]}` (LookupHostResponse).
     // The CEL expression expects a list<string>, so unwrap the `ips` field.

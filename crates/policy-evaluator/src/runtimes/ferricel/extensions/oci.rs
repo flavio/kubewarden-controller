@@ -1,10 +1,13 @@
+use std::sync::Arc;
+
 use ferricel_types::extensions::{BuilderChainDecl, BuilderStep, ExtensionDecl};
 use serde_json::Value;
 
-use super::helpers::{require_channel, send_and_recv, str_field};
-use crate::{callback_requests::CallbackRequestType, evaluation_context::EvaluationContext};
-
-const CHANNEL_ERR: &str = "kw.oci: callback channel is not set";
+use crate::{
+    callback_requests::CallbackRequestType,
+    evaluation_context::EvaluationContext,
+    runtimes::ferricel::extensions::helpers::{call_host, str_field},
+};
 
 /// `BuilderChainDecl` for the `kw.oci` library.
 ///
@@ -82,33 +85,45 @@ pub fn manifest_config_extension() -> ExtensionDecl {
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
 pub(crate) fn manifest_handler(
-    eval_ctx: &EvaluationContext,
+    eval_ctx: &Arc<EvaluationContext>,
     builder_map: &Value,
 ) -> Result<Value, String> {
-    let channel = require_channel(eval_ctx).ok_or(CHANNEL_ERR)?;
     let image = str_field(builder_map, "image").map_err(|e| format!("kw.oci.manifest: {e}"))?;
-    send_and_recv(channel, CallbackRequestType::OciManifest { image })
-        .map_err(|e| format!("kw.oci.manifest: {e}"))
+    call_host(
+        eval_ctx,
+        "oci",
+        "v1/oci_manifest",
+        CallbackRequestType::OciManifest { image },
+    )
+    .map_err(|e| format!("kw.oci.manifest: {e}"))
 }
 
 pub(crate) fn manifest_digest_handler(
-    eval_ctx: &EvaluationContext,
+    eval_ctx: &Arc<EvaluationContext>,
     builder_map: &Value,
 ) -> Result<Value, String> {
-    let channel = require_channel(eval_ctx).ok_or(CHANNEL_ERR)?;
     let image =
         str_field(builder_map, "image").map_err(|e| format!("kw.oci.manifestDigest: {e}"))?;
-    send_and_recv(channel, CallbackRequestType::OciManifestDigest { image })
-        .map_err(|e| format!("kw.oci.manifestDigest: {e}"))
+    call_host(
+        eval_ctx,
+        "oci",
+        "v1/manifest_digest",
+        CallbackRequestType::OciManifestDigest { image },
+    )
+    .map_err(|e| format!("kw.oci.manifestDigest: {e}"))
 }
 
 pub(crate) fn manifest_config_handler(
-    eval_ctx: &EvaluationContext,
+    eval_ctx: &Arc<EvaluationContext>,
     builder_map: &Value,
 ) -> Result<Value, String> {
-    let channel = require_channel(eval_ctx).ok_or(CHANNEL_ERR)?;
     let image =
         str_field(builder_map, "image").map_err(|e| format!("kw.oci.manifestConfig: {e}"))?;
-    send_and_recv(channel, CallbackRequestType::OciManifestAndConfig { image })
-        .map_err(|e| format!("kw.oci.manifestConfig: {e}"))
+    call_host(
+        eval_ctx,
+        "oci",
+        "v1/oci_manifest_config",
+        CallbackRequestType::OciManifestAndConfig { image },
+    )
+    .map_err(|e| format!("kw.oci.manifestConfig: {e}"))
 }
