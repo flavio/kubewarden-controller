@@ -8,7 +8,8 @@ use k8s_openapi::{
     api::admissionregistration::v1::{ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding},
     apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta},
 };
-use policy_evaluator::policy_metadata::Rule;
+use policy_evaluator::policy_metadata::{ContextAwareResource, Rule};
+use tracing::warn;
 
 pub(crate) fn vap(
     cel_policy_module: &str,
@@ -50,6 +51,11 @@ pub(crate) struct VapData {
     pub(crate) object_selector: Option<LabelSelector>,
     /// paramKind + paramRef settings (when both are present).
     pub(crate) param_settings: serde_yaml::Mapping,
+    /// The Kubernetes resource (apiVersion/kind) named by `paramKind`, when
+    /// present. This is the resource the compiled/interpreted policy fetches
+    /// at evaluation time via `paramRef`, and must be granted access to via
+    /// `spec.contextAwareResources` for the fetch to succeed.
+    pub(crate) param_resource: Option<ContextAwareResource>,
 }
 
 impl VapData {
@@ -65,10 +71,32 @@ impl VapData {
 
         // Params: both must be present together or both absent.
         let mut param_settings = serde_yaml::Mapping::new();
+        let mut param_resource = None;
         match (&vap_spec.param_kind, vap_binding_spec.param_ref) {
-            (Some(vap_param_kind), Some(vap_param_ref)) => {
+            (Some(vap_param_kind), Some(mut vap_param_ref)) => {
+                // The Kubernetes API marks `parameterNotFoundAction` as
+                // required, but a hand-written binding may omit it. Default
+                // to `Deny` (fail-closed) rather than silently forwarding an
+                // incomplete paramRef, which the ferricel/cel-policy runtime
+                // would reject at settings-validation time.
+                if vap_param_ref.parameter_not_found_action.is_none() {
+                    warn!(
+                        "paramRef.parameterNotFoundAction not set in the binding; defaulting to Deny"
+                    );
+                    vap_param_ref.parameter_not_found_action = Some("Deny".to_string());
+                }
+
                 param_settings.insert("paramKind".into(), serde_yaml::to_value(vap_param_kind)?);
-                param_settings.insert("paramRef".into(), serde_yaml::to_value(vap_param_ref)?);
+                param_settings.insert("paramRef".into(), serde_yaml::to_value(&vap_param_ref)?);
+
+                if let (Some(api_version), Some(kind)) =
+                    (&vap_param_kind.api_version, &vap_param_kind.kind)
+                {
+                    param_resource = Some(ContextAwareResource {
+                        api_version: api_version.clone(),
+                        kind: kind.clone(),
+                    });
+                }
             }
             (None, None) => {}
             _ => {
@@ -102,13 +130,20 @@ impl VapData {
             namespace_selector,
             object_selector,
             param_settings,
+            param_resource,
         })
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::path::Path;
+    use std::{fs::File, path::Path};
+
+    use k8s_openapi::api::admissionregistration::v1::{
+        ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding,
+    };
+
+    use super::VapData;
 
     pub(crate) const CEL_POLICY_MODULE: &str = "ghcr.io/kubewarden/policies/cel-policy:latest";
 
@@ -119,5 +154,47 @@ pub(crate) mod tests {
             .join(path)
             .to_string_lossy()
             .to_string()
+    }
+
+    fn open_vap_data(vap_yaml_path: &str, vap_binding_yaml_path: &str) -> VapData {
+        let yaml_file = File::open(test_data(vap_yaml_path)).expect("cannot open VAP yaml file");
+        let vap: ValidatingAdmissionPolicy =
+            serde_yaml::from_reader(yaml_file).expect("cannot parse VAP yaml file");
+
+        let yaml_file = File::open(test_data(vap_binding_yaml_path))
+            .expect("cannot open VAP binding yaml file");
+        let vap_binding: ValidatingAdmissionPolicyBinding =
+            serde_yaml::from_reader(yaml_file).expect("cannot parse VAP binding yaml file");
+
+        VapData::new(vap, vap_binding).expect("cannot build VapData")
+    }
+
+    #[test]
+    fn param_ref_parameter_not_found_action_defaults_to_deny_when_absent() {
+        let vap_data = open_vap_data(
+            "vap/vap-with-params.yml",
+            "vap/vap-binding-params-no-action.yml",
+        );
+
+        assert_eq!(
+            "Deny",
+            vap_data.param_settings["paramRef"]["parameterNotFoundAction"]
+                .as_str()
+                .expect("parameterNotFoundAction should be a string")
+        );
+    }
+
+    #[test]
+    fn param_ref_parameter_not_found_action_is_preserved_when_present() {
+        // The fixture explicitly sets parameterNotFoundAction to Deny; this
+        // pins that an explicit value is forwarded as-is (not overwritten).
+        let vap_data = open_vap_data("vap/vap-with-params.yml", "vap/vap-binding-params.yml");
+
+        assert_eq!(
+            "Deny",
+            vap_data.param_settings["paramRef"]["parameterNotFoundAction"]
+                .as_str()
+                .expect("parameterNotFoundAction should be a string")
+        );
     }
 }

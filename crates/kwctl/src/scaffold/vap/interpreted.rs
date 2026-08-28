@@ -69,6 +69,15 @@ pub(crate) fn vap_interpreted(
         settings.insert("validations".into(), kw_cel_validations.into());
     }
 
+    let mut context_aware_resources = BTreeSet::new();
+    if let Some(param_resource) = &vap_data.param_resource {
+        warn!(
+            "granting access to {}/{} via spec.contextAwareResources (required by paramKind); review before applying",
+            param_resource.api_version, param_resource.kind
+        );
+        context_aware_resources.insert(param_resource.clone());
+    }
+
     Ok(ClusterAdmissionPolicy {
         api_version: "policies.kubewarden.io/v1".to_string(),
         kind: "ClusterAdmissionPolicy".to_string(),
@@ -81,7 +90,7 @@ pub(crate) fn vap_interpreted(
             object_selector: vap_data.object_selector,
             mutating: false,
             background_audit: true,
-            context_aware_resources: BTreeSet::new(),
+            context_aware_resources,
             failure_policy: None,
             mode: None, // VAP policies are always in protect mode, which is the default for KW
             settings,
@@ -96,7 +105,7 @@ mod tests {
     use k8s_openapi::api::admissionregistration::v1::{
         ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding,
     };
-    use policy_evaluator::policy_metadata::Rule;
+    use policy_evaluator::policy_metadata::{ContextAwareResource, Rule};
     use rstest::*;
 
     use super::*;
@@ -111,6 +120,12 @@ mod tests {
     )]
     #[case::vap_with_variables("vap/vap-with-variables.yml", "vap/vap-binding.yml", true, false)]
     #[case::vap_with_params("vap/vap-with-params.yml", "vap/vap-binding-params.yml", false, true)]
+    #[case::vap_with_params_no_action(
+        "vap/vap-with-params.yml",
+        "vap/vap-binding-params-no-action.yml",
+        false,
+        true
+    )]
     #[case::only_param_kind("vap/vap-with-params.yml", "vap/vap-binding.yml", false, true)]
     #[case::only_param_ref(
         "vap/vap-without-variables.yml",
@@ -164,12 +179,29 @@ mod tests {
         assert!(!cluster_admission_policy.spec.mutating);
         assert_eq!(cluster_admission_policy.spec.rules, expected_rules);
         assert!(cluster_admission_policy.spec.background_audit);
-        assert!(
-            cluster_admission_policy
-                .spec
-                .context_aware_resources
-                .is_empty()
-        );
+        if has_params {
+            // The resource named by paramKind must be granted access to via
+            // spec.contextAwareResources, otherwise the policy would be
+            // denied when fetching it via paramRef at evaluation time.
+            assert!(
+                cluster_admission_policy
+                    .spec
+                    .context_aware_resources
+                    .contains(&ContextAwareResource {
+                        api_version: "v1".to_string(),
+                        kind: "ConfigMap".to_string(),
+                    }),
+                "context_aware_resources should contain the param resource (v1/ConfigMap), got: {:?}",
+                cluster_admission_policy.spec.context_aware_resources
+            );
+        } else {
+            assert!(
+                cluster_admission_policy
+                    .spec
+                    .context_aware_resources
+                    .is_empty()
+            );
+        }
         assert_eq!(
             expected_failure_policy,
             cluster_admission_policy.spec.settings["failurePolicy"]
@@ -223,8 +255,15 @@ mod tests {
                 expected_param_kind,
                 cluster_admission_policy.spec.settings["paramKind"]
             );
-            let expected_param_ref =
-                serde_yaml::to_value(vap_binding.clone().spec.unwrap().param_ref.unwrap()).unwrap();
+            // paramRef.parameterNotFoundAction must always be present in the
+            // generated settings: it's defaulted to Deny by VapData::new()
+            // when the binding omits it (some fixtures set it explicitly,
+            // others don't -- both must end up with a value here).
+            let mut expected_param_ref = vap_binding.clone().spec.unwrap().param_ref.unwrap();
+            if expected_param_ref.parameter_not_found_action.is_none() {
+                expected_param_ref.parameter_not_found_action = Some("Deny".to_string());
+            }
+            let expected_param_ref = serde_yaml::to_value(expected_param_ref).unwrap();
             assert_eq!(
                 expected_param_ref,
                 cluster_admission_policy.spec.settings["paramRef"]
