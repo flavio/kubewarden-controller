@@ -494,7 +494,11 @@ spec:
     // paramRef is stored in the ClusterAdmissionPolicy settings and forwarded
     // to the wasm as a binding so it can call kw.k8s.get to fetch the param resource.
     let settings = PolicySettings::try_from(&json!({
-        "paramRef": { "name": "replica-limit", "namespace": "default" }
+        "paramRef": {
+            "name": "replica-limit",
+            "namespace": "default",
+            "parameterNotFoundAction": "Deny"
+        }
     }))
     .unwrap();
 
