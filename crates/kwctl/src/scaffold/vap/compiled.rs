@@ -8,6 +8,7 @@ use policy_evaluator::{
     policy_evaluator::PolicyExecutionMode,
     policy_metadata::{ContextAwareResource, Metadata, PolicyType},
 };
+use tracing::warn;
 
 use crate::scaffold::{
     kubewarden_crds::{ClusterAdmissionPolicy, ClusterAdmissionPolicySpec},
@@ -50,7 +51,14 @@ pub(crate) fn vap_compiled(vap_data: VapData, wasm_path: &Path) -> Result<Cluste
     let caps = ferricel_host_capabilities(&used);
     let host_capabilities = if caps.is_empty() { None } else { Some(caps) };
 
-    write_metadata_file(&vap_data, &wasm_path_abs, host_capabilities)?;
+    let context_aware_resources = context_aware_resources_from_param(&vap_data);
+
+    write_metadata_file(
+        &vap_data,
+        &wasm_path_abs,
+        host_capabilities,
+        context_aware_resources.clone(),
+    )?;
 
     let module = format!("file://{}", wasm_path_abs.display());
 
@@ -66,12 +74,29 @@ pub(crate) fn vap_compiled(vap_data: VapData, wasm_path: &Path) -> Result<Cluste
             object_selector: vap_data.object_selector,
             mutating: false,
             background_audit: true,
-            context_aware_resources: BTreeSet::new(),
+            context_aware_resources,
             failure_policy: None,
             mode: None,
             settings: vap_data.param_settings,
         },
     })
+}
+
+/// Build the `spec.contextAwareResources` allow list granting the policy
+/// access to the resource named by `paramKind`, when present. Without this
+/// grant, a parameterized policy would be denied access to the resource it
+/// fetches via `paramRef` at evaluation time (see
+/// `EvaluationContext::can_access_kubernetes_resource`).
+fn context_aware_resources_from_param(vap_data: &VapData) -> BTreeSet<ContextAwareResource> {
+    let mut context_aware_resources = BTreeSet::new();
+    if let Some(param_resource) = &vap_data.param_resource {
+        warn!(
+            "granting access to {}/{} via spec.contextAwareResources (required by paramKind); review before applying",
+            param_resource.api_version, param_resource.kind
+        );
+        context_aware_resources.insert(param_resource.clone());
+    }
+    context_aware_resources
 }
 
 /// Write a `metadata.yml` file in the same directory as `wasm_path_abs`.
@@ -80,6 +105,7 @@ fn write_metadata_file(
     vap_data: &VapData,
     wasm_path_abs: &Path,
     host_capabilities: Option<BTreeSet<String>>,
+    context_aware_resources: BTreeSet<ContextAwareResource>,
 ) -> Result<()> {
     let metadata_path = wasm_path_abs
         .parent()
@@ -101,19 +127,6 @@ fn write_metadata_file(
     let mut annotations = std::collections::BTreeMap::new();
     if let Some(name) = vap_data.metadata.name.as_deref() {
         annotations.insert("io.kubewarden.policy.title".to_string(), name.to_string());
-    }
-
-    // Safety: VapData::new() already validated that spec is present.
-    let vap_spec = vap_data.vap.spec.as_ref().unwrap();
-
-    let mut context_aware_resources = BTreeSet::new();
-    if let Some(param_kind) = &vap_spec.param_kind
-        && let (Some(api_version), Some(kind)) = (&param_kind.api_version, &param_kind.kind)
-    {
-        context_aware_resources.insert(ContextAwareResource {
-            api_version: api_version.clone(),
-            kind: kind.clone(),
-        });
     }
 
     let policy_metadata = Metadata {
@@ -174,6 +187,11 @@ mod tests {
     #[case::vap_without_variables("vap/vap-without-variables.yml", "vap/vap-binding.yml", false)]
     #[case::vap_with_variables("vap/vap-with-variables.yml", "vap/vap-binding.yml", false)]
     #[case::vap_with_params("vap/vap-with-params.yml", "vap/vap-binding-params.yml", true)]
+    #[case::vap_with_params_no_action(
+        "vap/vap-with-params.yml",
+        "vap/vap-binding-params-no-action.yml",
+        true
+    )]
     fn compile_vap_to_wasm(
         #[case] vap_yaml_path: &str,
         #[case] vap_binding_yaml_path: &str,
@@ -209,7 +227,6 @@ mod tests {
         assert_eq!(expected_module, cap.spec.module);
         assert!(!cap.spec.mutating);
         assert!(cap.spec.background_audit);
-        assert!(cap.spec.context_aware_resources.is_empty());
         assert!(cap.spec.failure_policy.is_none());
         assert!(cap.spec.mode.is_none());
 
@@ -221,9 +238,33 @@ mod tests {
         if has_params {
             assert!(cap.spec.settings.contains_key("paramKind"));
             assert!(cap.spec.settings.contains_key("paramRef"));
+            // The resource named by paramKind must be granted access to via
+            // spec.contextAwareResources, otherwise the policy would be
+            // denied when fetching it via paramRef at evaluation time.
+            assert!(
+                cap.spec
+                    .context_aware_resources
+                    .contains(&ContextAwareResource {
+                        api_version: "v1".to_string(),
+                        kind: "ConfigMap".to_string(),
+                    }),
+                "context_aware_resources should contain the param resource (v1/ConfigMap), got: {:?}",
+                cap.spec.context_aware_resources
+            );
+            // paramRef.parameterNotFoundAction must always be present in the
+            // generated settings (defaulted to Deny by VapData::new() when
+            // the binding omits it), otherwise the ferricel runtime's
+            // settings validation would reject the policy at load time.
+            assert_eq!(
+                "Deny",
+                cap.spec.settings["paramRef"]["parameterNotFoundAction"]
+                    .as_str()
+                    .expect("parameterNotFoundAction should be a string")
+            );
         } else {
             assert!(!cap.spec.settings.contains_key("paramKind"));
             assert!(!cap.spec.settings.contains_key("paramRef"));
+            assert!(cap.spec.context_aware_resources.is_empty());
         }
 
         assert_eq!(cap.spec.rules, expected_rules);
@@ -254,27 +295,38 @@ mod tests {
 
     #[test]
     fn metadata_yml_contains_context_aware_resources_for_params() {
-        use policy_evaluator::policy_metadata::ContextAwareResource;
-
         let dir = TempDir::new().unwrap();
         let wasm_path = dir.path().join("policy.wasm");
 
         let vap_data = open_vap_data("vap/vap-with-params.yml", "vap/vap-binding-params.yml");
-        vap_compiled(vap_data, &wasm_path).unwrap();
+        let cap = vap_compiled(vap_data, &wasm_path).unwrap();
 
         let metadata_path = dir.path().join("metadata.yml");
         let metadata: Metadata =
             serde_yaml::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
 
+        let expected_resource = ContextAwareResource {
+            api_version: "v1".to_string(),
+            kind: "ConfigMap".to_string(),
+        };
+
         assert!(
             metadata
                 .context_aware_resources
-                .contains(&ContextAwareResource {
-                    api_version: "v1".to_string(),
-                    kind: "ConfigMap".to_string(),
-                }),
+                .contains(&expected_resource),
             "context_aware_resources should contain the param resource (v1/ConfigMap), got: {:?}",
             metadata.context_aware_resources
+        );
+
+        // The CRD's spec.contextAwareResources must match metadata.yml,
+        // otherwise the parameterized policy would be denied access to the
+        // resource it fetches via paramRef at evaluation time.
+        assert!(
+            cap.spec
+                .context_aware_resources
+                .contains(&expected_resource),
+            "spec.contextAwareResources should contain the param resource (v1/ConfigMap), got: {:?}",
+            cap.spec.context_aware_resources
         );
     }
 
