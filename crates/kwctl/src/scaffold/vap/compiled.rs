@@ -1,4 +1,9 @@
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{
+    collections::BTreeSet,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Result, anyhow};
 use ferricel_core::compiler::Builder as CompilerBuilder;
@@ -8,6 +13,7 @@ use policy_evaluator::{
     policy_evaluator::PolicyExecutionMode,
     policy_metadata::{ContextAwareResource, Metadata, PolicyType},
 };
+use tempfile::NamedTempFile;
 use tracing::warn;
 
 use crate::scaffold::{
@@ -15,10 +21,104 @@ use crate::scaffold::{
     vap::VapData,
 };
 
+/// Derive the path of the `metadata.yml` file that sits alongside `wasm_path`.
+fn metadata_path_for(wasm_path: &Path) -> Result<PathBuf> {
+    Ok(parent_dir_of(wasm_path).join("metadata.yml"))
+}
+
+/// Directory `path` lives in, defaulting to `.` when `path` has no parent
+/// component (e.g. a bare file name like `policy.wasm`).
+fn parent_dir_of(path: &Path) -> PathBuf {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
+/// Write `contents` to `path` atomically: the data is first staged in a
+/// temporary file created in the same directory as `path` (so the final
+/// rename is guaranteed to be an atomic same-filesystem operation), fsync'd,
+/// and then moved into place. `path` therefore either ends up holding the
+/// complete new content, or is left exactly as it was before the call -
+/// never truncated or partially written, regardless of where a failure
+/// occurs.
+///
+/// Unless `force` is set, the rename fails (leaving both the temp file
+/// cleaned up and `path` untouched) if `path` already exists.
+fn write_output_file(path: &Path, contents: &[u8], force: bool, what: &str) -> Result<()> {
+    let dir = parent_dir_of(path);
+
+    let mut tmp = NamedTempFile::new_in(&dir).map_err(|e| {
+        anyhow!(
+            "cannot create temporary file for {what} in {}: {e}",
+            dir.display()
+        )
+    })?;
+
+    tmp.write_all(contents)
+        .and_then(|()| tmp.as_file().sync_all())
+        .map_err(|e| anyhow!("cannot write {what} to {}: {e}", path.display()))?;
+
+    // NamedTempFile is created with 0600 permissions; restore the usual
+    // world-readable mode the previous fs::write()-based implementation
+    // produced for these output files.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tmp.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o644))
+            .map_err(|e| anyhow!("cannot set permissions on {what}: {e}"))?;
+    }
+
+    if force {
+        tmp.persist(path)
+            .map_err(|e| anyhow!("cannot write {what} to {}: {}", path.display(), e.error))?;
+    } else {
+        tmp.persist_noclobber(path).map_err(|e| {
+            if e.error.kind() == std::io::ErrorKind::AlreadyExists {
+                anyhow!(
+                    "{what} already exists at {}, use --force to overwrite",
+                    path.display()
+                )
+            } else {
+                anyhow!("cannot write {what} to {}: {}", path.display(), e.error)
+            }
+        })?;
+    }
+
+    Ok(())
+}
+
 /// Compiled path: compiles the VAP CEL expressions to Wasm, writes the module
 /// to `wasm_path`, generates a `metadata.yml` alongside it, and builds a
 /// [`ClusterAdmissionPolicy`] with only paramKind + paramRef in settings.
-pub(crate) fn vap_compiled(vap_data: VapData, wasm_path: &Path) -> Result<ClusterAdmissionPolicy> {
+///
+/// Unless `force` is set, neither `wasm_path` nor the `metadata.yml` written
+/// alongside it are allowed to already exist: the check happens before any
+/// compilation or write happens, so a conflict on either destination leaves
+/// both untouched.
+pub(crate) fn vap_compiled(
+    vap_data: VapData,
+    wasm_path: &Path,
+    force: bool,
+) -> Result<ClusterAdmissionPolicy> {
+    let metadata_path = metadata_path_for(wasm_path)?;
+
+    if !force {
+        if wasm_path.exists() {
+            return Err(anyhow!(
+                "{} already exists, use --force to overwrite",
+                wasm_path.display()
+            ));
+        }
+        if metadata_path.exists() {
+            return Err(anyhow!(
+                "metadata.yml already exists at {}, use --force to overwrite",
+                metadata_path.display()
+            ));
+        }
+    }
+
     // Register all Kubewarden host-capability builder chains and extension
     // declarations so the compiler accepts CEL expressions that call kw.oci,
     // kw.net, kw.crypto, etc. in addition to kw.k8s (auto-registered by ferricel-core).
@@ -34,8 +134,7 @@ pub(crate) fn vap_compiled(vap_data: VapData, wasm_path: &Path) -> Result<Cluste
         .compile_vap_from_policy(&vap_data.vap)
         .map_err(|e| anyhow!("failed to compile VAP to Wasm: {e}"))?;
 
-    fs::write(wasm_path, &wasm_bytes)
-        .map_err(|e| anyhow!("cannot write Wasm module to {}: {e}", wasm_path.display()))?;
+    write_output_file(wasm_path, &wasm_bytes, force, "Wasm module")?;
 
     // Canonicalize only after the file has been written, otherwise a relative
     // (and, until now, non-existing) output path would fall back to the
@@ -53,12 +152,25 @@ pub(crate) fn vap_compiled(vap_data: VapData, wasm_path: &Path) -> Result<Cluste
 
     let context_aware_resources = context_aware_resources_from_param(&vap_data);
 
-    write_metadata_file(
+    if let Err(e) = write_metadata_file(
         &vap_data,
-        &wasm_path_abs,
+        &metadata_path,
         host_capabilities,
         context_aware_resources.clone(),
-    )?;
+        force,
+    ) {
+        if !force {
+            // Best-effort rollback: metadata.yml failed to write and `force`
+            // was not set, so `wasm_path` is guaranteed to have been freshly
+            // created by the `persist_noclobber()` call above (the earlier
+            // pre-check plus the noclobber rename together rule out it
+            // having existed before this invocation). Remove it so the
+            // failure leaves no artifacts behind, matching the guarantee we
+            // give for the `metadata.yml`-already-exists case.
+            let _ = fs::remove_file(wasm_path);
+        }
+        return Err(e);
+    }
 
     let module = format!("file://{}", wasm_path_abs.display());
 
@@ -99,31 +211,17 @@ fn context_aware_resources_from_param(vap_data: &VapData) -> BTreeSet<ContextAwa
     context_aware_resources
 }
 
-/// Write a `metadata.yml` file in the same directory as `wasm_path_abs`.
-/// Returns an error if the file already exists.
+/// Write a `metadata.yml` file at `metadata_path`. Existence of the file was
+/// already checked (unless `force` is set) before any Wasm/metadata write
+/// took place; `force` is only forwarded here to pick the right write
+/// strategy.
 fn write_metadata_file(
     vap_data: &VapData,
-    wasm_path_abs: &Path,
+    metadata_path: &Path,
     host_capabilities: Option<BTreeSet<String>>,
     context_aware_resources: BTreeSet<ContextAwareResource>,
+    force: bool,
 ) -> Result<()> {
-    let metadata_path = wasm_path_abs
-        .parent()
-        .ok_or_else(|| {
-            anyhow!(
-                "cannot determine parent directory of {}",
-                wasm_path_abs.display()
-            )
-        })?
-        .join("metadata.yml");
-
-    if metadata_path.exists() {
-        return Err(anyhow!(
-            "metadata.yml already exists at {}",
-            metadata_path.display()
-        ));
-    }
-
     let mut annotations = std::collections::BTreeMap::new();
     if let Some(name) = vap_data.metadata.name.as_deref() {
         annotations.insert("io.kubewarden.policy.title".to_string(), name.to_string());
@@ -148,12 +246,12 @@ fn write_metadata_file(
 
     let metadata_yaml = serde_yaml::to_string(&policy_metadata)
         .map_err(|e| anyhow!("cannot serialize metadata to YAML: {e}"))?;
-    fs::write(&metadata_path, metadata_yaml).map_err(|e| {
-        anyhow!(
-            "cannot write metadata.yml to {}: {e}",
-            metadata_path.display()
-        )
-    })?;
+    write_output_file(
+        metadata_path,
+        metadata_yaml.as_bytes(),
+        force,
+        "metadata.yml",
+    )?;
 
     Ok(())
 }
@@ -181,6 +279,16 @@ mod tests {
             serde_yaml::from_reader(yaml_file).unwrap();
 
         VapData::new(vap, vap_binding).unwrap()
+    }
+
+    /// Names of the entries directly inside `dir`, for asserting that no
+    /// stray temporary files (e.g. leftover `.tmp*` staging files) are left
+    /// behind after a `vap_compiled` call, success or failure.
+    fn dir_entry_names(dir: &Path) -> std::collections::BTreeSet<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
     }
 
     #[rstest]
@@ -222,7 +330,7 @@ mod tests {
         let expected_module = format!("file://{}", wasm_path.display());
 
         let vap_data = VapData::new(vap, vap_binding).unwrap();
-        let cap = vap_compiled(vap_data, &wasm_path).unwrap();
+        let cap = vap_compiled(vap_data, &wasm_path, false).unwrap();
 
         assert_eq!(expected_module, cap.spec.module);
         assert!(!cap.spec.mutating);
@@ -278,7 +386,7 @@ mod tests {
         let wasm_path = dir.path().join("policy.wasm");
 
         let vap_data = open_vap_data(vap_yaml_path, vap_binding_yaml_path);
-        vap_compiled(vap_data, &wasm_path).unwrap();
+        vap_compiled(vap_data, &wasm_path, false).unwrap();
 
         let metadata_path = dir.path().join("metadata.yml");
         assert!(metadata_path.exists(), "metadata.yml should be created");
@@ -291,6 +399,15 @@ mod tests {
         assert!(metadata.context_aware_resources.is_empty());
         assert!(metadata.protocol_version.is_none());
         assert!(!metadata.rules.is_empty());
+        // No leftover staging file from either atomic rename.
+        assert_eq!(
+            std::collections::BTreeSet::from([
+                "policy.wasm".to_string(),
+                "metadata.yml".to_string()
+            ]),
+            dir_entry_names(dir.path()),
+            "no temporary staging files should be left behind"
+        );
     }
 
     #[test]
@@ -299,7 +416,7 @@ mod tests {
         let wasm_path = dir.path().join("policy.wasm");
 
         let vap_data = open_vap_data("vap/vap-with-params.yml", "vap/vap-binding-params.yml");
-        let cap = vap_compiled(vap_data, &wasm_path).unwrap();
+        let cap = vap_compiled(vap_data, &wasm_path, false).unwrap();
 
         let metadata_path = dir.path().join("metadata.yml");
         let metadata: Metadata =
@@ -340,12 +457,125 @@ mod tests {
         fs::write(&metadata_path, b"existing content").unwrap();
 
         let vap_data = open_vap_data("vap/vap-without-variables.yml", "vap/vap-binding.yml");
-        let result = vap_compiled(vap_data, &wasm_path);
+        let result = vap_compiled(vap_data, &wasm_path, false);
 
         let e = result.expect_err("expected an error");
         assert!(
             e.to_string().contains("metadata.yml already exists"),
             "unexpected error: {e}"
+        );
+        // A conflict on metadata.yml must not leave a policy.wasm behind.
+        assert!(
+            !wasm_path.exists(),
+            "policy.wasm should not have been created when metadata.yml already exists"
+        );
+        // Only the pre-existing metadata.yml should remain: no leftover
+        // staging file from the aborted wasm write.
+        assert_eq!(
+            std::collections::BTreeSet::from(["metadata.yml".to_string()]),
+            dir_entry_names(dir.path()),
+            "no temporary staging files should be left behind"
+        );
+    }
+
+    #[test]
+    fn wasm_already_exists_returns_error() {
+        let dir = TempDir::new().unwrap();
+        let wasm_path = dir.path().join("policy.wasm");
+
+        // pre-create policy.wasm to trigger the conflict
+        fs::write(&wasm_path, b"existing wasm content").unwrap();
+
+        let vap_data = open_vap_data("vap/vap-without-variables.yml", "vap/vap-binding.yml");
+        let result = vap_compiled(vap_data, &wasm_path, false);
+
+        let e = result.expect_err("expected an error");
+        assert!(
+            e.to_string().contains("already exists"),
+            "unexpected error: {e}"
+        );
+        assert_eq!(
+            b"existing wasm content".to_vec(),
+            fs::read(&wasm_path).unwrap(),
+            "existing policy.wasm must not be overwritten"
+        );
+        assert!(
+            !dir.path().join("metadata.yml").exists(),
+            "metadata.yml should not have been created when policy.wasm already exists"
+        );
+        // Only the pre-existing policy.wasm should remain: no leftover
+        // staging file from the aborted metadata write.
+        assert_eq!(
+            std::collections::BTreeSet::from(["policy.wasm".to_string()]),
+            dir_entry_names(dir.path()),
+            "no temporary staging files should be left behind"
+        );
+    }
+
+    #[test]
+    fn force_overwrites_existing_outputs() {
+        let dir = TempDir::new().unwrap();
+        let wasm_path = dir.path().join("policy.wasm");
+        let metadata_path = dir.path().join("metadata.yml");
+
+        fs::write(&wasm_path, b"stale wasm content").unwrap();
+        fs::write(&metadata_path, b"stale metadata content").unwrap();
+
+        let vap_data = open_vap_data("vap/vap-without-variables.yml", "vap/vap-binding.yml");
+        vap_compiled(vap_data, &wasm_path, true).unwrap();
+
+        assert_ne!(
+            b"stale wasm content".to_vec(),
+            fs::read(&wasm_path).unwrap(),
+            "policy.wasm should have been overwritten with --force"
+        );
+        let metadata: Metadata = serde_yaml::from_str(&fs::read_to_string(&metadata_path).unwrap())
+            .expect("metadata.yml should have been overwritten with valid YAML");
+        assert_eq!(metadata.execution_mode, PolicyExecutionMode::Ferricel);
+        // No leftover staging file from either atomic rename.
+        assert_eq!(
+            std::collections::BTreeSet::from([
+                "policy.wasm".to_string(),
+                "metadata.yml".to_string()
+            ]),
+            dir_entry_names(dir.path()),
+            "no temporary staging files should be left behind"
+        );
+    }
+
+    #[test]
+    fn write_output_file_does_not_overwrite_on_conflict_and_leaves_no_staging_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("out.txt");
+        fs::write(&path, b"original").unwrap();
+
+        let err = write_output_file(&path, b"new content", false, "test file")
+            .expect_err("expected a conflict error");
+        assert!(
+            err.to_string().contains("already exists"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(b"original".to_vec(), fs::read(&path).unwrap());
+        assert_eq!(
+            std::collections::BTreeSet::from(["out.txt".to_string()]),
+            dir_entry_names(dir.path()),
+            "no temporary staging file should be left behind after a conflict"
+        );
+    }
+
+    #[test]
+    fn write_output_file_force_replaces_content_atomically() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("out.txt");
+        fs::write(&path, b"original").unwrap();
+
+        write_output_file(&path, b"replaced", true, "test file").unwrap();
+
+        assert_eq!(b"replaced".to_vec(), fs::read(&path).unwrap());
+        assert_eq!(
+            std::collections::BTreeSet::from(["out.txt".to_string()]),
+            dir_entry_names(dir.path()),
+            "no temporary staging file should be left behind after a forced replace"
         );
     }
 
@@ -362,7 +592,7 @@ mod tests {
         let wasm_path = dir.path().join("policy.wasm");
 
         let vap_data = open_vap_data(vap_yaml_path, vap_binding_yaml_path);
-        vap_compiled(vap_data, &wasm_path).unwrap();
+        vap_compiled(vap_data, &wasm_path, false).unwrap();
 
         let metadata_path = dir.path().join("metadata.yml");
         let metadata: Metadata =
@@ -382,7 +612,7 @@ mod tests {
         let wasm_path = dir.path().join("policy.wasm");
 
         let vap_data = open_vap_data("vap/vap-with-host-capabilities.yml", "vap/vap-binding.yml");
-        vap_compiled(vap_data, &wasm_path).unwrap();
+        vap_compiled(vap_data, &wasm_path, false).unwrap();
 
         let metadata_path = dir.path().join("metadata.yml");
         let metadata: Metadata =
