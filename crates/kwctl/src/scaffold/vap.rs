@@ -16,6 +16,7 @@ pub(crate) fn vap(
     vap_path: &Path,
     binding_path: &Path,
     compile_to_wasm: Option<&Path>,
+    force: bool,
 ) -> Result<()> {
     let vap_file = File::open(vap_path)
         .map_err(|e| anyhow!("cannot open {}: {e}", vap_path.to_str().unwrap()))?;
@@ -32,7 +33,7 @@ pub(crate) fn vap(
     let vap_data = VapData::new(vap, vap_binding)?;
 
     let cluster_admission_policy = match compile_to_wasm {
-        Some(wasm_path) => compiled::vap_compiled(vap_data, wasm_path)?,
+        Some(wasm_path) => compiled::vap_compiled(vap_data, wasm_path, force)?,
         None => interpreted::vap_interpreted(cel_policy_module, vap_data)?,
     };
 

@@ -529,6 +529,12 @@ fn subcommand_scaffold() -> Command {
             .value_name("FILE")
             .conflicts_with("cel-policy")
             .help("Compile the VAP CEL expressions into a standalone Wasm module and write it to FILE"),
+        Arg::new("force")
+            .long("force")
+            .short('f')
+            .num_args(0)
+            .requires("compile-to-wasm")
+            .help("Overwrite FILE and metadata.yml if they already exist (only valid together with --compile-to-wasm)"),
         Arg::new("policy")
             .long("policy")
             .short('p')
