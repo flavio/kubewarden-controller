@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use wasmtime_provider::wasmtime;
+
 use crate::{
     evaluation_context::EvaluationContext,
     runtimes::ferricel::{errors::FerricelRuntimeError, stack_pre::StackPre},
@@ -24,9 +26,19 @@ impl Stack {
     }
 
     /// Evaluate the compiled Wasm module with the given JSON-encoded bindings.
+    ///
+    /// If the evaluation is interrupted because the epoch deadline configured
+    /// via [`EvaluationContext::epoch_deadline`] was exceeded, this returns
+    /// [`FerricelRuntimeError::ExecutionDeadlineExceeded`] instead of the
+    /// generic [`FerricelRuntimeError::EvalFailed`], so callers can surface a
+    /// clear timeout error rather than a raw wasmtime trap message.
     pub fn eval(&self, bindings_json: Option<&str>) -> Result<String, FerricelRuntimeError> {
-        self.engine
-            .eval(bindings_json)
-            .map_err(FerricelRuntimeError::EvalFailed)
+        self.engine.eval(bindings_json).map_err(|e| {
+            if matches!(e.downcast_ref::<wasmtime::Trap>(), Some(wasmtime::Trap::Interrupt)) {
+                FerricelRuntimeError::ExecutionDeadlineExceeded
+            } else {
+                FerricelRuntimeError::EvalFailed(e)
+            }
+        })
     }
 }
