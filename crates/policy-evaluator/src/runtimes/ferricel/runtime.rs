@@ -10,7 +10,7 @@ use crate::{
     callback_requests::{CallbackRequest, CallbackRequestType},
     evaluation_context::EvaluationContext,
     policy_evaluator::{PolicySettings, ValidateRequest},
-    runtimes::ferricel::stack::Stack,
+    runtimes::ferricel::{errors::FerricelRuntimeError, stack::Stack},
 };
 
 pub(crate) struct Runtime<'a>(pub(crate) &'a Stack);
@@ -64,6 +64,15 @@ impl Runtime<'_> {
                     format!("Cannot deserialize ferricel response: {e}"),
                 ),
             },
+            Err(FerricelRuntimeError::ExecutionDeadlineExceeded) => {
+                error!(policy_id = %self.0.eval_ctx().policy_id, "policy execution time exceeded");
+                AdmissionResponse::reject(
+                    request.uid().to_string(),
+                    "Policy execution interrupted because it exceeded the allowed execution time"
+                        .to_owned(),
+                    500,
+                )
+            }
             Err(e) => AdmissionResponse::reject_internal_server_error(
                 request.uid().to_string(),
                 e.to_string(),
