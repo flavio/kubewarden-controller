@@ -86,6 +86,52 @@ fn build_evaluator_with_host_capabilities(
         .unwrap_or_else(|e| panic!("cannot rehydrate evaluator: {e}"))
 }
 
+/// Builds an evaluator with Wasmtime epoch interruption enabled on the engine
+/// (when `enable_interruption` is `true`) and the given `epoch_deadline` (in
+/// ticks) set on the `EvaluationContext`.
+///
+/// These two knobs are independent: `PolicyEvaluatorBuilder::enable_epoch_interruptions`
+/// only flips on `wasmtime::Config::epoch_interruption` for the engine (its own
+/// deadline arguments are consumed by the waPC runtime, not ferricel); the
+/// per-evaluation deadline that ferricel actually honors comes from
+/// `EvaluationContext::epoch_deadline`, forwarded via `StackPre::rehydrate`.
+/// This lets tests exercise "interruption enabled but no deadline set" (which
+/// must trap immediately) independently of "deadline set" (which must not).
+///
+/// The engine's epoch counter is never incremented here, so `Some(deadline)`
+/// only exercises the "deadline was set on the Store" path, not an actual
+/// timeout-triggered interruption.
+fn build_evaluator_with_epoch_deadline(
+    wasm: &[u8],
+    callback_channel: Option<tokio::sync::mpsc::Sender<CallbackRequest>>,
+    enable_interruption: bool,
+    epoch_deadline: Option<u64>,
+) -> policy_evaluator::policy_evaluator::PolicyEvaluator {
+    let mut builder = PolicyEvaluatorBuilder::new()
+        .policy_contents(wasm)
+        .execution_mode(PolicyExecutionMode::Ferricel);
+    if enable_interruption {
+        // The deadline values passed here are irrelevant to the ferricel
+        // runtime: they only configure the waPC-specific `EpochDeadlines`
+        // struct on the builder, whose sole effect on ferricel is enabling
+        // `wasmtime::Config::epoch_interruption` on the shared engine.
+        builder = builder.enable_epoch_interruptions(u64::MAX, u64::MAX);
+    }
+    let pre = builder
+        .build_pre()
+        .unwrap_or_else(|e| panic!("cannot build PolicyEvaluatorPre: {e}"));
+    let eval_ctx = EvaluationContext {
+        policy_id: "test-ferricel".to_owned(),
+        callback_channel,
+        ctx_aware_resources_allow_list: BTreeSet::new(),
+        epoch_deadline,
+        host_capabilities: HostCapabilities::AllowAll,
+    };
+    pre.rehydrate(&eval_ctx)
+        .unwrap_or_else(|e| panic!("cannot rehydrate evaluator: {e}"))
+}
+
+
 /// Mock scenario that handles:
 /// - GET /api/v1  -- API discovery requests made by the kube client on startup
 /// - GET /api/v1/namespaces/{name}  -- namespace fetch requests from ferricel runtime
@@ -405,6 +451,69 @@ async fn test_raw_request_is_rejected() {
     assert!(
         msg.contains("does not support raw"),
         "expected message to mention raw support, got: {msg:?}"
+    );
+}
+
+/// Trivial cluster-scoped VAP used by the epoch-deadline tests below. Using a
+/// cluster-scoped request (see `cluster_scoped_request`) means no
+/// `namespaceObject` fetch is attempted, so these tests need no callback
+/// channel and can focus purely on epoch-deadline behavior.
+const VAP_ALWAYS_ALLOW: &str = r#"
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: always-allow
+spec:
+  validations:
+    - expression: "true"
+      message: "unreachable"
+"#;
+
+/// Regression test for epoch-deadline propagation: `StackPre::rehydrate` must
+/// forward `eval_ctx.epoch_deadline` into `ferricel_core`'s `Store` (via
+/// `EnginePre::rehydrate`). With Wasmtime epoch interruption enabled on the
+/// engine, an evaluation with a deadline set must succeed normally (the
+/// engine's epoch counter is never incremented in this test, so nothing times
+/// out) -- without the fix, ferricel-core traps immediately because no
+/// deadline reaches the Store.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_epoch_deadline_is_propagated_to_ferricel_store() {
+    let wasm = compile_vap(VAP_ALWAYS_ALLOW);
+    let mut evaluator = build_evaluator_with_epoch_deadline(&wasm, None, true, Some(2));
+
+    let response = evaluator.validate(
+        ValidateRequest::AdmissionRequest(Box::new(cluster_scoped_request())),
+        &PolicySettings::default(),
+    );
+
+    assert!(
+        response.allowed,
+        "expected the evaluation to succeed once the epoch deadline is set, got: {response:?}"
+    );
+}
+
+/// When Wasmtime epoch interruption is enabled on the engine but no deadline
+/// is configured for this evaluation (`epoch_deadline: None`), the Wasm guest
+/// traps immediately. This must be surfaced as a clear "execution deadline
+/// exceeded" rejection (500), mirroring the waPC runtime's behavior, rather
+/// than a raw wasmtime trap message.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_missing_epoch_deadline_on_interruption_enabled_engine_is_reported_as_timeout() {
+    let wasm = compile_vap(VAP_ALWAYS_ALLOW);
+    let mut evaluator = build_evaluator_with_epoch_deadline(&wasm, None, true, None);
+
+    let response = evaluator.validate(
+        ValidateRequest::AdmissionRequest(Box::new(cluster_scoped_request())),
+        &PolicySettings::default(),
+    );
+
+    assert!(!response.allowed, "expected rejection, got: {response:?}");
+    let status = response.status.as_ref().expect("expected a status");
+    assert_eq!(Some(500), status.code);
+    let msg = status.message.as_deref().unwrap_or("");
+    assert!(
+        msg.contains("exceeded the allowed execution time"),
+        "expected message to mention the execution deadline, got: {msg:?}"
     );
 }
 

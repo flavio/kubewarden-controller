@@ -49,10 +49,20 @@ impl StackPre {
     ///
     /// Every extension is always registered. Extensions that require a callback
     /// channel return a clear error if `eval_ctx.callback_channel` is `None`.
+    ///
+    /// `eval_ctx.epoch_deadline`, when set, is forwarded to
+    /// [`ferricel_core::runtime::EnginePre::rehydrate`] and applied to the
+    /// [`wasmtime::Store`] created for every evaluation. This requires the
+    /// shared [`wasmtime::Engine`] used to build this `StackPre` to have been
+    /// created with `epoch_interruption` enabled (see
+    /// `PolicyEvaluatorBuilder::enable_epoch_interruptions`); otherwise the
+    /// deadline has no effect. Conversely, if epoch interruption is enabled on
+    /// the engine but no deadline is set here, evaluation traps immediately.
     pub(crate) fn rehydrate(&self, eval_ctx: &EvaluationContext) -> ferricel_core::runtime::Engine {
         self.engine_pre.rehydrate(
             extensions::build_extensions(eval_ctx),
             logging::policy_logger(eval_ctx.policy_id.clone()),
+            eval_ctx.epoch_deadline,
         )
     }
 }
