@@ -79,6 +79,12 @@ pub enum PolicyEvaluatorBuilderError {
 
     #[error("error when building ferricel precompiled stack: {0}")]
     NewFerricelStackPre(#[source] crate::runtimes::ferricel::errors::FerricelRuntimeError),
+
+    #[error("cannot read policy file to inspect ferricel VAP variables: {0}")]
+    ReadPolicyFileForVapVariables(#[source] std::io::Error),
+
+    #[error("cannot read VAP variables referenced by the compiled ferricel module: {0}")]
+    ReadVapVariables(#[source] anyhow::Error),
 }
 
 #[derive(Error, Debug)]

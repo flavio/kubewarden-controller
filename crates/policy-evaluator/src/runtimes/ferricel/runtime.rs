@@ -87,8 +87,11 @@ impl Runtime<'_> {
     ///   - `oldObject`       The previous version of the resource (UPDATE/DELETE) or null.
     ///   - `request`         The full AdmissionRequest map (operation, userInfo, etc.).
     ///   - `namespaceObject` The Namespace resource for `request.namespace`, fetched from
-    ///     the cluster via the callback channel. null for cluster-scoped resources.
-    ///     Error if the request is namespace-scoped but no callback channel is available.
+    ///     the cluster via the callback channel. null for cluster-scoped resources, and
+    ///     also null (without fetching) when the compiled policy's `ferricel.vap-variables`
+    ///     Wasm custom section proves that `namespaceObject` is never referenced (see
+    ///     `StackPre::references_vap_variable`). Error if the request is namespace-scoped,
+    ///     the policy may reference `namespaceObject`, but no callback channel is available.
     ///     Derived from `AdmissionRequest.namespace` rather than `object.metadata.namespace`
     ///     because `object` is null for DELETE requests, even though the request is
     ///     still namespace-scoped.
@@ -120,17 +123,30 @@ impl Runtime<'_> {
                         ))
                     })?;
 
-                let namespace_object = fetch_namespace_object(
-                    admission_request.namespace.as_deref(),
-                    self.0.eval_ctx(),
-                )
-                .map_err(|e| {
-                    error!(error = e.as_str(), "failed to fetch namespace object");
-                    Box::new(AdmissionResponse::reject_internal_server_error(
-                        request.uid().to_string(),
-                        e,
-                    ))
-                })?;
+                let namespace_object = if self.0.references_vap_variable("namespaceObject") {
+                    fetch_namespace_object(
+                        admission_request.namespace.as_deref(),
+                        self.0.eval_ctx(),
+                    )
+                    .map_err(|e| {
+                        error!(error = e.as_str(), "failed to fetch namespace object");
+                        Box::new(AdmissionResponse::reject_internal_server_error(
+                            request.uid().to_string(),
+                            e,
+                        ))
+                    })?
+                } else {
+                    // The compiled policy's `ferricel.vap-variables` Wasm
+                    // custom section (see `StackPre::references_vap_variable`)
+                    // proves that `namespaceObject` is never referenced by
+                    // this policy's CEL: skip the fetch entirely, avoiding an
+                    // unnecessary Kubernetes API call and (more importantly)
+                    // a hard failure when no Kubernetes client/callback
+                    // channel is available (e.g. `kwctl run` without cluster
+                    // access), which would otherwise reject every namespaced
+                    // request even though the policy never needs this value.
+                    Value::Null
+                };
 
                 let param_ref = settings.0.get("paramRef").cloned().unwrap_or(Value::Null);
 
