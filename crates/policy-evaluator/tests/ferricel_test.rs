@@ -131,7 +131,6 @@ fn build_evaluator_with_epoch_deadline(
         .unwrap_or_else(|e| panic!("cannot rehydrate evaluator: {e}"))
 }
 
-
 /// Mock scenario that handles:
 /// - GET /api/v1  -- API discovery requests made by the kube client on startup
 /// - GET /api/v1/namespaces/{name}  -- namespace fetch requests from ferricel runtime
@@ -341,8 +340,60 @@ async fn test_simple_validation(
     let _ = shutdown_tx.send(());
 }
 
-/// Compile and evaluate a VAP that uses CEL variables to compute intermediate
-/// values before the final validation expression.
+/// Shared assertion for the two regression tests below: a VAP that never
+/// references `namespaceObject` (like `VAP_SIMPLE`) must evaluate
+/// successfully against a namespace-scoped request, regardless of whether a
+/// callback channel/Kubernetes client is available.
+///
+/// Before the `ferricel.vap-variables` Wasm section was consulted, the
+/// runtime unconditionally tried to fetch `namespaceObject` for every
+/// namespaced request, failing evaluation even though the compiled policy
+/// never uses that value.
+fn assert_namespaced_request_is_allowed_without_namespace_object(
+    callback_channel: Option<mpsc::Sender<CallbackRequest>>,
+    scenario: &str,
+) {
+    let wasm = compile_vap(VAP_SIMPLE);
+    let mut evaluator = build_evaluator(&wasm, callback_channel, BTreeSet::new());
+    let request = ValidateRequest::AdmissionRequest(Box::new(load_admission_request(
+        "deployment_accept.json",
+    )));
+
+    let response =
+        tokio::task::block_in_place(|| evaluator.validate(request, &PolicySettings::default()));
+
+    assert!(
+        response.allowed,
+        "expected policy not referencing namespaceObject to evaluate {scenario}, got: {:?}",
+        response.status
+    );
+}
+
+/// A callback channel is available, but no Kubernetes client was configured
+/// for it: if `fetch_namespace_object` were called, the callback handler
+/// would answer with "kube::Client was not initialized properly".
+#[tokio::test(flavor = "multi_thread")]
+async fn test_policy_without_namespace_object_reference_works_without_kube_client() {
+    let (shutdown_tx, callback_channel) = setup_callback_handler(None, None).await;
+
+    assert_namespaced_request_is_allowed_without_namespace_object(
+        Some(callback_channel),
+        "without a kube client",
+    );
+
+    let _ = shutdown_tx.send(());
+}
+
+/// No callback channel at all: `fetch_namespace_object` would fail
+/// immediately with "callback channel is not available" if called.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_policy_without_namespace_object_reference_works_without_callback_channel() {
+    assert_namespaced_request_is_allowed_without_namespace_object(
+        None,
+        "without a callback channel",
+    );
+}
+
 #[rstest]
 #[case::accept("deployment_accept.json", true, None)]
 #[case::reject("deployment_reject.json", false, Some("too many replicas"))]

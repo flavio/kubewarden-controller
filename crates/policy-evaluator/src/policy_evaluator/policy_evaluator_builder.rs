@@ -1,4 +1,4 @@
-use std::{path::Path, result::Result};
+use std::{borrow::Cow, collections::BTreeSet, path::Path, result::Result};
 
 use wasmtime_provider::wasmtime;
 
@@ -190,7 +190,8 @@ impl PolicyEvaluatorBuilder {
                 StackPre::from(rego_stack_pre)
             }
             PolicyExecutionMode::Ferricel => {
-                let ferricel_stack_pre = ferricel::StackPre::new(engine, module)
+                let vap_variables = self.ferricel_vap_variables()?;
+                let ferricel_stack_pre = ferricel::StackPre::new(engine, module, vap_variables)
                     .map_err(PolicyEvaluatorBuilderError::NewFerricelStackPre)?;
                 StackPre::from(ferricel_stack_pre)
             }
@@ -238,6 +239,34 @@ impl PolicyEvaluatorBuilder {
                     .map_err(PolicyEvaluatorBuilderError::WasmModuleBuild),
             }
         }
+    }
+
+    /// Determine the well-known VAP variables (e.g. `namespaceObject`)
+    /// referenced by the compiled ferricel policy, by inspecting the
+    /// `ferricel.vap-variables` Wasm custom section (see
+    /// [`ferricel_core::vap_variables_used`]).
+    ///
+    /// Returns `None` -- meaning "unknown, assume every variable may be
+    /// referenced" -- when the raw Wasm bytes aren't available, i.e. the
+    /// `policy_module` builder input was used (this is how `policy-server`
+    /// builds its evaluators, from a pre-compiled/deserialized
+    /// `wasmtime::Module`, which does not retain the original Wasm bytes or
+    /// their custom sections).
+    fn ferricel_vap_variables(
+        &self,
+    ) -> Result<Option<BTreeSet<String>>, PolicyEvaluatorBuilderError> {
+        let wasm_bytes: Cow<'_, [u8]> = match (&self.policy_contents, &self.policy_file) {
+            (Some(contents), _) => Cow::Borrowed(contents.as_slice()),
+            (None, Some(file)) => Cow::Owned(
+                std::fs::read(file)
+                    .map_err(PolicyEvaluatorBuilderError::ReadPolicyFileForVapVariables)?,
+            ),
+            (None, None) => return Ok(None),
+        };
+
+        let vap_variables = ferricel_core::vap_variables_used(&wasm_bytes)
+            .map_err(PolicyEvaluatorBuilderError::ReadVapVariables)?;
+        Ok(Some(vap_variables.into_iter().collect()))
     }
 }
 
