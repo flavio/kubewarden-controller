@@ -367,10 +367,13 @@ impl FerricelPrinter {
             producers: &'a [ferricel_core::ProducerField],
             #[serde(skip_serializing_if = "Option::is_none")]
             vap_source: Option<&'a str>,
+            #[serde(skip_serializing_if = "<[String]>::is_empty")]
+            vap_variables: &'a [String],
         }
         let doc = FerricelYaml {
             producers: &info.producers,
             vap_source: info.vap_source.as_deref(),
+            vap_variables: &info.vap_variables,
         };
         print!("{}", serde_yaml::to_string(&doc)?);
         Ok(())
@@ -402,6 +405,17 @@ impl FerricelPrinter {
                 row_table.add_row(row![Fgbl -> format!("{}:", field.name), d -> values.join(", ")]);
                 row_table.printstd();
             }
+        }
+
+        // VAP variables referenced — one comma-separated line, same style
+        // as the Producers rows above.
+        if !info.vap_variables.is_empty() {
+            let mut row_table = Table::new();
+            row_table.set_format(FormatBuilder::new().padding(0, 1).build());
+            row_table.add_row(
+                row![Fgbl -> "VAP variables (referenced):", d -> info.vap_variables.join(", ")],
+            );
+            row_table.printstd();
         }
 
         // VAP source — fenced YAML block via the markdown renderer.
