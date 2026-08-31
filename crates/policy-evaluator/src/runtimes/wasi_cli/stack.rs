@@ -1,25 +1,46 @@
 use std::sync::Arc;
 
 use tracing::debug;
-use wasmtime_wasi::{I32Exit, WasiCtxBuilder, p1::WasiP1Ctx, p2::pipe::MemoryOutputPipe};
+use wasmtime_wasi::{I32Exit, WasiCtxBuilder, p1::WasiP1Ctx};
 
 use crate::{
     evaluation_context::EvaluationContext,
-    runtimes::wasi_cli::{errors::WasiRuntimeError, stack_pre::StackPre, wasi_pipe::WasiPipe},
+    runtimes::wasi_cli::{
+        bounded_output_pipe::BoundedOutputPipe, errors::WasiRuntimeError, stack_pre::StackPre,
+        wasi_pipe::WasiPipe,
+    },
 };
 
 const EXIT_SUCCESS: i32 = 0;
 
-/// Maximum bytes a policy may write to stdout or stderr.
-/// Protects the host from memory exhaustion caused by a runaway or
-/// malicious policy.
-/// 4 MiB is well above any realistic output: stdout carries the JSON
-/// AdmissionResponse (typically a few KB, tens of KB with large mutation
-/// patches; Kubernetes objects themselves are capped at ~1.5 MiB by etcd),
-/// and stderr carries policy logs. Expected steady-state usage is well
-/// under 1 MiB per evaluation; the cap only bounds the worst case, at
-/// most 8 MiB (stdout + stderr) per in-flight evaluation.
-const MAX_OUTPUT_PIPE_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+/// Maximum bytes a policy may write to stdout.
+///
+/// Stdout carries the JSON `AdmissionResponse`, which for mutating
+/// policies includes the *entire* `mutated_object`, not just a patch (see
+/// `AdmissionResponse::from_policy_validation_response`). This is not
+/// bounded by etcd's ~1.5 MiB object size limit: policies can validate and
+/// mutate objects served by aggregated API servers, which are not stored
+/// in etcd and are not subject to that limit. 64 MiB is well above any
+/// realistic legitimate output, while still bounding the worst case of a
+/// runaway or malicious policy.
+///
+/// Exceeding this cap traps the guest immediately (see
+/// `BoundedOutputPipe`), surfacing as a `WasiRuntimeError::WasiEvaluation`
+/// with a clear message, rather than a silently truncated stdout that
+/// later fails to deserialize.
+const MAX_STDOUT_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
+
+/// Maximum bytes a policy may write to stderr.
+///
+/// Stderr does not carry structured policy logs: the Kubewarden SDKs send
+/// those to the host via the `kubewarden/tracing.log` host capability
+/// (see `host_callback`'s `"tracing" => "log"` branch), which does not go
+/// through this pipe at all. What ends up on stderr is only diagnostic
+/// output that originates below the SDK layer: language runtime panics,
+/// crash traces, or ad-hoc `eprintln!`/`console.error` debugging output.
+/// This is expected to be tiny (a stack trace at most), so a much smaller
+/// cap than stdout's is appropriate.
+const MAX_STDERR_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
 
 pub(crate) struct Context {
     pub(crate) wasi_ctx: WasiP1Ctx,
@@ -77,8 +98,8 @@ impl Stack {
         input: &[u8],
         args: &[&str],
     ) -> std::result::Result<RunResult, WasiRuntimeError> {
-        let stdout_pipe = MemoryOutputPipe::new(MAX_OUTPUT_PIPE_BYTES);
-        let stderr_pipe = MemoryOutputPipe::new(MAX_OUTPUT_PIPE_BYTES);
+        let stdout_pipe = BoundedOutputPipe::new("stdout", MAX_STDOUT_BYTES);
+        let stderr_pipe = BoundedOutputPipe::new("stderr", MAX_STDERR_BYTES);
         let stdin_pipe = WasiPipe::new(input);
 
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
@@ -136,7 +157,7 @@ impl Stack {
 
 fn pipe_to_string(
     name: &str,
-    pipe: &MemoryOutputPipe,
+    pipe: &BoundedOutputPipe,
 ) -> std::result::Result<String, WasiRuntimeError> {
     let buf = pipe.contents();
     String::from_utf8(buf.to_vec()).map_err(|e| WasiRuntimeError::PipeConversion {

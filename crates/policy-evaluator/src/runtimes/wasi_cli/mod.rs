@@ -1,3 +1,4 @@
+mod bounded_output_pipe;
 pub mod errors;
 mod runtime;
 mod stack;
