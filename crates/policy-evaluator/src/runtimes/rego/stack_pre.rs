@@ -1,5 +1,5 @@
 use crate::{
-    policy_evaluator::RegoPolicyExecutionMode,
+    policy_evaluator::{RegoPolicyExecutionMode, policy_evaluator_builder::ResourceLimits},
     runtimes::rego::errors::{RegoRuntimeError, Result},
 };
 
@@ -20,6 +20,7 @@ pub(crate) struct StackPre {
     module: wasmtime::Module,
     pub entrypoint_id: i32,
     pub policy_execution_mode: RegoPolicyExecutionMode,
+    resource_limits: Option<ResourceLimits>,
 }
 
 impl StackPre {
@@ -28,12 +29,14 @@ impl StackPre {
         module: wasmtime::Module,
         entrypoint_id: i32,
         policy_execution_mode: RegoPolicyExecutionMode,
+        resource_limits: Option<ResourceLimits>,
     ) -> Self {
         Self {
             engine,
             module,
             entrypoint_id,
             policy_execution_mode,
+            resource_limits,
         }
     }
 
@@ -46,6 +49,12 @@ impl StackPre {
 
         if let Some(deadline) = epoch_deadline {
             builder = builder.enable_epoch_interruptions(deadline);
+        }
+        if let Some(resource_limits) = self.resource_limits {
+            builder = builder.enable_resource_limits(burrego::ResourceLimits {
+                max_memory_size: resource_limits.max_memory_size,
+                max_table_elements: resource_limits.max_table_elements,
+            });
         }
         let evaluator = builder
             .build()

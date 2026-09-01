@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use wasmtime::{Engine, Module};
 
 use crate::{
-    Evaluator,
+    Evaluator, ResourceLimits,
     errors::{BurregoError, Result},
     host_callbacks::HostCallbacks,
 };
@@ -14,6 +14,7 @@ pub struct EvaluatorBuilder {
     module: Option<Module>,
     engine: Option<Engine>,
     epoch_deadline: Option<u64>,
+    resource_limits: Option<ResourceLimits>,
     host_callbacks: Option<HostCallbacks>,
 }
 
@@ -39,6 +40,19 @@ impl EvaluatorBuilder {
     #[must_use]
     pub fn enable_epoch_interruptions(mut self, deadline: u64) -> Self {
         self.epoch_deadline = Some(deadline);
+        self
+    }
+
+    /// Enable enforcement of resource limits on the instantiated Rego
+    /// WebAssembly module, leveraging wasmtime's
+    /// [`ResourceLimiter`](wasmtime::ResourceLimiter) facility.
+    ///
+    /// This can be used to prevent a malicious, or misbehaving, Rego
+    /// policy from exhausting the host's memory. See [`ResourceLimits`]
+    /// for details.
+    #[must_use]
+    pub fn enable_resource_limits(mut self, resource_limits: ResourceLimits) -> Self {
+        self.resource_limits = Some(resource_limits);
         self
     }
 
@@ -101,6 +115,91 @@ impl EvaluatorBuilder {
             .clone()
             .expect("host callbacks should be set");
 
-        Evaluator::from_engine_and_module(engine, module, host_callbacks, self.epoch_deadline)
+        Evaluator::from_engine_and_module(
+            engine,
+            module,
+            host_callbacks,
+            self.epoch_deadline,
+            self.resource_limits,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    // Per the WebAssembly specification, linear memory is grown in units of
+    // pages, and a page is fixed at 64KiB.
+    const WASM_PAGE_SIZE: usize = 65536;
+
+    fn gatekeeper_policy_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data/gatekeeper/policy.wasm")
+    }
+
+    // Verifies that `ResourceLimits` is correctly enforced by leveraging
+    // wasmtime's `ResourceLimiter` facility.
+    //
+    // `Evaluator` always allocates a 5-page (320KiB) linear memory upfront
+    // and hands it over to the Rego module (see `Evaluator::setup`).
+    // Configuring a `max_memory_size` smaller than that must cause the
+    // evaluator creation to fail, while a generous limit must not affect a
+    // normal evaluation.
+
+    #[test]
+    fn evaluation_succeeds_with_generous_resource_limits() {
+        let resource_limits = ResourceLimits {
+            max_memory_size: Some(32 * WASM_PAGE_SIZE),
+            max_table_elements: Some(10_000),
+        };
+
+        let evaluator = EvaluatorBuilder::default()
+            .policy_path(&gatekeeper_policy_path())
+            .host_callbacks(HostCallbacks::default())
+            .enable_resource_limits(resource_limits)
+            .build();
+
+        assert!(
+            evaluator.is_ok(),
+            "evaluator creation should succeed: {:?}",
+            evaluator.err()
+        );
+    }
+
+    #[test]
+    fn build_fails_when_initial_memory_is_above_the_limit() {
+        // The evaluator always allocates a 5-page linear memory upfront,
+        // which is already above the configured limit.
+        let resource_limits = ResourceLimits {
+            max_memory_size: Some(WASM_PAGE_SIZE),
+            ..Default::default()
+        };
+
+        let evaluator = EvaluatorBuilder::default()
+            .policy_path(&gatekeeper_policy_path())
+            .host_callbacks(HostCallbacks::default())
+            .enable_resource_limits(resource_limits)
+            .build();
+
+        assert!(
+            evaluator.is_err(),
+            "evaluator creation should fail because the initial memory exceeds the limit"
+        );
+    }
+
+    #[test]
+    fn evaluation_without_resource_limits_still_works() {
+        let evaluator = EvaluatorBuilder::default()
+            .policy_path(&gatekeeper_policy_path())
+            .host_callbacks(HostCallbacks::default())
+            .build();
+
+        assert!(
+            evaluator.is_ok(),
+            "evaluator creation should succeed: {:?}",
+            evaluator.err()
+        );
     }
 }

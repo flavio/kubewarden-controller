@@ -46,6 +46,7 @@ pub(crate) struct Context {
     pub(crate) wasi_ctx: WasiP1Ctx,
     pub(crate) stdin_pipe: WasiPipe,
     pub(crate) eval_ctx: Arc<EvaluationContext>,
+    pub(crate) limits: wasmtime::StoreLimits,
 }
 
 pub(crate) struct Stack {
@@ -114,6 +115,7 @@ impl Stack {
             wasi_ctx,
             stdin_pipe,
             eval_ctx: self.eval_ctx.clone(),
+            limits: self.stack_pre.store_limits(),
         };
 
         let mut store = self
