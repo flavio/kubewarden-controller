@@ -1,7 +1,9 @@
 use wasmtime_provider::wasmtime;
 
-use crate::policy_evaluator::policy_evaluator_builder::ResourceLimits;
-use crate::runtimes::wapc::errors::{Result, WapcRuntimeError};
+use crate::{
+    policy_evaluator::policy_evaluator_builder::ResourceLimits,
+    runtimes::wapc::errors::{Result, WapcRuntimeError},
+};
 
 /// Reduce allocation time of new `WasmtimeProviderEngine`, see the `rehydrate` method
 #[derive(Clone)]
