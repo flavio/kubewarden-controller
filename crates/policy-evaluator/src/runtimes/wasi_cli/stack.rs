@@ -131,12 +131,12 @@ impl Stack {
         // sure the guest is done writing to the output pipes.
         drop(store);
 
-        let stderr = pipe_to_string("stderr", &stderr_pipe)?.trim().to_string();
+        let stderr = pipe_to_string(&stderr_pipe)?.trim().to_string();
 
         if let Err(err) = evaluation_result {
             if let Some(exit_error) = err.downcast_ref::<I32Exit>() {
                 if exit_error.0 == EXIT_SUCCESS {
-                    let stdout = pipe_to_string("stdout", &stdout_pipe)?;
+                    let stdout = pipe_to_string(&stdout_pipe)?;
                     return Ok(RunResult { stdout, stderr });
                 } else {
                     debug!(
@@ -152,18 +152,15 @@ impl Stack {
             return Err(WasiRuntimeError::WasiEvaluation { stderr, error: err });
         }
 
-        let stdout = pipe_to_string("stdout", &stdout_pipe)?;
+        let stdout = pipe_to_string(&stdout_pipe)?;
         Ok(RunResult { stdout, stderr })
     }
 }
 
-fn pipe_to_string(
-    name: &str,
-    pipe: &BoundedOutputPipe,
-) -> std::result::Result<String, WasiRuntimeError> {
+fn pipe_to_string(pipe: &BoundedOutputPipe) -> std::result::Result<String, WasiRuntimeError> {
     let buf = pipe.contents();
     String::from_utf8(buf.to_vec()).map_err(|e| WasiRuntimeError::PipeConversion {
-        name: name.to_string(),
+        name: pipe.name().to_string(),
         error: format!("Cannot convert buffer to UTF8 string: {e}"),
     })
 }

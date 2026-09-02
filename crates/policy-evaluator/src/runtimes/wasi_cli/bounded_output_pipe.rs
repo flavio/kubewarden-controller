@@ -56,6 +56,11 @@ impl BoundedOutputPipe {
         self.buffer.lock().unwrap().clone().freeze()
     }
 
+    /// The name given at construction time (e.g. "stdout", "stderr").
+    pub(crate) fn name(&self) -> &'static str {
+        self.name
+    }
+
     fn overflow_message(&self) -> String {
         format!(
             "policy exceeded the maximum allowed size of {} bytes for {}",
