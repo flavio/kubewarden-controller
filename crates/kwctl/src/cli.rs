@@ -328,6 +328,15 @@ fn run_args() -> Vec<Arg> {
            .long("disable-wasmtime-cache")
            .num_args(0)
            .help("Turn off usage of wasmtime cache"),
+       Arg::new("disable-memory-limit")
+           .long("disable-memory-limit")
+           .action(ArgAction::SetTrue)
+           .help("Disable policy memory limit"),
+       Arg::new("policy-memory-limit")
+           .long("policy-memory-limit")
+           .value_name("MAXIMUM_MEMORY_MIB")
+           .default_value("256")
+           .help("Maximum amount of linear memory, in MiB, a policy is allowed to use"),
        Arg::new("allow-context-aware")
            .long("allow-context-aware")
            .num_args(0)
