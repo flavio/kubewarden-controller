@@ -213,7 +213,7 @@ impl PolicyEvaluatorBuilder {
 
         let stack_pre = match execution_mode {
             PolicyExecutionMode::KubewardenWapc => {
-                let wapc_stack_pre = wapc::StackPre::new(engine, module)
+                let wapc_stack_pre = wapc::StackPre::new(engine, module, self.resource_limits)
                     .map_err(PolicyEvaluatorBuilderError::NewWapcStackPre)?;
                 StackPre::from(wapc_stack_pre)
             }
