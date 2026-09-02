@@ -136,9 +136,9 @@ pub(crate) fn vap_compiled(
 
     write_output_file(wasm_path, &wasm_bytes, force, "Wasm module")?;
 
-    // Canonicalize only after the file has been written, otherwise a relative
-    // (and, until now, non-existing) output path would fall back to the
-    // relative path, producing a `file://` URI that isn't absolute.
+    // Canonicalize only after the file has been written: a relative,
+    // not-yet-existing output path cannot be canonicalized, so this must
+    // happen after `write_output_file` has created it.
     let wasm_path_abs = wasm_path
         .canonicalize()
         .map_err(|e| anyhow!("cannot canonicalize {}: {e}", wasm_path.display()))?;
@@ -172,7 +172,9 @@ pub(crate) fn vap_compiled(
         return Err(e);
     }
 
-    let module = format!("file://{}", wasm_path_abs.display());
+    let module = url::Url::from_file_path(&wasm_path_abs)
+        .map_err(|_| anyhow!("cannot convert {} to a file URI", wasm_path_abs.display()))?
+        .to_string();
 
     Ok(ClusterAdmissionPolicy {
         api_version: "policies.kubewarden.io/v1".to_string(),
@@ -327,12 +329,19 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let wasm_path = dir.path().join("policy.wasm");
-        let expected_module = format!("file://{}", wasm_path.display());
 
         let vap_data = VapData::new(vap, vap_binding).unwrap();
         let cap = vap_compiled(vap_data, &wasm_path, false).unwrap();
 
-        assert_eq!(expected_module, cap.spec.module);
+        // `spec.module` must be a valid `file://` URI that round-trips back
+        // to the canonicalized wasm path via `Url::to_file_path()`, which is
+        // how consumers (policy-fetcher, kwctl) resolve it.
+        let module_url = url::Url::parse(&cap.spec.module).unwrap();
+        assert_eq!("file", module_url.scheme());
+        assert_eq!(
+            wasm_path.canonicalize().unwrap(),
+            module_url.to_file_path().unwrap()
+        );
         assert!(!cap.spec.mutating);
         assert!(cap.spec.background_audit);
         assert!(cap.spec.failure_policy.is_none());
@@ -376,6 +385,37 @@ mod tests {
         }
 
         assert_eq!(cap.spec.rules, expected_rules);
+    }
+
+    /// A wasm output path containing a space (a reserved character in URIs)
+    /// must still produce a `spec.module` that is a valid, parsable `file://`
+    /// URI resolving back to the original path - i.e. the space must be
+    /// percent-encoded rather than copied verbatim.
+    #[test]
+    fn module_uri_percent_encodes_reserved_characters_in_path() {
+        let dir = TempDir::new().unwrap();
+        let sub_dir = dir.path().join("dir with spaces");
+        fs::create_dir(&sub_dir).unwrap();
+        let wasm_path = sub_dir.join("my policy.wasm");
+
+        let vap_data = open_vap_data("vap/vap-without-variables.yml", "vap/vap-binding.yml");
+        let cap = vap_compiled(vap_data, &wasm_path, false).unwrap();
+
+        assert!(
+            cap.spec.module.contains("%20"),
+            "expected the space in the path to be percent-encoded, got: {}",
+            cap.spec.module
+        );
+
+        let module_url = url::Url::parse(&cap.spec.module).unwrap_or_else(|e| {
+            panic!("spec.module is not a valid URI: {} ({e})", cap.spec.module)
+        });
+        assert_eq!(
+            wasm_path.canonicalize().unwrap(),
+            module_url
+                .to_file_path()
+                .unwrap_or_else(|()| panic!("spec.module does not resolve back to a file path"))
+        );
     }
 
     #[rstest]
