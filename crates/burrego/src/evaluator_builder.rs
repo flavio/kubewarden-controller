@@ -135,8 +135,14 @@ mod tests {
     // pages, and a page is fixed at 64KiB.
     const WASM_PAGE_SIZE: usize = 65536;
 
+    // Reuse a gatekeeper policy already compiled to Wasm and committed to
+    // the repository by the `policy-evaluator` crate. `test_data/gatekeeper`
+    // is gitignored and only produced by the `opa build` step of the e2e
+    // tests, so it's not guaranteed to exist when running `cargo test`
+    // (e.g. in the unit-tests CI job, or on a fresh checkout).
     fn gatekeeper_policy_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data/gatekeeper/policy.wasm")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../policy-evaluator/tests/data/gatekeeper_always_happy_policy.wasm")
     }
 
     // Verifies that `ResourceLimits` is correctly enforced by leveraging
