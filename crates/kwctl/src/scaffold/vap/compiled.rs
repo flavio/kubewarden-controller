@@ -18,7 +18,7 @@ use tracing::warn;
 
 use crate::scaffold::{
     kubewarden_crds::{ClusterAdmissionPolicy, ClusterAdmissionPolicySpec},
-    vap::VapData,
+    vap::{VapData, warn_kw_k8s_requires_grants},
 };
 
 /// Derive the path of the `metadata.yml` file that sits alongside `wasm_path`.
@@ -151,6 +151,19 @@ pub(crate) fn vap_compiled(
     let host_capabilities = if caps.is_empty() { None } else { Some(caps) };
 
     let context_aware_resources = context_aware_resources_from_param(&vap_data);
+
+    // The `ferricel.extensions` section records every host extension the
+    // compiled module actually calls, including `kw.k8s.get`/`kw.k8s.list`.
+    // Unlike `paramKind`, there is no static way (short of parsing the CEL
+    // AST ourselves) to know *which* apiVersion/kind those calls target, so
+    // we can only warn that `context_aware_resources` may need to be
+    // extended by hand, not derive the grants automatically.
+    if used
+        .iter()
+        .any(|extension| extension.namespace.as_deref() == Some("kw.k8s"))
+    {
+        warn_kw_k8s_requires_grants(&context_aware_resources);
+    }
 
     if let Err(e) = write_metadata_file(
         &vap_data,
@@ -670,6 +683,46 @@ mod tests {
         assert!(
             caps.contains("oci/v1/manifest_digest"),
             "expected oci/v1/manifest_digest in host_capabilities, got: {caps:?}"
+        );
+    }
+
+    /// A VAP that calls `kw.k8s.apiVersion(...).kind(...).get(...)` must
+    /// produce metadata.yml with the `kubernetes/get_resource` host
+    /// capability populated, even though (pending manual review by the user)
+    /// `context_aware_resources` stays empty: there is no `paramKind` for
+    /// this VAP, and the apiVersion/kind targeted by `kw.k8s` calls is not
+    /// statically derived. This pins the current (intentionally incomplete)
+    /// behavior that the `kw.k8s`-usage warning exists to compensate for.
+    #[test]
+    fn metadata_yml_contains_host_capabilities_for_kw_k8s_but_no_context_aware_resources() {
+        let dir = TempDir::new().unwrap();
+        let wasm_path = dir.path().join("policy.wasm");
+
+        let vap_data = open_vap_data("vap/vap-with-k8s.yml", "vap/vap-binding.yml");
+        let cap = vap_compiled(vap_data, &wasm_path, false).unwrap();
+
+        let metadata_path = dir.path().join("metadata.yml");
+        let metadata: Metadata =
+            serde_yaml::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
+
+        let caps = metadata
+            .host_capabilities
+            .as_ref()
+            .expect("host_capabilities should be Some for a policy using kw.k8s");
+        assert!(
+            caps.contains("kubernetes/get_resource"),
+            "expected kubernetes/get_resource in host_capabilities, got: {caps:?}"
+        );
+
+        assert!(
+            metadata.context_aware_resources.is_empty(),
+            "context_aware_resources should stay empty: kw.k8s targets are not statically derived, got: {:?}",
+            metadata.context_aware_resources
+        );
+        assert!(
+            cap.spec.context_aware_resources.is_empty(),
+            "spec.context_aware_resources should stay empty: kw.k8s targets are not statically derived, got: {:?}",
+            cap.spec.context_aware_resources
         );
     }
 }

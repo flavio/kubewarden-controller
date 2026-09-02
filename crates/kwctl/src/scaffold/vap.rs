@@ -1,7 +1,7 @@
 mod compiled;
 mod interpreted;
 
-use std::{convert::TryFrom, fs::File, path::Path};
+use std::{collections::BTreeSet, convert::TryFrom, fs::File, path::Path};
 
 use anyhow::{Result, anyhow};
 use k8s_openapi::{
@@ -40,6 +40,69 @@ pub(crate) fn vap(
     serde_yaml::to_writer(std::io::stdout(), &cluster_admission_policy)?;
 
     Ok(())
+}
+
+/// Warn that this policy calls `kw.k8s`, which reads Kubernetes resources at
+/// evaluation time. The `granted` set holds the resources currently allowed
+/// in `spec.contextAwareResources` and `metadata.yml`. This set only comes
+/// from `paramKind`, so it can miss resources the policy reads through
+/// `kw.k8s`.
+///
+/// The runtime denies a `kw.k8s` call when its apiVersion and kind are not in
+/// `granted` (see `EvaluationContext::can_access_kubernetes_resource`). The
+/// user must review the generated `contextAwareResources` list and add each
+/// missing apiVersion and kind by hand before they apply the policy.
+pub(crate) fn warn_kw_k8s_requires_grants(granted: &BTreeSet<ContextAwareResource>) {
+    if granted.is_empty() {
+        warn!(
+            "this policy calls kw.k8s.*, but spec.contextAwareResources is empty. Every kw.k8s get/list call will be denied at evaluation time. Add each apiVersion/kind that the policy reads through kw.k8s to spec.contextAwareResources in the generated ClusterAdmissionPolicy. Add the same entries to contextAwareResources in metadata.yml, if that file was generated."
+        );
+    } else {
+        let granted_list = granted
+            .iter()
+            .map(|r| format!("{}/{}", r.api_version, r.kind))
+            .collect::<Vec<_>>()
+            .join(", ");
+        warn!(
+            "this policy calls kw.k8s.*. Only {granted_list} is granted through spec.contextAwareResources, derived from paramKind. Add every other apiVersion/kind that the policy reads through kw.k8s to spec.contextAwareResources by hand, and to metadata.yml if that file was generated. Without this, the runtime denies the call at evaluation time."
+        );
+    }
+}
+
+/// Check whether any CEL expression in `vap` mentions `kw.k8s`. The check
+/// looks at `validations`, `variables`, and `matchConditions`, and searches
+/// only for the text `kw.k8s`.
+///
+/// The interpreted path uses this check because it has no compiled Wasm
+/// module to inspect. The compiled path instead reads the exact list of
+/// host extensions from the `ferricel.extensions` section of the module.
+///
+/// A text search can find `kw.k8s` inside a string literal and report a
+/// false positive. It cannot miss a real use in valid CEL, so this check
+/// never produces a false negative. A false positive only causes an extra
+/// warning. It does not hide a real one.
+fn vap_uses_kw_k8s(vap: &ValidatingAdmissionPolicy) -> bool {
+    let Some(spec) = vap.spec.as_ref() else {
+        return false;
+    };
+
+    let validations_use_it = spec
+        .validations
+        .iter()
+        .flatten()
+        .any(|v| v.expression.contains("kw.k8s"));
+    let variables_use_it = spec
+        .variables
+        .iter()
+        .flatten()
+        .any(|v| v.expression.contains("kw.k8s"));
+    let match_conditions_use_it = spec
+        .match_conditions
+        .iter()
+        .flatten()
+        .any(|m| m.expression.contains("kw.k8s"));
+
+    validations_use_it || variables_use_it || match_conditions_use_it
 }
 
 /// Data extracted from a VAP + binding pair, shared by both output paths.
@@ -143,6 +206,7 @@ pub(crate) mod tests {
     use k8s_openapi::api::admissionregistration::v1::{
         ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding,
     };
+    use rstest::*;
 
     use super::VapData;
 
@@ -168,6 +232,26 @@ pub(crate) mod tests {
             serde_yaml::from_reader(yaml_file).expect("cannot parse VAP binding yaml file");
 
         VapData::new(vap, vap_binding).expect("cannot build VapData")
+    }
+
+    fn open_vap(vap_yaml_path: &str) -> ValidatingAdmissionPolicy {
+        let yaml_file = File::open(test_data(vap_yaml_path)).expect("cannot open VAP yaml file");
+        serde_yaml::from_reader(yaml_file).expect("cannot parse VAP yaml file")
+    }
+
+    #[test]
+    fn vap_uses_kw_k8s_detects_it_in_validations() {
+        let vap = open_vap("vap/vap-with-k8s.yml");
+        assert!(super::vap_uses_kw_k8s(&vap));
+    }
+
+    #[rstest]
+    #[case::without_variables("vap/vap-without-variables.yml")]
+    #[case::with_variables("vap/vap-with-variables.yml")]
+    #[case::with_host_capabilities("vap/vap-with-host-capabilities.yml")]
+    fn vap_uses_kw_k8s_is_false_when_not_used(#[case] vap_yaml_path: &str) {
+        let vap = open_vap(vap_yaml_path);
+        assert!(!super::vap_uses_kw_k8s(&vap));
     }
 
     #[test]

@@ -1028,6 +1028,14 @@ fn test_scaffold_manifest(#[case] pull_policies_before: bool) {
     contains("module: ghcr.io/kubewarden/tests/cel-policy:1.0.0"),
     is_empty()
 )]
+#[case::vap_using_kw_k8s(
+    Some("vap/vap-with-k8s.yml"),
+    Some("vap/vap-binding.yml"),
+    Some("ghcr.io/kubewarden/tests/cel-policy:1.0.0"),
+    true,
+    contains("module: ghcr.io/kubewarden/tests/cel-policy:1.0.0"),
+    contains("this policy calls kw.k8s")
+)]
 #[case::missing_policy(
     None,
     Some("vap/vap-binding.yml"),
@@ -1138,6 +1146,43 @@ fn test_scaffold_vap_compile_to_wasm(
     } else {
         cmd.assert().failure();
     }
+}
+
+/// A compiled VAP that calls `kw.k8s.apiVersion(...).kind(...).get(...)` has
+/// no `paramKind`, so `spec.contextAwareResources` stays empty and every
+/// `kw.k8s` call would be denied at evaluation time unless the user edits
+/// the generated output by hand. `kwctl` cannot statically derive which
+/// apiVersion/kind is targeted (see `context_aware_resources_from_param` in
+/// `scaffold/vap/compiled.rs`), so it must at least warn about it.
+#[test]
+fn test_scaffold_vap_compile_to_wasm_warns_about_kw_k8s_usage() {
+    let tempdir = tempdir().unwrap();
+    let wasm_output = tempdir.path().join("policy.wasm");
+
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("scaffold")
+        .arg("vap")
+        .arg("--policy")
+        .arg(test_data("vap/vap-with-k8s.yml"))
+        .arg("--binding")
+        .arg(test_data("vap/vap-binding.yml"))
+        .arg("--compile-to-wasm")
+        .arg(&wasm_output);
+
+    let output = cmd.output().unwrap();
+    assert!(output.status.success(), "command should succeed");
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("this policy calls kw.k8s"),
+        "expected a kw.k8s warning on stderr, got: {stderr}"
+    );
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !stdout.contains("contextAwareResources"),
+        "no contextAwareResources should have been derived for kw.k8s (the field is omitted when empty), got: {stdout}"
+    );
 }
 
 #[test]
