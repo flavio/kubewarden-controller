@@ -6,7 +6,7 @@ use tracing::warn;
 
 use crate::scaffold::{
     kubewarden_crds::{ClusterAdmissionPolicy, ClusterAdmissionPolicySpec},
-    vap::VapData,
+    vap::{VapData, vap_uses_kw_k8s, warn_kw_k8s_requires_grants},
 };
 
 /// Interpreter path: validates the OCI reference and builds a
@@ -76,6 +76,17 @@ pub(crate) fn vap_interpreted(
             param_resource.api_version, param_resource.kind
         );
         context_aware_resources.insert(param_resource.clone());
+    }
+
+    // Unlike `paramKind`, there is no static way (short of parsing the CEL
+    // AST ourselves) to know *which* apiVersion/kind a `kw.k8s.get`/`.list`
+    // call targets, so we can only warn that `context_aware_resources` may
+    // need to be extended by hand, not derive the grants automatically.
+    // Detection here is a best-effort textual search over the raw CEL
+    // expressions (see `vap_uses_kw_k8s`), since there is no compiled
+    // artifact to inspect for actual host-extension usage on this path.
+    if vap_uses_kw_k8s(&vap_data.vap) {
+        warn_kw_k8s_requires_grants(&context_aware_resources);
     }
 
     Ok(ClusterAdmissionPolicy {
@@ -282,5 +293,32 @@ mod tests {
                     .contains_key("paramRef")
             );
         }
+    }
+
+    /// A VAP that calls `kw.k8s.apiVersion(...).kind(...).get(...)` has no
+    /// `paramKind`, so `context_aware_resources` stays empty: the apiVersion/
+    /// kind targeted by `kw.k8s` calls is only detected via a best-effort
+    /// textual search (see `vap_uses_kw_k8s`), never turned into a grant.
+    /// This pins the current (intentionally incomplete) behavior that the
+    /// `kw.k8s`-usage warning exists to compensate for.
+    #[test]
+    fn kw_k8s_usage_does_not_populate_context_aware_resources() {
+        let yaml_file = File::open(test_data("vap/vap-with-k8s.yml")).unwrap();
+        let vap: ValidatingAdmissionPolicy = serde_yaml::from_reader(yaml_file).unwrap();
+        let yaml_file = File::open(test_data("vap/vap-binding.yml")).unwrap();
+        let vap_binding: ValidatingAdmissionPolicyBinding =
+            serde_yaml::from_reader(yaml_file).unwrap();
+
+        let vap_data = VapData::new(vap, vap_binding).unwrap();
+        let cluster_admission_policy = vap_interpreted(CEL_POLICY_MODULE, vap_data).unwrap();
+
+        assert!(
+            cluster_admission_policy
+                .spec
+                .context_aware_resources
+                .is_empty(),
+            "context_aware_resources should stay empty: kw.k8s targets are not statically derived, got: {:?}",
+            cluster_admission_policy.spec.context_aware_resources
+        );
     }
 }
