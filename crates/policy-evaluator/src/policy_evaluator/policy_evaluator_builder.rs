@@ -169,6 +169,11 @@ impl PolicyEvaluatorBuilder {
     /// Enable enforcement of resource limits (like the maximum size of the
     /// linear memory and tables) on the policies evaluated by this
     /// `PolicyEvaluator`.
+    ///
+    /// Each field of `ResourceLimits` set to `None` is left unenforced (no
+    /// limit). This means calling this method with `ResourceLimits::default()`
+    /// is equivalent to not calling it at all: it's safe to always chain it
+    /// onto the builder, even when the caller has no limit configured.
     #[must_use]
     pub fn enable_resource_limits(mut self, resource_limits: ResourceLimits) -> Self {
         self.resource_limits = Some(resource_limits);
