@@ -20,10 +20,7 @@ impl StackPre {
             .module(module);
 
         if let Some(resource_limits) = resource_limits {
-            builder = builder.enable_resource_limits(wasmtime_provider::ResourceLimits {
-                max_memory_size: resource_limits.max_memory_size,
-                max_table_elements: resource_limits.max_table_elements,
-            });
+            builder = builder.enable_resource_limits(resource_limits.into());
         }
 
         let engine_provider_pre = builder

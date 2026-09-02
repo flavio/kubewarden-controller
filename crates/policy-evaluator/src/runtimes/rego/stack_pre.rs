@@ -51,10 +51,7 @@ impl StackPre {
             builder = builder.enable_epoch_interruptions(deadline);
         }
         if let Some(resource_limits) = self.resource_limits {
-            builder = builder.enable_resource_limits(burrego::ResourceLimits {
-                max_memory_size: resource_limits.max_memory_size,
-                max_table_elements: resource_limits.max_table_elements,
-            });
+            builder = builder.enable_resource_limits(resource_limits.into());
         }
         let evaluator = builder
             .build()

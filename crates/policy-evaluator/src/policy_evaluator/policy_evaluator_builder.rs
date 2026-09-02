@@ -58,6 +58,24 @@ pub struct ResourceLimits {
     pub max_table_elements: Option<usize>,
 }
 
+impl From<ResourceLimits> for burrego::ResourceLimits {
+    fn from(limits: ResourceLimits) -> Self {
+        Self {
+            max_memory_size: limits.max_memory_size,
+            max_table_elements: limits.max_table_elements,
+        }
+    }
+}
+
+impl From<ResourceLimits> for wasmtime_provider::ResourceLimits {
+    fn from(limits: ResourceLimits) -> Self {
+        Self {
+            max_memory_size: limits.max_memory_size,
+            max_table_elements: limits.max_table_elements,
+        }
+    }
+}
+
 /// Helper Struct that creates a `PolicyEvaluator` object
 #[derive(Default)]
 pub struct PolicyEvaluatorBuilder {
