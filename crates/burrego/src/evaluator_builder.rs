@@ -135,14 +135,13 @@ mod tests {
     // pages, and a page is fixed at 64KiB.
     const WASM_PAGE_SIZE: usize = 65536;
 
-    // Reuse a gatekeeper policy already compiled to Wasm and committed to
-    // the repository by the `policy-evaluator` crate. `test_data/gatekeeper`
-    // is gitignored and only produced by the `opa build` step of the e2e
-    // tests, so it's not guaranteed to exist when running `cargo test`
-    // (e.g. in the unit-tests CI job, or on a fresh checkout).
-    fn gatekeeper_policy_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../policy-evaluator/tests/data/gatekeeper_always_happy_policy.wasm")
+    // Small OPA policy compiled to Wasm and committed to the repository
+    // under `tests/data/`, used to exercise the evaluator without
+    // depending on gatekeeper-specific fixtures or on `opa` being installed
+    // (see `tests/data/Makefile` to rebuild it after editing the
+    // `.rego` source).
+    fn test_policy_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/trace.wasm")
     }
 
     // Verifies that `ResourceLimits` is correctly enforced by leveraging
@@ -162,7 +161,7 @@ mod tests {
         };
 
         let evaluator = EvaluatorBuilder::default()
-            .policy_path(&gatekeeper_policy_path())
+            .policy_path(&test_policy_path())
             .host_callbacks(HostCallbacks::default())
             .enable_resource_limits(resource_limits)
             .build();
@@ -184,7 +183,7 @@ mod tests {
         };
 
         let evaluator = EvaluatorBuilder::default()
-            .policy_path(&gatekeeper_policy_path())
+            .policy_path(&test_policy_path())
             .host_callbacks(HostCallbacks::default())
             .enable_resource_limits(resource_limits)
             .build();
@@ -198,7 +197,7 @@ mod tests {
     #[test]
     fn evaluation_without_resource_limits_still_works() {
         let evaluator = EvaluatorBuilder::default()
-            .policy_path(&gatekeeper_policy_path())
+            .policy_path(&test_policy_path())
             .host_callbacks(HostCallbacks::default())
             .build();
 
