@@ -22,6 +22,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # Disable incremental compilation, CI doesn't do them
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   # Detect which files changed to run appropriate checks
   changes:
