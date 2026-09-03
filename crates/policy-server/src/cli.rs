@@ -177,6 +177,19 @@ pub(crate) fn build_cli() -> Command {
             .default_value("2")
             .help("Interrupt policy evaluation after the given time"),
 
+        Arg::new("disable-memory-limit")
+            .long("disable-memory-limit")
+            .action(ArgAction::SetTrue)
+            .env("KUBEWARDEN_DISABLE_MEMORY_LIMIT")
+            .help("Disable policy memory limit"),
+
+        Arg::new("policy-memory-limit")
+            .long("policy-memory-limit")
+            .env("KUBEWARDEN_POLICY_MEMORY_LIMIT")
+            .value_name("MAXIMUM_MEMORY_MIB")
+            .default_value("256")
+            .help("Maximum amount of linear memory, in MiB, a policy is allowed to use"),
+
         Arg::new("daemon")
             .long("daemon")
             .env("KUBEWARDEN_DAEMON")

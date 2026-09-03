@@ -17,7 +17,7 @@ use policy_evaluator::{
     host_capabilities::HostCapabilities,
     kubewarden_policy_sdk::settings::SettingsValidationResponse,
     policy_evaluator::{PolicyEvaluator, PolicyEvaluatorPre, PolicyExecutionMode, ValidateRequest},
-    policy_evaluator_builder::PolicyEvaluatorBuilder,
+    policy_evaluator_builder::{PolicyEvaluatorBuilder, ResourceLimits},
     policy_group_evaluator::{PolicyGroupMemberSettings, evaluator::PolicyGroupEvaluator},
     policy_metadata::ContextAwareResource,
     wasmtime,
@@ -116,6 +116,10 @@ pub(crate) struct EvaluationEnvironment {
 
     /// When set, defines after how many seconds a policy evaluation is interrupted.
     global_policy_evaluation_limit_seconds: Option<u64>,
+
+    /// When set, defines the maximum amount of linear memory, in bytes, that
+    /// each policy is allowed to use.
+    policy_memory_limit_bytes: Option<usize>,
 }
 
 /// This structure is used to build the `EvaluationEnvironment` instance.
@@ -125,6 +129,7 @@ pub(crate) struct EvaluationEnvironmentBuilder<'engine, 'precompiled_policies> {
     callback_handler_tx: mpsc::Sender<CallbackRequest>,
     continue_on_errors: bool,
     global_policy_evaluation_limit_seconds: Option<u64>,
+    policy_memory_limit_bytes: Option<usize>,
     always_accept_admission_reviews_on_namespace: Option<String>,
 }
 
@@ -141,6 +146,7 @@ impl<'engine, 'precompiled_policies> EvaluationEnvironmentBuilder<'engine, 'prec
             callback_handler_tx,
             continue_on_errors: false,
             global_policy_evaluation_limit_seconds: None,
+            policy_memory_limit_bytes: None,
             always_accept_admission_reviews_on_namespace: None,
         }
     }
@@ -151,6 +157,13 @@ impl<'engine, 'precompiled_policies> EvaluationEnvironmentBuilder<'engine, 'prec
         policy_evaluation_limit_seconds: u64,
     ) -> Self {
         self.global_policy_evaluation_limit_seconds = Some(policy_evaluation_limit_seconds);
+        self
+    }
+
+    /// Enable enforcement of a maximum amount of linear memory, in bytes,
+    /// that each policy is allowed to use.
+    pub fn with_policy_memory_limit(mut self, policy_memory_limit_bytes: usize) -> Self {
+        self.policy_memory_limit_bytes = Some(policy_memory_limit_bytes);
         self
     }
 
@@ -197,6 +210,7 @@ impl<'engine, 'precompiled_policies> EvaluationEnvironmentBuilder<'engine, 'prec
                 .clone(),
             callback_handler_tx: Some(self.callback_handler_tx.clone()),
             global_policy_evaluation_limit_seconds: self.global_policy_evaluation_limit_seconds,
+            policy_memory_limit_bytes: self.policy_memory_limit_bytes,
             ..Default::default()
         };
 
@@ -438,8 +452,12 @@ impl EvaluationEnvironment {
             debug!(?policy_id, "create wasmtime::Module");
             let module = create_wasmtime_module(policy_id, engine, precompiled_policy)?;
             debug!(?policy_id, "create PolicyEvaluatorPre");
-            let pol_eval_pre =
-                create_policy_evaluator_pre(engine, &module, precompiled_policy.execution_mode)?;
+            let pol_eval_pre = create_policy_evaluator_pre(
+                engine,
+                &module,
+                precompiled_policy.execution_mode,
+                self.policy_memory_limit_bytes,
+            )?;
 
             self.module_digest_to_policy_evaluator_pre
                 .insert(module_digest.to_owned(), Arc::new(pol_eval_pre));
@@ -749,15 +767,26 @@ fn create_wasmtime_module(
 /// epoch-interruption setting is decided once in `lib.rs`; the per-evaluation
 /// deadline is applied later, via `EvaluationContext::epoch_deadline`
 /// (see `epoch_deadline_for`).
+///
+/// Unlike the epoch deadline, `policy_memory_limit_bytes` is applied here,
+/// at `PolicyEvaluatorPre` build time: it's baked into the `ResourceLimits`
+/// used by every `wasmtime::Store` created out of the resulting `Pre`
+/// instance (via `PolicyEvaluatorBuilder::enable_resource_limits`), so there
+/// is no per-evaluation override.
 fn create_policy_evaluator_pre(
     engine: &wasmtime::Engine,
     module: &wasmtime::Module,
     mode: PolicyExecutionMode,
+    policy_memory_limit_bytes: Option<usize>,
 ) -> Result<PolicyEvaluatorPre> {
     let policy_evaluator_builder = PolicyEvaluatorBuilder::new()
         .engine(engine.to_owned())
         .policy_module(module.to_owned())
-        .execution_mode(mode);
+        .execution_mode(mode)
+        .enable_resource_limits(ResourceLimits {
+            max_memory_size: policy_memory_limit_bytes,
+            max_table_elements: None,
+        });
 
     policy_evaluator_builder.build_pre().map_err(|e| {
         EvaluationError::WebAssemblyError(format!("cannot build PolicyEvaluatorPre {e}"))

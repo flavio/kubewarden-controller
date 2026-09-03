@@ -4,12 +4,13 @@ use wasmtime::{AsContextMut, Caller, Linker};
 use crate::{
     builtins::BUILTINS_HELPER,
     errors::{BurregoError, Result},
+    evaluator::StoreData,
     stack_helper::StackHelper,
 };
 
 /// Add OPA host callbacks to the linker.
 /// The callbackes are the one listed at https://www.openpolicyagent.org/docs/latest/wasm/#imports
-pub(crate) fn add_to_linker(linker: &mut Linker<Option<StackHelper>>) -> Result<()> {
+pub(crate) fn add_to_linker(linker: &mut Linker<StoreData>) -> Result<()> {
     register_opa_abort_func(linker)?;
     register_opa_println_func(linker)?;
     register_opa_builtin0_func(linker)?;
@@ -21,15 +22,13 @@ pub(crate) fn add_to_linker(linker: &mut Linker<Option<StackHelper>>) -> Result<
     Ok(())
 }
 
-fn register_opa_abort_func(
-    linker: &mut Linker<Option<StackHelper>>,
-) -> Result<&mut Linker<Option<StackHelper>>> {
+fn register_opa_abort_func(linker: &mut Linker<StoreData>) -> Result<&mut Linker<StoreData>> {
     linker
         .func_wrap(
             "env",
             "opa_abort",
-            |mut caller: Caller<'_, Option<StackHelper>>, addr: i32| {
-                let stack_helper = caller.data().as_ref().unwrap();
+            |mut caller: Caller<'_, StoreData>, addr: i32| {
+                let stack_helper = caller.data().stack_helper.as_ref().unwrap();
                 let opa_abort_host_callback = stack_helper.opa_abort_host_callback;
 
                 let memory_export = caller.get_export("memory").ok_or_else(|| BurregoError::RegoWasmError("cannot find 'memory' export".to_string()))?;
@@ -50,14 +49,12 @@ fn register_opa_abort_func(
         })
 }
 
-fn register_opa_println_func(
-    linker: &mut Linker<Option<StackHelper>>,
-) -> Result<&mut Linker<Option<StackHelper>>> {
+fn register_opa_println_func(linker: &mut Linker<StoreData>) -> Result<&mut Linker<StoreData>> {
     linker.func_wrap(
         "env",
         "opa_println",
-        |mut caller: Caller<'_, Option<StackHelper>>, addr: i32| {
-            let stack_helper = caller.data().as_ref().unwrap();
+        |mut caller: Caller<'_, StoreData>, addr: i32| {
+            let stack_helper = caller.data().stack_helper.as_ref().unwrap();
             let opa_println_host_callback = stack_helper.opa_println_host_callback;
 
             let memory_export = caller.get_export("memory").ok_or_else(|| BurregoError::RegoWasmError("cannot find 'memory' export".to_string()))?;
@@ -81,16 +78,14 @@ fn register_opa_println_func(
 /// env.opa_builtin0 (builtin_id, ctx) addr
 /// Called to dispatch the built-in function identified by the builtin_id.
 /// The ctx parameter reserved for future use. The result addr must refer to a value in the shared-memory buffer. The function accepts 0 arguments.
-fn register_opa_builtin0_func(
-    linker: &mut Linker<Option<StackHelper>>,
-) -> Result<&mut Linker<Option<StackHelper>>> {
+fn register_opa_builtin0_func(linker: &mut Linker<StoreData>) -> Result<&mut Linker<StoreData>> {
     linker.func_wrap(
         "env",
         "opa_builtin0",
-        |mut caller: Caller<'_, Option<StackHelper>>, builtin_id: i32, _ctx: i32| {
+        |mut caller: Caller<'_, StoreData>, builtin_id: i32, _ctx: i32| {
             debug!(builtin_id, "opa_builtin0");
 
-            let stack_helper = caller.data().as_ref().unwrap();
+            let stack_helper = caller.data().stack_helper.as_ref().unwrap();
             let opa_malloc_fn = stack_helper.opa_malloc_fn.clone();
             let opa_json_parse_fn = stack_helper.opa_json_parse_fn.clone();
             let builtin_name = stack_helper
@@ -129,19 +124,17 @@ fn register_opa_builtin0_func(
 
 /// env.opa_builtin1(builtin_id, ctx, _1) addr
 /// Same as previous except the function accepts 1 argument.
-fn register_opa_builtin1_func(
-    linker: &mut Linker<Option<StackHelper>>,
-) -> Result<&mut Linker<Option<StackHelper>>> {
+fn register_opa_builtin1_func(linker: &mut Linker<StoreData>) -> Result<&mut Linker<StoreData>> {
     linker.func_wrap(
         "env",
         "opa_builtin1",
-            move |mut caller: Caller<'_, Option<StackHelper>>,
+            move |mut caller: Caller<'_, StoreData>,
                   builtin_id: i32,
                   _ctx: i32,
                   p1: i32| {
             debug!(builtin_id, p1, "opa_builtin1");
 
-            let stack_helper = caller.data().as_ref().unwrap();
+            let stack_helper = caller.data().stack_helper.as_ref().unwrap();
             let opa_malloc_fn = stack_helper.opa_malloc_fn.clone();
             let opa_json_parse_fn = stack_helper.opa_json_parse_fn.clone();
             let opa_json_dump_fn = stack_helper.opa_json_dump_fn.clone();
@@ -187,20 +180,18 @@ fn register_opa_builtin1_func(
 
 /// env.opa_builtin2 (builtin_id, ctx, _1, _2) addr
 /// Same as previous except the function accepts 2 arguments.
-fn register_opa_builtin2_func(
-    linker: &mut Linker<Option<StackHelper>>,
-) -> Result<&mut Linker<Option<StackHelper>>> {
+fn register_opa_builtin2_func(linker: &mut Linker<StoreData>) -> Result<&mut Linker<StoreData>> {
     linker.func_wrap(
         "env",
         "opa_builtin2",
-            move |mut caller: Caller<'_, Option<StackHelper>>,
+            move |mut caller: Caller<'_, StoreData>,
                   builtin_id: i32,
                   _ctx: i32,
                   p1: i32,
                   p2: i32| {
             debug!(builtin_id, p1, p2, "opa_builtin2");
 
-            let stack_helper = caller.data().as_ref().unwrap();
+            let stack_helper = caller.data().stack_helper.as_ref().unwrap();
             let opa_malloc_fn = stack_helper.opa_malloc_fn.clone();
             let opa_json_parse_fn = stack_helper.opa_json_parse_fn.clone();
             let opa_json_dump_fn = stack_helper.opa_json_dump_fn.clone();
@@ -246,13 +237,11 @@ fn register_opa_builtin2_func(
 
 /// env.opa_builtin3 (builtin_id, ctx, _1, _2, _3) addr
 /// Same as previous except the function accepts 3 arguments.
-fn register_opa_builtin3_func(
-    linker: &mut Linker<Option<StackHelper>>,
-) -> Result<&mut Linker<Option<StackHelper>>> {
+fn register_opa_builtin3_func(linker: &mut Linker<StoreData>) -> Result<&mut Linker<StoreData>> {
     linker.func_wrap(
         "env",
         "opa_builtin3",
-            move |mut caller: Caller<'_, Option<StackHelper>>,
+            move |mut caller: Caller<'_, StoreData>,
                   builtin_id: i32,
                   _ctx: i32,
                   p1: i32,
@@ -260,7 +249,7 @@ fn register_opa_builtin3_func(
                   p3: i32| {
             debug!(builtin_id, p1, p2, p3, "opa_builtin3");
 
-            let stack_helper = caller.data().as_ref().unwrap();
+            let stack_helper = caller.data().stack_helper.as_ref().unwrap();
             let opa_malloc_fn = stack_helper.opa_malloc_fn.clone();
             let opa_json_parse_fn = stack_helper.opa_json_parse_fn.clone();
             let opa_json_dump_fn = stack_helper.opa_json_dump_fn.clone();
@@ -308,13 +297,11 @@ fn register_opa_builtin3_func(
 
 /// env.opa_builtin4 (builtin_id, ctx, _1, _2, _3, _4) addr
 /// Same as previous except the function accepts 4 arguments.
-fn register_opa_builtin4_func(
-    linker: &mut Linker<Option<StackHelper>>,
-) -> Result<&mut Linker<Option<StackHelper>>> {
+fn register_opa_builtin4_func(linker: &mut Linker<StoreData>) -> Result<&mut Linker<StoreData>> {
     linker.func_wrap(
         "env",
         "opa_builtin4",
-            move |mut caller: Caller<'_, Option<StackHelper>>,
+            move |mut caller: Caller<'_, StoreData>,
                   builtin_id: i32,
                   _ctx: i32,
                   p1: i32,
@@ -323,7 +310,7 @@ fn register_opa_builtin4_func(
                   p4: i32| {
             debug!(builtin_id, p1, p2, p3, p4, "opa_builtin4");
 
-            let stack_helper = caller.data().as_ref().unwrap();
+            let stack_helper = caller.data().stack_helper.as_ref().unwrap();
             let opa_malloc_fn = stack_helper.opa_malloc_fn.clone();
             let opa_json_parse_fn = stack_helper.opa_json_parse_fn.clone();
             let opa_json_dump_fn = stack_helper.opa_json_dump_fn.clone();

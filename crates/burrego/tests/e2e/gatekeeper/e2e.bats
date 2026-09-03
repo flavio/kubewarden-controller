@@ -1,7 +1,7 @@
 #!/usr/bin/env bats
 
 @test "[accept in namespace]: valid namespace" {
-  run cargo run --example  cli -- -v eval policy.wasm --input-path request-valid.json
+  run cargo run --example  cli -- -v eval ../../data/gatekeeper.wasm --input-path request-valid.json
   # this prints the output when one the checks below fails
   echo "output = ${output}"
 
@@ -11,7 +11,7 @@
 }
 
 @test "[accept in namespace]: not valid namespace" {
-  run cargo run --example  cli -- -v eval policy.wasm --input-path request-not-valid.json
+  run cargo run --example  cli -- -v eval ../../data/gatekeeper.wasm --input-path request-not-valid.json
   # this prints the output when one the checks below fails
   echo "output = ${output}"
 
