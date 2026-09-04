@@ -52,38 +52,32 @@ fn rego_policy_detector(wasm_path: PathBuf) -> Result<bool> {
     Ok(false)
 }
 
-// Looks at the Wasm module pointed by `wasm_path` and returns whether it was produced by ferricel.
+// Looks at the Wasm module pointed by `wasm_path` and returns whether it was produced by ferricel
+// from a `ValidatingAdmissionPolicy` (VAP).
 //
-// The code inspects the WebAssembly `producers` custom section, looking for a `processed-by` field
-// that contains an entry named `ferricel`. Ferricel always adds this entry when compiling a CEL
-// expression to Wasm.
+// Any Wasm module compiled by ferricel (including a plain CEL expression compiled via
+// `Compiler::compile`) carries a `processed-by: ferricel` entry in the standard WebAssembly
+// `producers` custom section. That alone is not enough to accept the module as a policy backend:
+// a module compiled from a bare CEL expression evaluates to a scalar, not a `ValidationResponse`,
+// and would fail every request once loaded as a policy.
+//
+// Only modules compiled via `Compiler::compile_vap` / `Compiler::compile_vap_from_policy` embed
+// the original VAP YAML in a `ferricel.vap-source` custom section (exposed as
+// `ModuleInfo::vap_source`). Require both pieces of evidence -- the `processed-by: ferricel`
+// producer entry and the presence of `ferricel.vap-source` -- before accepting the module as a
+// Ferricel policy.
 fn ferricel_policy_detector(wasm_path: PathBuf) -> Result<bool> {
     let data: Vec<u8> = std::fs::read(wasm_path.clone())
         .map_err(|e| anyhow!("cannot access file {:?}: {}", wasm_path, e))?;
 
-    for payload in wasmparser::Parser::new(0).parse_all(&data) {
-        let payload = payload.map_err(|e| anyhow!("cannot parse WebAssembly file: {}", e))?;
-        if let wasmparser::Payload::CustomSection(cs) = payload
-            && let wasmparser::KnownCustom::Producers(reader) = cs.as_known()
-        {
-            for field in reader {
-                let field = field
-                    .map_err(|e| anyhow!("cannot parse WebAssembly producers section: {}", e))?;
-                if field.name == "processed-by" {
-                    for value in field.values {
-                        let value = value.map_err(|e| {
-                            anyhow!("cannot parse WebAssembly producers field value: {}", e)
-                        })?;
-                        if value.name == "ferricel" {
-                            return Ok(true);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let module_info = ferricel_core::inspect(&data)
+        .map_err(|e| anyhow!("cannot inspect WebAssembly file: {}", e))?;
 
-    Ok(false)
+    let processed_by_ferricel = module_info.producers.iter().any(|field| {
+        field.name == "processed-by" && field.values.iter().any(|value| value.name == "ferricel")
+    });
+
+    Ok(processed_by_ferricel && module_info.vap_source.is_some())
 }
 
 fn kubewarden_protocol_detector(wasm_path: PathBuf) -> Result<ProtocolVersion> {
@@ -149,7 +143,7 @@ impl BackendDetector {
                     Ok(Backend::Ferricel)
                 } else {
                     Err(anyhow!(
-                        "Wrong value inside of policy's metadata for 'executionMode'. The policy has not been created using ferricel"
+                        "Wrong value inside of policy's metadata for 'executionMode'. The policy is not a ValidatingAdmissionPolicy compiled by ferricel"
                     ))
                 }
             }
@@ -251,9 +245,37 @@ mod tests {
         BackendDetector::new(rego, mock_protocol_version_detector_v1, ferricel)
     }
 
-    /// Compile a trivial CEL expression and return a temp file containing the wasm bytes.
-    /// The resulting module will have a `producers` section with a `ferricel` entry.
-    fn ferricel_wasm_file() -> NamedTempFile {
+    /// A minimal `ValidatingAdmissionPolicy` YAML that ferricel can compile without needing any
+    /// host extension registered.
+    const VAP_ALWAYS_ALLOW: &str = r#"
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: always-allow
+spec:
+  validations:
+    - expression: "true"
+      message: "unreachable"
+"#;
+
+    /// Compile a `ValidatingAdmissionPolicy` and return a temp file containing the wasm bytes.
+    /// The resulting module carries both the `processed-by: ferricel` producer entry and a
+    /// `ferricel.vap-source` custom section.
+    fn ferricel_vap_wasm_file() -> NamedTempFile {
+        let wasm_bytes = CompilerBuilder::new()
+            .build()
+            .compile_vap(VAP_ALWAYS_ALLOW)
+            .expect("failed to compile VAP");
+        let tmp = NamedTempFile::new().expect("failed to create temp file");
+        std::fs::write(tmp.path(), wasm_bytes).expect("failed to write wasm");
+        tmp
+    }
+
+    /// Compile a trivial CEL expression (not a VAP) and return a temp file containing the wasm
+    /// bytes. The resulting module carries the `processed-by: ferricel` producer entry but, since
+    /// it wasn't compiled from a VAP, has no `ferricel.vap-source` custom section. Such a module
+    /// evaluates to a scalar, not a `ValidationResponse`, and must not be accepted as a policy.
+    fn ferricel_cel_wasm_file() -> NamedTempFile {
         let wasm_bytes = CompilerBuilder::new()
             .build()
             .compile("1 + 1")
@@ -272,7 +294,8 @@ mod tests {
     }
 
     #[rstest]
-    #[case::ferricel_module(ferricel_wasm_file, true)]
+    #[case::ferricel_vap_module(ferricel_vap_wasm_file, true)]
+    #[case::ferricel_cel_module(ferricel_cel_wasm_file, false)]
     #[case::non_ferricel_module(non_ferricel_wasm_file, false)]
     fn test_ferricel_policy_detector(
         #[case] wasm_file_fn: fn() -> NamedTempFile, // factory fn producing the wasm fixture
