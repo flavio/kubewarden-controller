@@ -133,6 +133,26 @@ impl VapData {
             .ok_or_else(|| anyhow!("ValidatingAdmissionPolicy has no spec"))?;
         let vap_binding_spec = vap_binding.spec.unwrap_or_default();
 
+        // The binding only references its policy by name; make sure it
+        // actually points at the VAP we were given. Without this check a
+        // mismatched pair is silently combined, compiling one policy while
+        // applying another policy's binding metadata (name, selectors,
+        // paramRef, ...).
+        let vap_name = vap
+            .metadata
+            .name
+            .as_deref()
+            .ok_or_else(|| anyhow!("ValidatingAdmissionPolicy has no metadata.name"))?;
+        let policy_name = vap_binding_spec
+            .policy_name
+            .as_deref()
+            .ok_or_else(|| anyhow!("ValidatingAdmissionPolicyBinding has no spec.policyName"))?;
+        if policy_name != vap_name {
+            return Err(anyhow!(
+                "ValidatingAdmissionPolicyBinding spec.policyName '{policy_name}' does not match ValidatingAdmissionPolicy metadata.name '{vap_name}'"
+            ));
+        }
+
         // Params: both must be present together or both absent.
         let mut param_settings = serde_yaml::Mapping::new();
         let mut param_resource = None;
@@ -222,6 +242,14 @@ pub(crate) mod tests {
     }
 
     fn open_vap_data(vap_yaml_path: &str, vap_binding_yaml_path: &str) -> VapData {
+        let (vap, vap_binding) = open_raw(vap_yaml_path, vap_binding_yaml_path);
+        VapData::new(vap, vap_binding).expect("cannot build VapData")
+    }
+
+    fn open_raw(
+        vap_yaml_path: &str,
+        vap_binding_yaml_path: &str,
+    ) -> (ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding) {
         let yaml_file = File::open(test_data(vap_yaml_path)).expect("cannot open VAP yaml file");
         let vap: ValidatingAdmissionPolicy =
             serde_yaml::from_reader(yaml_file).expect("cannot parse VAP yaml file");
@@ -231,7 +259,7 @@ pub(crate) mod tests {
         let vap_binding: ValidatingAdmissionPolicyBinding =
             serde_yaml::from_reader(yaml_file).expect("cannot parse VAP binding yaml file");
 
-        VapData::new(vap, vap_binding).expect("cannot build VapData")
+        (vap, vap_binding)
     }
 
     fn open_vap(vap_yaml_path: &str) -> ValidatingAdmissionPolicy {
@@ -281,5 +309,39 @@ pub(crate) mod tests {
                 .as_str()
                 .expect("parameterNotFoundAction should be a string")
         );
+    }
+
+    #[test]
+    fn new_rejects_binding_whose_policy_name_does_not_match_the_vap() {
+        let (vap, mut vap_binding) =
+            open_raw("vap/vap-without-variables.yml", "vap/vap-binding.yml");
+        vap_binding
+            .spec
+            .as_mut()
+            .expect("binding has a spec")
+            .policy_name = Some("some-other-policy".to_string());
+
+        let err = match VapData::new(vap, vap_binding) {
+            Ok(_) => panic!("mismatched policyName/metadata.name should be rejected"),
+            Err(e) => e,
+        };
+
+        let message = err.to_string();
+        assert!(message.contains("some-other-policy"), "{message}");
+        assert!(message.contains("vap-test"), "{message}");
+    }
+
+    #[test]
+    fn new_rejects_vap_with_no_metadata_name() {
+        let (mut vap, vap_binding) =
+            open_raw("vap/vap-without-variables.yml", "vap/vap-binding.yml");
+        vap.metadata.name = None;
+
+        let err = match VapData::new(vap, vap_binding) {
+            Ok(_) => panic!("VAP with no metadata.name is rejected"),
+            Err(e) => e,
+        };
+
+        assert!(err.to_string().contains("metadata.name"));
     }
 }
