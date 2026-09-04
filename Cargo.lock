@@ -2244,9 +2244,9 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "ferricel-core"
-version = "0.6.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2fdde6c53587ddb2b01c21fa88b1eaef5c36beada76c5166bf9a2d33a9bf24bf"
+checksum = "95849e8f3c0fbb23cbeea07f4bd70905800c41af1758db5e5d0b23103a045705"
 dependencies = [
  "anyhow",
  "cel",
@@ -2265,9 +2265,9 @@ dependencies = [
 
 [[package]]
 name = "ferricel-types"
-version = "0.6.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8733e4d10077157dc5b1b54d780b83834d3f9025266e85e83091fcdf2a85a03"
+checksum = "b534082fd9e6a12688278cc442e7a6fdc665c7027e8ececbfd8fcbe15fc42f0e"
 dependencies = [
  "prost 0.14.4",
  "prost-build 0.14.4",
