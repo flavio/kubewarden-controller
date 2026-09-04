@@ -5,12 +5,12 @@ mod net;
 mod oci;
 mod sigstore;
 
-use std::{
-    collections::{BTreeSet, HashMap},
-    sync::Arc,
-};
+use std::{collections::BTreeSet, sync::Arc};
 
-use ferricel_core::{ExtensionKey, runtime::ExtensionFn};
+use ferricel_core::{
+    compiler::vap::{kw_k8s_get_extension, kw_k8s_list_extension},
+    runtime::Extensions,
+};
 use ferricel_types::extensions::{BuilderChainDecl, ExtensionDecl, UsedExtension};
 
 use crate::evaluation_context::EvaluationContext;
@@ -48,14 +48,42 @@ pub fn compiler_extension_decls() -> Vec<ExtensionDecl> {
 
 // ─── Runtime extensions map ───────────────────────────────────────────────────
 
-/// Build the `HashMap<ExtensionKey, ExtensionFn>` that is passed to
-/// `EnginePre::rehydrate` for every ferricel policy evaluation.
+/// Extract the first element (the builder map) from a guest-supplied
+/// argument list.
+///
+/// The wasm host-call trampoline rejects a call whose `args.len()` doesn't match
+/// the registered `ExtensionDecl::num_args` *before* invoking the closure, so
+/// every handler here can already trust that `args` has exactly one element.
+/// This helper is a defense-in-depth guard, not the primary line of defense:
+/// it protects against a decl/handler mismatch introduced by a future edit
+/// (e.g. a handler added with the wrong `num_args`) and against the closures
+/// being invoked directly, as the unit tests below do. Every builder handler
+/// must go through this helper instead of indexing `args[0]` directly, so
+/// that a missing argument turns into a controlled `Err` rather than a host
+/// panic in either case.
+fn builder_arg<'a>(
+    args: &'a [serde_json::Value],
+    name: &str,
+) -> Result<&'a serde_json::Value, String> {
+    args.first()
+        .ok_or_else(|| format!("{name}: expected a builder map argument, got none"))
+}
+
+/// Build the [`Extensions`] registry that is passed to `EnginePre::rehydrate`
+/// for every ferricel policy evaluation.
 ///
 /// Every handler is always registered. Handlers that require a callback
 /// channel return an error if `eval_ctx.callback_channel` is `None` rather
-/// than being omitted from the map -- this way CEL expressions that call
-/// those functions receive a clear error message instead of a silent "extension
-/// not found" panic from the wasm runtime.
+/// than being omitted from the registry. This way CEL expressions that call
+/// those functions receive a clear error message instead of an "extension not
+/// found" error from the wasm runtime.
+///
+/// Every registration pairs the handler with the same [`ExtensionDecl`] used
+/// to configure the compiler (see [`compiler_extension_decls`] and
+/// [`kw_k8s_get_extension`]/[`kw_k8s_list_extension`]), so the compile-time
+/// and runtime argument counts can never drift apart. Rembmer, `ferricel-core`
+/// enforces `args.len() == decl.num_args` for every guest call before it
+/// reaches these closures.
 ///
 /// Every handler that performs a host call routes through
 /// [`crate::runtimes::callback::host_callback_typed`] -- the single
@@ -66,129 +94,156 @@ pub fn compiler_extension_decls() -> Vec<ExtensionDecl> {
 /// (`eval_ctx.ctx_aware_resources_allow_list`), so a ferricel policy can never
 /// use a host capability or read a Kubernetes resource that its
 /// `EvaluationContext` denies.
-pub(crate) fn build_extensions(eval_ctx: &EvaluationContext) -> HashMap<ExtensionKey, ExtensionFn> {
-    let mut m: HashMap<ExtensionKey, ExtensionFn> = HashMap::new();
+///
+/// An `Err(String)` returned by any handler becomes a CEL runtime error at
+/// the call site (unless absorbed by `||`/`&&`). A CEL runtime error inside
+/// a VAP `matchCondition` or `validation` always fails the evaluation.
+pub(crate) fn build_extensions(eval_ctx: &EvaluationContext) -> Extensions {
+    let mut m = Extensions::new();
 
     // ── kw.k8s ────────────────────────────────────────────────────────────────
     {
         let ctx = Arc::new(eval_ctx.clone());
-        m.insert(
-            ExtensionKey::new(Some("kw.k8s".into()), "get".into()),
-            Arc::new(move |args: Vec<serde_json::Value>| kubernetes::get_handler(&ctx, &args[0])),
+        m.register(
+            kw_k8s_get_extension(),
+            move |args: Vec<serde_json::Value>| {
+                kubernetes::get_handler(&ctx, builder_arg(&args, "kw.k8s.get")?)
+            },
         );
     }
     {
         let ctx = Arc::new(eval_ctx.clone());
-        m.insert(
-            ExtensionKey::new(Some("kw.k8s".into()), "list".into()),
-            Arc::new(move |args: Vec<serde_json::Value>| kubernetes::list_handler(&ctx, &args[0])),
+        m.register(
+            kw_k8s_list_extension(),
+            move |args: Vec<serde_json::Value>| {
+                kubernetes::list_handler(&ctx, builder_arg(&args, "kw.k8s.list")?)
+            },
         );
     }
 
     // ── kw.oci ────────────────────────────────────────────────────────────────
     {
         let ctx = Arc::new(eval_ctx.clone());
-        m.insert(
-            ExtensionKey::new(Some("kw.oci".into()), "manifest".into()),
-            Arc::new(move |args: Vec<serde_json::Value>| oci::manifest_handler(&ctx, &args[0])),
+        m.register(
+            oci::manifest_extension(),
+            move |args: Vec<serde_json::Value>| {
+                oci::manifest_handler(&ctx, builder_arg(&args, "kw.oci.manifest")?)
+            },
         );
     }
     {
         let ctx = Arc::new(eval_ctx.clone());
-        m.insert(
-            ExtensionKey::new(Some("kw.oci".into()), "manifestDigest".into()),
-            Arc::new(move |args: Vec<serde_json::Value>| {
-                oci::manifest_digest_handler(&ctx, &args[0])
-            }),
+        m.register(
+            oci::manifest_digest_extension(),
+            move |args: Vec<serde_json::Value>| {
+                oci::manifest_digest_handler(&ctx, builder_arg(&args, "kw.oci.manifestDigest")?)
+            },
         );
     }
     {
         let ctx = Arc::new(eval_ctx.clone());
-        m.insert(
-            ExtensionKey::new(Some("kw.oci".into()), "manifestConfig".into()),
-            Arc::new(move |args: Vec<serde_json::Value>| {
-                oci::manifest_config_handler(&ctx, &args[0])
-            }),
+        m.register(
+            oci::manifest_config_extension(),
+            move |args: Vec<serde_json::Value>| {
+                oci::manifest_config_handler(&ctx, builder_arg(&args, "kw.oci.manifestConfig")?)
+            },
         );
     }
 
     // ── kw.net ────────────────────────────────────────────────────────────────
     {
         let ctx = Arc::new(eval_ctx.clone());
-        m.insert(
-            ExtensionKey::new(Some("kw.net".into()), "lookupHost".into()),
-            Arc::new(move |args: Vec<serde_json::Value>| net::lookup_host_handler(&ctx, &args)),
+        m.register(
+            net::lookup_host_extension(),
+            move |args: Vec<serde_json::Value>| net::lookup_host_handler(&ctx, &args),
         );
     }
 
     // ── kw.crypto ─────────────────────────────────────────────────────────────
     {
         let ctx = Arc::new(eval_ctx.clone());
-        m.insert(
-            ExtensionKey::new(Some("kw.crypto".into()), "verify".into()),
-            Arc::new(move |args: Vec<serde_json::Value>| crypto::verify_handler(&ctx, &args[0])),
+        m.register(
+            crypto::verify_extension(),
+            move |args: Vec<serde_json::Value>| {
+                crypto::verify_handler(&ctx, builder_arg(&args, "kw.crypto.verify")?)
+            },
         );
     }
     // Shared accessor: reads "trusted" (crypto) or "is_trusted" (sigstore).
-    m.insert(
-        ExtensionKey::new(None, "isTrusted".into()),
-        Arc::new(|args: Vec<serde_json::Value>| crypto::is_trusted_handler(&args)),
+    m.register(
+        crypto::is_trusted_extension(),
+        |args: Vec<serde_json::Value>| crypto::is_trusted_handler(&args),
     );
-    m.insert(
-        ExtensionKey::new(None, "reason".into()),
-        Arc::new(|args: Vec<serde_json::Value>| crypto::reason_handler(&args)),
+    m.register(
+        crypto::reason_extension(),
+        |args: Vec<serde_json::Value>| crypto::reason_handler(&args),
     );
 
     // ── kw.sigstore ───────────────────────────────────────────────────────────
     {
         let ctx = Arc::new(eval_ctx.clone());
-        m.insert(
-            ExtensionKey::new(Some("kw.sigstore".into()), "pubKeyVerify".into()),
-            Arc::new(move |args: Vec<serde_json::Value>| {
-                sigstore::pub_key_verify_handler(&ctx, &args[0])
-            }),
+        m.register(
+            sigstore::pub_key_verify_extension(),
+            move |args: Vec<serde_json::Value>| {
+                sigstore::pub_key_verify_handler(
+                    &ctx,
+                    builder_arg(&args, "kw.sigstore.pubKeyVerify")?,
+                )
+            },
         );
     }
     {
         let ctx = Arc::new(eval_ctx.clone());
-        m.insert(
-            ExtensionKey::new(Some("kw.sigstore".into()), "keylessVerify".into()),
-            Arc::new(move |args: Vec<serde_json::Value>| {
-                sigstore::keyless_verify_handler(&ctx, &args[0])
-            }),
+        m.register(
+            sigstore::keyless_verify_extension(),
+            move |args: Vec<serde_json::Value>| {
+                sigstore::keyless_verify_handler(
+                    &ctx,
+                    builder_arg(&args, "kw.sigstore.keylessVerify")?,
+                )
+            },
         );
     }
     {
         let ctx = Arc::new(eval_ctx.clone());
-        m.insert(
-            ExtensionKey::new(Some("kw.sigstore".into()), "keylessPrefixVerify".into()),
-            Arc::new(move |args: Vec<serde_json::Value>| {
-                sigstore::keyless_prefix_verify_handler(&ctx, &args[0])
-            }),
+        m.register(
+            sigstore::keyless_prefix_verify_extension(),
+            move |args: Vec<serde_json::Value>| {
+                sigstore::keyless_prefix_verify_handler(
+                    &ctx,
+                    builder_arg(&args, "kw.sigstore.keylessPrefixVerify")?,
+                )
+            },
         );
     }
     {
         let ctx = Arc::new(eval_ctx.clone());
-        m.insert(
-            ExtensionKey::new(Some("kw.sigstore".into()), "githubActionsVerify".into()),
-            Arc::new(move |args: Vec<serde_json::Value>| {
-                sigstore::github_actions_verify_handler(&ctx, &args[0])
-            }),
+        m.register(
+            sigstore::github_actions_verify_extension(),
+            move |args: Vec<serde_json::Value>| {
+                sigstore::github_actions_verify_handler(
+                    &ctx,
+                    builder_arg(&args, "kw.sigstore.githubActionsVerify")?,
+                )
+            },
         );
     }
     {
         let ctx = Arc::new(eval_ctx.clone());
-        m.insert(
-            ExtensionKey::new(Some("kw.sigstore".into()), "certificateVerify".into()),
-            Arc::new(move |args: Vec<serde_json::Value>| {
-                sigstore::certificate_verify_handler(&ctx, &args[0])
-            }),
+        m.register(
+            sigstore::certificate_verify_extension(),
+            move |args: Vec<serde_json::Value>| {
+                sigstore::certificate_verify_handler(
+                    &ctx,
+                    builder_arg(&args, "kw.sigstore.certificateVerify")?,
+                )
+            },
         );
     }
     // Sigstore-only accessor: reads "digest" from the VerificationResponse.
-    m.insert(
-        ExtensionKey::new(None, "digest".into()),
-        Arc::new(|args: Vec<serde_json::Value>| sigstore::digest_handler(&args)),
+    m.register(
+        sigstore::digest_extension(),
+        |args: Vec<serde_json::Value>| sigstore::digest_handler(&args),
     );
 
     m
@@ -387,6 +442,86 @@ mod tests {
             assert!(
                 !caps.is_empty(),
                 "namespaced extension {ns}/{func} has no host-capability mapping"
+            );
+        }
+    }
+
+    // ── untrusted-guest arity guard ────────────────────────────────────────────
+
+    #[test]
+    fn every_registered_extension_rejects_empty_args_without_panicking() {
+        // Ferricel-core rejects a call whose argument count doesn't
+        // match the registered `ExtensionDecl::num_args` before it ever
+        // reaches the closure, but this is a defense-in-depth test for the
+        // closures themselves (see `builder_arg`'s doc comment): it protects
+        // against a decl/handler mismatch and against the closures being
+        // invoked directly, as done here.
+        let exts = build_extensions(&EvaluationContext::default());
+        let decls: Vec<ExtensionDecl> = exts.decls().cloned().collect();
+        assert!(
+            !decls.is_empty(),
+            "expected at least one registered extension"
+        );
+        for decl in decls {
+            let key =
+                ferricel_core::ExtensionKey::new(decl.namespace.clone(), decl.function.clone());
+            let ext = exts.get(&key).unwrap_or_else(|| {
+                panic!("decl {decl:?} not found in its own Extensions registry")
+            });
+            let result = (ext.implementation)(vec![]);
+            assert!(
+                result.is_err(),
+                "extension {decl:?} did not return Err when called with empty args"
+            );
+        }
+    }
+
+    // ── compile-time / runtime decl drift guard ────────────────────────────────
+
+    #[test]
+    fn runtime_decls_match_compiler_decls() {
+        // The runtime `Extensions` registry built by `build_extensions` must
+        // declare exactly the same `ExtensionDecl`s (namespace, function,
+        // calling style, and -- crucially -- `num_args`) that the compiler is
+        // configured with. Otherwise ferricel-core's runtime arity check
+        // (`args.len() == decl.num_args`) could silently diverge from what
+        // the compiler emitted, defeating the type-checking the compiler
+        // performs at each CEL call site.
+        //
+        // `kw.k8s.get`/`kw.k8s.list` are not in `compiler_extension_decls`
+        // because the *compiler* auto-registers the `kw.k8s` builder chain
+        // (see `compiler_builder_chains`'s doc comment); we compare against
+        // their own decl constructors instead.
+        let runtime_decls: BTreeSet<ExtensionDecl> =
+            build_extensions(&EvaluationContext::default())
+                .decls()
+                .cloned()
+                .collect();
+
+        let mut expected: BTreeSet<ExtensionDecl> =
+            compiler_extension_decls().into_iter().collect();
+        expected.insert(kw_k8s_get_extension());
+        expected.insert(kw_k8s_list_extension());
+
+        assert_eq!(runtime_decls, expected);
+    }
+
+    // ── every builder-handler decl expects at least one argument ───────────────
+
+    #[test]
+    fn every_registered_decl_has_at_least_one_arg() {
+        // Every handler registered in `build_extensions` reads `args[0]` (via
+        // `builder_arg` or, for `kw.net.lookupHost`/`isTrusted`/`reason`/
+        // `digest`, via `.first()` directly). If a future decl were
+        // registered with `num_args: 0`, ferricel-core's arity check would
+        // let a zero-arg call reach the closure and `builder_arg` would then
+        // (correctly) reject it -- but the decl itself would be wrong. This
+        // test catches that class of mistake independently of arity
+        // enforcement.
+        for decl in build_extensions(&EvaluationContext::default()).decls() {
+            assert!(
+                decl.num_args >= 1,
+                "decl {decl:?} declares num_args=0 but its handler expects an argument"
             );
         }
     }
