@@ -110,9 +110,10 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 	Expect(err).ToNot(HaveOccurred())
 
 	err = (&AdmissionPolicyReconciler{
-		Client:               k8sManager.GetClient(),
-		Scheme:               k8sManager.GetScheme(),
-		DeploymentsNamespace: deploymentsNamespace,
+		Client:                  k8sManager.GetClient(),
+		Scheme:                  k8sManager.GetScheme(),
+		DeploymentsNamespace:    deploymentsNamespace,
+		ControllerConfigMapName: constants.DefaultControllerConfigMapName,
 		FeatureGateAdmissionWebhookMatchConditions: true,
 	}).SetupWithManager(k8sManager)
 	Expect(err).ToNot(HaveOccurred())
@@ -126,9 +127,10 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 	Expect(err).ToNot(HaveOccurred())
 
 	err = (&AdmissionPolicyGroupReconciler{
-		Client:               k8sManager.GetClient(),
-		Scheme:               k8sManager.GetScheme(),
-		DeploymentsNamespace: deploymentsNamespace,
+		Client:                  k8sManager.GetClient(),
+		Scheme:                  k8sManager.GetScheme(),
+		DeploymentsNamespace:    deploymentsNamespace,
+		ControllerConfigMapName: constants.DefaultControllerConfigMapName,
 		FeatureGateAdmissionWebhookMatchConditions: true,
 	}).SetupWithManager(k8sManager)
 	Expect(err).ToNot(HaveOccurred())
@@ -146,6 +148,7 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 		Scheme:                  k8sManager.GetScheme(),
 		DeploymentsNamespace:    deploymentsNamespace,
 		ClientCAConfigMapName:   clientCAConfigMapName,
+		ControllerConfigMapName: constants.DefaultControllerConfigMapName,
 		ImagePullSecrets:        []corev1.LocalObjectReference{{Name: reconcilerImagePullSecret}},
 		PolicyServerMetricsPort: constants.PolicyServerMetricsPort,
 		TelemetryConfiguration: TelemetryConfiguration{
@@ -183,6 +186,19 @@ var _ = SynchronizedBeforeSuite(func() []byte {
 		Data: map[string][]byte{
 			constants.CARootCert:       caCertBytes,
 			constants.CARootPrivateKey: caPrivateKey,
+		},
+	})
+	Expect(err).NotTo(HaveOccurred())
+
+	// Create the controller configuration ConfigMap. The configuration holds
+	// the allow list of resources for namespaced policies
+	err = k8sClient.Create(ctx, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      constants.DefaultControllerConfigMapName,
+			Namespace: deploymentsNamespace,
+		},
+		Data: map[string]string{
+			constants.ControllerConfigKey: testControllerConfigYAML,
 		},
 	})
 	Expect(err).NotTo(HaveOccurred())

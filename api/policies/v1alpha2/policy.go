@@ -7,7 +7,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// +kubebuilder:validation:Enum=unscheduled;scheduled;pending;active
+// +kubebuilder:validation:Enum=unscheduled;scheduled;pending;active;rejected
 type PolicyStatusEnum string
 
 const (
@@ -25,6 +25,11 @@ const (
 	// PolicyStatusActive informs that the k8s API server should be
 	// forwarding admission review objects to the policy.
 	PolicyStatusActive PolicyStatusEnum = "active"
+	// PolicyStatusRejected means that the policy targets resources that
+	// the cluster administrator does not allow for namespaced policies.
+	// The controller does not deploy the policy. The PolicyActive
+	// condition explains the reason.
+	PolicyStatusRejected PolicyStatusEnum = "rejected"
 )
 
 // +kubebuilder:validation:Enum=protect;monitor;unknown

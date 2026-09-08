@@ -603,6 +603,8 @@ returned in the warning field of the response. + |  | Required: \{} +
 
 
 
+
+
 [id="{anchor_prefix}-github-com-kubewarden-adm-controller-api-policies-v1-policygroupmember"]
 ==== PolicyGroupMember
 
@@ -1124,7 +1126,7 @@ _Underlying type:_ _string_
 
 
 .Validation:
-- Enum: [unscheduled scheduled pending active]
+- Enum: [unscheduled scheduled pending active rejected]
 
 .Appears In:
 ****
@@ -1578,7 +1580,7 @@ _Underlying type:_ _string_
 
 
 .Validation:
-- Enum: [unscheduled scheduled pending active]
+- Enum: [unscheduled scheduled pending active rejected]
 
 .Appears In:
 ****

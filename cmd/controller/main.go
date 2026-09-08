@@ -88,6 +88,7 @@ type Configuration struct {
 	AlwaysAcceptAdmissionReviewsOnDeploymentsNamespace bool
 	ClientCAConfigMapName                              string
 	DefaultsConfigMapName                              string
+	ControllerConfigMapName                            string
 	FeatureGateAdmissionWebhookMatchConditions         bool
 	WebhookServiceName                                 string
 	ImagePullSecrets                                   []corev1.LocalObjectReference
@@ -152,6 +153,10 @@ func main() {
 		"defaults-configmap-name",
 		constants.DefaultDefaultsConfigMapName,
 		"Name of the ConfigMap that holds the rendered default Kubewarden resources.")
+	flag.StringVar(&config.ControllerConfigMapName,
+		"controller-configmap-name",
+		constants.DefaultControllerConfigMapName,
+		"Name of the ConfigMap that holds the controller configuration, for example the resources that namespaced policies can target. The ConfigMap must be in the deployments namespace.")
 	flag.StringVar(&imagePullSecretsFlag,
 		"image-pull-secrets",
 		"",
@@ -443,6 +448,7 @@ func setupReconcilers(mgr ctrl.Manager,
 		AlwaysAcceptAdmissionReviewsInDeploymentsNamespace: config.AlwaysAcceptAdmissionReviewsOnDeploymentsNamespace,
 		TelemetryConfiguration:                             otelConfiguration,
 		ClientCAConfigMapName:                              config.ClientCAConfigMapName,
+		ControllerConfigMapName:                            config.ControllerConfigMapName,
 		ImagePullSecrets:                                   config.ImagePullSecrets,
 		HostNetwork:                                        config.HostNetwork,
 		PolicyServerMetricsPort:                            policyServerMetricsPort,
@@ -451,10 +457,11 @@ func setupReconcilers(mgr ctrl.Manager,
 	}
 
 	if err := (&controller.AdmissionPolicyReconciler{
-		Client:               mgr.GetClient(),
-		Scheme:               mgr.GetScheme(),
-		Log:                  ctrl.Log.WithName("admission-policy-reconciler"),
-		DeploymentsNamespace: deploymentsNamespace,
+		Client:                  mgr.GetClient(),
+		Scheme:                  mgr.GetScheme(),
+		Log:                     ctrl.Log.WithName("admission-policy-reconciler"),
+		DeploymentsNamespace:    deploymentsNamespace,
+		ControllerConfigMapName: config.ControllerConfigMapName,
 		FeatureGateAdmissionWebhookMatchConditions: config.FeatureGateAdmissionWebhookMatchConditions,
 	}).SetupWithManager(mgr); err != nil {
 		return errors.Join(errors.New("unable to create AdmissionPolicy controller"), err)
@@ -482,10 +489,11 @@ func setupReconcilers(mgr ctrl.Manager,
 	}
 
 	if err := (&controller.AdmissionPolicyGroupReconciler{
-		Client:               mgr.GetClient(),
-		Scheme:               mgr.GetScheme(),
-		Log:                  ctrl.Log.WithName("admission-policy-group-reconciler"),
-		DeploymentsNamespace: deploymentsNamespace,
+		Client:                  mgr.GetClient(),
+		Scheme:                  mgr.GetScheme(),
+		Log:                     ctrl.Log.WithName("admission-policy-group-reconciler"),
+		DeploymentsNamespace:    deploymentsNamespace,
+		ControllerConfigMapName: config.ControllerConfigMapName,
 		FeatureGateAdmissionWebhookMatchConditions: config.FeatureGateAdmissionWebhookMatchConditions,
 	}).SetupWithManager(mgr); err != nil {
 		return errors.Join(errors.New("unable to create AdmissionPolicyGroup controller"), err)

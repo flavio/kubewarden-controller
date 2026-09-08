@@ -2,12 +2,15 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"slices"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/e2e-framework/klient/k8s"
 	"sigs.k8s.io/e2e-framework/klient/wait"
@@ -29,6 +32,7 @@ const (
 	policyServerNameKey contextKey = "policyServerName"
 	policyNameKey       contextKey = "policyName"
 	policyKey           contextKey = "policy"
+	controllerConfigKey contextKey = "controllerConfig"
 )
 
 func createNamespaceWithRetry(ctx context.Context, cfg *envconf.Config, name string) error {
@@ -109,7 +113,79 @@ func verifyWebhookMetadata(labels, annotations map[string]string, policyName, po
 	return true
 }
 
-// containsFinalizer checks if a finalizer exists in the finalizers list.
+// containsFinalizer returns true when the list contains the finalizer.
 func containsFinalizer(finalizers []string, finalizer string) bool {
 	return slices.Contains(finalizers, finalizer)
+}
+
+// isPolicyRejectedFor returns true when the policy status is rejected and
+// the PolicyActive condition names the given resource.
+func isPolicyRejectedFor(status *policiesv1.PolicyStatus, resource string) bool {
+	if status.PolicyStatus != policiesv1.PolicyStatusRejected {
+		return false
+	}
+	condition := apimeta.FindStatusCondition(status.Conditions, string(policiesv1.PolicyActive))
+	if condition == nil || condition.Status != metav1.ConditionFalse {
+		return false
+	}
+	return condition.Reason == string(policiesv1.PolicyReasonResourcesNotAllowed) && strings.Contains(condition.Message, resource)
+}
+
+// getControllerConfig returns the controller configuration file (config.yaml)
+// stored in the controller configuration ConfigMap.
+func getControllerConfig(ctx context.Context, cfg *envconf.Config) (string, error) {
+	configMap := &corev1.ConfigMap{}
+	err := cfg.Client().Resources(namespace).Get(ctx, constants.DefaultControllerConfigMapName, namespace, configMap)
+	if err != nil {
+		return "", err
+	}
+	return configMap.Data[constants.ControllerConfigKey], nil
+}
+
+// setControllerConfig replaces the controller configuration file (config.yaml)
+// stored in the controller configuration ConfigMap.
+func setControllerConfig(ctx context.Context, cfg *envconf.Config, data string) error {
+	configMap := &corev1.ConfigMap{}
+	err := cfg.Client().Resources(namespace).Get(ctx, constants.DefaultControllerConfigMapName, namespace, configMap)
+	if err != nil {
+		return err
+	}
+	if configMap.Data == nil {
+		configMap.Data = map[string]string{}
+	}
+	configMap.Data[constants.ControllerConfigKey] = data
+	return cfg.Client().Resources(namespace).Update(ctx, configMap)
+}
+
+// waitForAdmissionPolicyRejected waits until the given AdmissionPolicy
+// transitions to the rejected status, with a PolicyActive condition that
+// names the given resource.
+func waitForAdmissionPolicyRejected(cfg *envconf.Config, policyName, policyNamespace, resource string) error {
+	return wait.For(conditions.New(cfg.Client().Resources()).ResourceMatch(
+		&policiesv1.AdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: policyName, Namespace: policyNamespace}},
+		func(object k8s.Object) bool {
+			p := object.(*policiesv1.AdmissionPolicy)
+			return isPolicyRejectedFor(&p.Status, resource)
+		},
+	), wait.WithTimeout(testTimeout), wait.WithInterval(testPollInterval))
+}
+
+// waitForPolicyServerConfigMapPolicy waits until the PolicyServer ConfigMap
+// lists the policy (wantPresent true), or until it no longer lists the
+// policy (wantPresent false). The check looks at the policies.yml entry.
+// ResourceMatch retries the check on a Get error, the same as every other
+// waiter in this file.
+func waitForPolicyServerConfigMapPolicy(cfg *envconf.Config, policyServerName, policyUniqueName string, wantPresent bool) error {
+	return wait.For(conditions.New(cfg.Client().Resources()).ResourceMatch(
+		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "policy-server-" + policyServerName, Namespace: namespace}},
+		func(object k8s.Object) bool {
+			configMap := object.(*corev1.ConfigMap)
+			policies := map[string]json.RawMessage{}
+			if err := json.Unmarshal([]byte(configMap.Data[constants.PolicyServerConfigPoliciesEntry]), &policies); err != nil {
+				return false
+			}
+			_, found := policies[policyUniqueName]
+			return found == wantPresent
+		},
+	), wait.WithTimeout(testTimeout), wait.WithInterval(testPollInterval))
 }

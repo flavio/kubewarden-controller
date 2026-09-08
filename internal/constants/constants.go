@@ -65,6 +65,20 @@ const (
 	// DefaultDefaultsConfigMapName is the default name of the ConfigMap containing default resources.
 	DefaultDefaultsConfigMapName = "kubewarden-defaults"
 
+	// DefaultControllerConfigMapName is the default name of the ConfigMap
+	// that holds the controller configuration.
+	DefaultControllerConfigMapName = "kubewarden-controller-config"
+	// ControllerConfigKey is the key of the controller configuration
+	// ConfigMap that holds the configuration file. The file is a YAML
+	// object. For example, the key namespacedPoliciesAllowedResources of
+	// this object holds the list of resources that namespaced policies can
+	// target.
+	ControllerConfigKey = "config.yaml"
+	// ControllerConfigNamespacedPoliciesAllowedResourcesKey is the key of
+	// the controller configuration file that holds the list of resources
+	// that namespaced policies can target.
+	ControllerConfigNamespacedPoliciesAllowedResourcesKey = "namespacedPoliciesAllowedResources"
+
 	PolicyServerIndexKey = ".spec.policyServer"
 
 	KubewardenPoliciesGroup = "policies.kubewarden.io"
