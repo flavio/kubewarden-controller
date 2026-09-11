@@ -26,6 +26,8 @@ use crate::{
     verify,
 };
 
+const BYTES_PER_MIB: usize = 1024 * 1024;
+
 #[derive(Default)]
 pub(crate) struct PullAndRunSettings {
     pub sources: Option<Sources>,
@@ -36,6 +38,9 @@ pub(crate) struct PullAndRunSettings {
     pub verified_manifest_digests: Option<HashMap<String, String>>,
     pub sigstore_trust_root: Option<Arc<SigstoreTrustRoot>>,
     pub enable_wasmtime_cache: bool,
+    /// Maximum amount of linear memory, in bytes, a policy is allowed to use.
+    /// `None` means the memory limit is disabled.
+    pub policy_memory_limit_bytes: Option<usize>,
     pub host_capabilities_mode: HostCapabilitiesMode,
 }
 
@@ -143,6 +148,8 @@ pub(crate) async fn parse_pull_and_run_settings(
         .unwrap_or(&false)
         .to_owned();
 
+    let policy_memory_limit_bytes = parse_policy_memory_limit_bytes(matches)?;
+
     let mut host_capabilities_mode = HostCapabilitiesMode::Direct;
     if matches.contains_id("record-host-capabilities-interactions") {
         let destination = matches
@@ -171,8 +178,36 @@ pub(crate) async fn parse_pull_and_run_settings(
         verified_manifest_digests,
         sigstore_trust_root,
         enable_wasmtime_cache,
+        policy_memory_limit_bytes,
         host_capabilities_mode,
     })
+}
+
+/// Parses the `--policy-memory-limit`/`--disable-memory-limit` flags into the
+/// maximum amount of linear memory, in bytes, a policy is allowed to use.
+/// Returns `None` when the memory limit is disabled.
+fn parse_policy_memory_limit_bytes(matches: &ArgMatches) -> Result<Option<usize>> {
+    if *matches
+        .get_one::<bool>("disable-memory-limit")
+        .unwrap_or(&false)
+    {
+        return Ok(None);
+    }
+
+    let policy_memory_limit_mib = matches
+        .get_one::<String>("policy-memory-limit")
+        .expect("policy-memory-limit should always be set")
+        .parse::<usize>()
+        .map_err(|e| anyhow!("Cannot parse 'policy-memory-limit' as a number: {}", e))?;
+
+    if policy_memory_limit_mib == 0 {
+        return Err(anyhow!(
+            "policy-memory-limit must be greater than 0, or the limit must be disabled via \
+             --disable-memory-limit"
+        ));
+    }
+
+    Ok(Some(policy_memory_limit_mib * BYTES_PER_MIB))
 }
 
 async fn build_verified_manifest_digests(
@@ -203,4 +238,40 @@ async fn build_verified_manifest_digests(
     }
 
     Ok(verified_manifest_digests)
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    fn run_matches(extra_args: &[&str]) -> ArgMatches {
+        let mut args = vec!["kwctl", "run", "--request-path", "/dev/null"];
+        args.extend_from_slice(extra_args);
+        args.push("file:///tmp/policy.wasm");
+
+        let matches = crate::cli::build_cli()
+            .try_get_matches_from(args)
+            .expect("cannot parse CLI arguments");
+        matches
+            .subcommand_matches("run")
+            .expect("run subcommand should be present")
+            .to_owned()
+    }
+
+    #[rstest]
+    #[case::default(&[], Some(256 * 1024 * 1024))]
+    #[case::custom_value(&["--policy-memory-limit", "64"], Some(64 * 1024 * 1024))]
+    #[case::disabled(&["--disable-memory-limit"], None)]
+    fn policy_memory_limit_bytes(#[case] extra_args: &[&str], #[case] expected: Option<usize>) {
+        let matches = run_matches(extra_args);
+        assert_eq!(parse_policy_memory_limit_bytes(&matches).unwrap(), expected);
+    }
+
+    #[test]
+    fn policy_memory_limit_rejects_zero() {
+        let matches = run_matches(&["--policy-memory-limit", "0"]);
+        assert!(parse_policy_memory_limit_bytes(&matches).is_err());
+    }
 }

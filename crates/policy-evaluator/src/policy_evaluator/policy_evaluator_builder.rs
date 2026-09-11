@@ -26,6 +26,56 @@ pub(crate) struct EpochDeadlines {
     pub wapc_func: u64,
 }
 
+/// Configure limits on the resources a single policy evaluation is allowed
+/// to consume, leveraging wasmtime's
+/// [`ResourceLimiter`](https://docs.rs/wasmtime/latest/wasmtime/trait.ResourceLimiter.html)
+/// facility (via `wasmtime::StoreLimits`).
+///
+/// This can be used to prevent a malicious, or misbehaving, policy from
+/// exhausting the host's memory, for example by growing its linear memory
+/// in an unbounded loop.
+///
+/// When a limit is exceeded, the corresponding `memory.grow`/`table.grow`
+/// wasm instruction fails and returns `-1` to the guest, following the
+/// WebAssembly specification. Most language toolchains treat a failed
+/// growth as a fatal allocation failure and abort the guest, which is
+/// reported back to the host as an evaluation error. The memory/table cap
+/// itself is always enforced by the host regardless of how the guest
+/// reacts to the failed growth.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ResourceLimits {
+    /// Maximum size, in bytes, that each of the module's linear memories is
+    /// allowed to grow to. This limit is applied to each linear memory
+    /// individually.
+    ///
+    /// `None` (the default) means no limit is enforced.
+    pub max_memory_size: Option<usize>,
+
+    /// Maximum number of elements each of the module's tables is allowed to
+    /// grow to. This limit is applied to each table individually.
+    ///
+    /// `None` (the default) means no limit is enforced.
+    pub max_table_elements: Option<usize>,
+}
+
+impl From<ResourceLimits> for burrego::ResourceLimits {
+    fn from(limits: ResourceLimits) -> Self {
+        Self {
+            max_memory_size: limits.max_memory_size,
+            max_table_elements: limits.max_table_elements,
+        }
+    }
+}
+
+impl From<ResourceLimits> for wasmtime_provider::ResourceLimits {
+    fn from(limits: ResourceLimits) -> Self {
+        Self {
+            max_memory_size: limits.max_memory_size,
+            max_table_elements: limits.max_table_elements,
+        }
+    }
+}
+
 /// Helper Struct that creates a `PolicyEvaluator` object
 #[derive(Default)]
 pub struct PolicyEvaluatorBuilder {
@@ -36,6 +86,7 @@ pub struct PolicyEvaluatorBuilder {
     execution_mode: Option<PolicyExecutionMode>,
     wasmtime_cache: bool,
     epoch_deadlines: Option<EpochDeadlines>,
+    resource_limits: Option<ResourceLimits>,
 }
 
 impl PolicyEvaluatorBuilder {
@@ -133,6 +184,20 @@ impl PolicyEvaluatorBuilder {
         self
     }
 
+    /// Enable enforcement of resource limits (like the maximum size of the
+    /// linear memory and tables) on the policies evaluated by this
+    /// `PolicyEvaluator`.
+    ///
+    /// Each field of `ResourceLimits` set to `None` is left unenforced (no
+    /// limit). This means calling this method with `ResourceLimits::default()`
+    /// is equivalent to not calling it at all: it's safe to always chain it
+    /// onto the builder, even when the caller has no limit configured.
+    #[must_use]
+    pub fn enable_resource_limits(mut self, resource_limits: ResourceLimits) -> Self {
+        self.resource_limits = Some(resource_limits);
+        self
+    }
+
     /// Ensure the configuration provided to the build is correct
     fn validate_user_input(&self) -> Result<(), InvalidUserInputError> {
         if self.policy_file.is_some() && self.policy_contents.is_some() {
@@ -171,12 +236,12 @@ impl PolicyEvaluatorBuilder {
 
         let stack_pre = match execution_mode {
             PolicyExecutionMode::KubewardenWapc => {
-                let wapc_stack_pre = wapc::StackPre::new(engine, module)
+                let wapc_stack_pre = wapc::StackPre::new(engine, module, self.resource_limits)
                     .map_err(PolicyEvaluatorBuilderError::NewWapcStackPre)?;
                 StackPre::from(wapc_stack_pre)
             }
             PolicyExecutionMode::Wasi => {
-                let wasi_stack_pre = wasi_cli::StackPre::new(engine, module)
+                let wasi_stack_pre = wasi_cli::StackPre::new(engine, module, self.resource_limits)
                     .map_err(PolicyEvaluatorBuilderError::NewWasiStackPre)?;
                 StackPre::from(wasi_stack_pre)
             }
@@ -186,6 +251,7 @@ impl PolicyEvaluatorBuilder {
                     module,
                     0, // currently the entrypoint is hard coded to this value
                     execution_mode.try_into()?,
+                    self.resource_limits,
                 );
                 StackPre::from(rego_stack_pre)
             }

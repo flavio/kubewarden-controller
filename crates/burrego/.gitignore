@@ -1,3 +1,4 @@
 target
 *.wasm
 *.tar.gz
+!tests/data/*.wasm

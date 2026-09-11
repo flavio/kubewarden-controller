@@ -1,10 +1,13 @@
 use wasmtime::{AsContext, Engine, InstancePre, Linker, Memory, Module, StoreContext};
 
-use crate::runtimes::{
-    callback::host_callback,
-    wasi_cli::{
-        errors::{Result, WasiRuntimeError},
-        stack::Context,
+use crate::{
+    policy_evaluator::policy_evaluator_builder::ResourceLimits,
+    runtimes::{
+        callback::host_callback,
+        wasi_cli::{
+            errors::{Result, WasiRuntimeError},
+            stack::Context,
+        },
     },
 };
 
@@ -13,10 +16,15 @@ use crate::runtimes::{
 pub(crate) struct StackPre {
     engine: Engine,
     instance_pre: InstancePre<Context>,
+    resource_limits: Option<ResourceLimits>,
 }
 
 impl StackPre {
-    pub(crate) fn new(engine: Engine, module: Module) -> Result<Self> {
+    pub(crate) fn new(
+        engine: Engine,
+        module: Module,
+        resource_limits: Option<ResourceLimits>,
+    ) -> Result<Self> {
         let mut linker = Linker::<Context>::new(&engine);
         wasmtime_wasi::p1::add_to_linker_sync(&mut linker, |c: &mut Context| &mut c.wasi_ctx)
             .map_err(WasiRuntimeError::WasmLinkerError)?;
@@ -28,6 +36,7 @@ impl StackPre {
         Ok(Self {
             engine,
             instance_pre,
+            resource_limits,
         })
     }
 
@@ -41,6 +50,7 @@ impl StackPre {
         if let Some(deadline) = epoch_deadline {
             store.set_epoch_deadline(deadline);
         }
+        store.limiter(|ctx| &mut ctx.limits);
 
         store
     }
@@ -55,6 +65,22 @@ impl StackPre {
         self.instance_pre
             .instantiate(store)
             .map_err(WasiRuntimeError::WasmInstantiate)
+    }
+
+    /// Build the `wasmtime::StoreLimits` to be enforced on the `wasmtime::Store`
+    /// created by `build_store`, based on the `ResourceLimits` configured for
+    /// this `StackPre`.
+    pub(crate) fn store_limits(&self) -> wasmtime::StoreLimits {
+        let mut builder = wasmtime::StoreLimitsBuilder::new();
+        if let Some(limits) = self.resource_limits {
+            if let Some(max_memory_size) = limits.max_memory_size {
+                builder = builder.memory_size(max_memory_size);
+            }
+            if let Some(max_table_elements) = limits.max_table_elements {
+                builder = builder.table_elements(max_table_elements);
+            }
+        }
+        builder.build()
     }
 }
 
@@ -125,4 +151,113 @@ fn get_vec_from_memory<'a, T: 'static>(
 ) -> Vec<u8> {
     let data = mem.data(store);
     data[ptr as usize..(ptr + len) as usize].to_vec()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use rstest::rstest;
+    use wasmtime_wasi::WasiCtxBuilder;
+
+    use super::*;
+    use crate::{evaluation_context::EvaluationContext, runtimes::wasi_cli::wasi_pipe::WasiPipe};
+
+    // Per the WebAssembly specification, linear memory is grown in units of
+    // pages, and a page is fixed at 64KiB.
+    const WASM_PAGE_SIZE: usize = 65536;
+
+    /// A minimal WASI module that, on `_start`, keeps growing its linear
+    /// memory by one page at a time until `memory.grow` fails.
+    ///
+    /// The module itself declares a maximum of 16 pages, so that even when
+    /// no host-side resource limit is configured, the test terminates
+    /// quickly.
+    const GROW_MEMORY_WAT: &str = r#"
+    (module
+      (memory (export "memory") 1 16)
+      (func (export "_start")
+        (block $done
+          (loop $loop
+            (br_if $done (i32.lt_s (memory.grow (i32.const 1)) (i32.const 0)))
+            (br $loop)
+          )
+        )
+      )
+    )
+    "#;
+
+    fn build_stack_pre(resource_limits: Option<ResourceLimits>) -> Result<StackPre> {
+        let engine = Engine::default();
+        let module = Module::new(&engine, GROW_MEMORY_WAT).expect("cannot compile WAT to wasm");
+        StackPre::new(engine, module, resource_limits)
+    }
+
+    fn build_context(stack_pre: &StackPre) -> Context {
+        Context {
+            wasi_ctx: WasiCtxBuilder::new().build_p1(),
+            stdin_pipe: WasiPipe::new(&[]),
+            eval_ctx: Arc::new(EvaluationContext::default()),
+            limits: stack_pre.store_limits(),
+        }
+    }
+
+    /// Instantiates the module, calls `_start`, and returns the final
+    /// number of pages the module's memory grew to.
+    fn run_and_get_memory_pages(stack_pre: &StackPre) -> u64 {
+        let ctx = build_context(stack_pre);
+        let mut store = stack_pre.build_store(ctx, None);
+        let instance = stack_pre
+            .rehydrate(&mut store)
+            .expect("instantiation should succeed");
+        let start_fn = instance
+            .get_typed_func::<(), ()>(&mut store, "_start")
+            .expect("cannot find _start function");
+        start_fn
+            .call(&mut store, ())
+            .expect("_start call should succeed");
+
+        instance
+            .get_memory(&mut store, "memory")
+            .expect("cannot find memory export")
+            .size(&store)
+    }
+
+    #[rstest]
+    // Without any resource limit configured, the guest can grow memory up
+    // to the module's own declared maximum (16 pages).
+    #[case::unbounded(None, 16)]
+    // The host-enforced limit (4 pages) is lower than the module's own
+    // maximum (16 pages), so it must be the one that stops the growth.
+    #[case::capped_by_resource_limits(
+        Some(ResourceLimits {
+            max_memory_size: Some(4 * WASM_PAGE_SIZE),
+            ..Default::default()
+        }),
+        4
+    )]
+    fn memory_growth(#[case] resource_limits: Option<ResourceLimits>, #[case] expected_pages: u64) {
+        let stack_pre = build_stack_pre(resource_limits).expect("cannot build StackPre");
+        assert_eq!(run_and_get_memory_pages(&stack_pre), expected_pages);
+    }
+
+    #[test]
+    fn initial_memory_above_limit_fails_at_instantiation() {
+        // The module requests 1 page (64KiB) of initial memory, which is
+        // already above the configured limit.
+        let resource_limits = ResourceLimits {
+            max_memory_size: Some(WASM_PAGE_SIZE / 2),
+            ..Default::default()
+        };
+        let stack_pre = build_stack_pre(Some(resource_limits)).expect("cannot build StackPre");
+
+        let ctx = build_context(&stack_pre);
+        let mut store = stack_pre.build_store(ctx, None);
+        let result = stack_pre.rehydrate(&mut store);
+
+        assert!(
+            result.is_err(),
+            "instantiation should fail because initial memory exceeds the limit"
+        );
+    }
 }

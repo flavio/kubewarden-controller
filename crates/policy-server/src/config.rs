@@ -24,6 +24,7 @@ use serde::Deserialize;
 
 pub static SERVICE_NAME: &str = "kubewarden-policy-server";
 const DOCKER_CONFIG_ENV_VAR: &str = "DOCKER_CONFIG";
+const BYTES_PER_MIB: usize = 1024 * 1024;
 
 lazy_static! {
     pub(crate) static ref HOSTNAME: String =
@@ -40,6 +41,9 @@ pub struct Config {
     pub always_accept_admission_reviews_on_namespace: Option<String>,
     // This is the global timeout for each policy evaluation.
     pub policy_evaluation_limit_seconds: Option<u64>,
+    // This is the global limit, expressed in bytes, applied to the linear memory of
+    // each policy.
+    pub policy_memory_limit_bytes: Option<usize>,
     pub tls_config: Option<TlsConfig>,
     pub pool_size: usize,
     pub metrics_enabled: bool,
@@ -86,6 +90,24 @@ impl Config {
                     .expect("policy-timeout should always be set")
                     .parse::<u64>()?,
             )
+        };
+        let policy_memory_limit_bytes = if *matches
+            .get_one::<bool>("disable-memory-limit")
+            .expect("clap should have set a default value")
+        {
+            None
+        } else {
+            let policy_memory_limit_mib = matches
+                .get_one::<String>("policy-memory-limit")
+                .expect("policy-memory-limit should always be set")
+                .parse::<usize>()?;
+            if policy_memory_limit_mib == 0 {
+                return Err(anyhow!(
+                    "policy-memory-limit must be greater than 0, or the limit must be disabled \
+                     via --disable-memory-limit"
+                ));
+            }
+            Some(policy_memory_limit_mib * BYTES_PER_MIB)
         };
         let sources = remote_server_options(matches)?;
         let pool_size = matches
@@ -160,6 +182,7 @@ impl Config {
             tls_config,
             always_accept_admission_reviews_on_namespace,
             policy_evaluation_limit_seconds,
+            policy_memory_limit_bytes,
             pool_size,
             metrics_enabled,
             sigstore_cache_dir,
@@ -668,6 +691,39 @@ example:
             assert_eq!(provide_flag, config.daemon);
             assert_eq!(provide_flag, config.metrics_enabled);
         }
+    }
+
+    fn config_with_policies_and_args(extra_args: &[&str]) -> Result<Config> {
+        let policies_yaml = r#"
+---
+example:
+  module: file:///tmp/namespace-validate-policy.wasm
+  settings: {}
+"#;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(policies_yaml.as_bytes()).unwrap();
+        let file_path = temp_file.into_temp_path();
+        let policies_flag = format!("--policies={}", file_path.to_str().unwrap());
+
+        let mut args = vec!["policy-server", &policies_flag];
+        args.extend_from_slice(extra_args);
+
+        let matches = cli::build_cli().try_get_matches_from(args)?;
+        Config::from_args(&matches)
+    }
+
+    #[rstest]
+    #[case::default(&[], Some(256 * 1024 * 1024))]
+    #[case::custom_value(&["--policy-memory-limit=64"], Some(64 * 1024 * 1024))]
+    #[case::disabled(&["--disable-memory-limit"], None)]
+    fn policy_memory_limit_bytes(#[case] extra_args: &[&str], #[case] expected: Option<usize>) {
+        let config = config_with_policies_and_args(extra_args).unwrap();
+        assert_eq!(config.policy_memory_limit_bytes, expected);
+    }
+
+    #[test]
+    fn policy_memory_limit_rejects_zero() {
+        assert!(config_with_policies_and_args(&["--policy-memory-limit=0"]).is_err());
     }
 
     #[rstest]

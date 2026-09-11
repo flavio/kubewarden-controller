@@ -9,7 +9,7 @@ use policy_evaluator::{
     kube,
     kubewarden_policy_sdk::settings::SettingsValidationResponse,
     policy_evaluator::{PolicyEvaluator, PolicySettings, ValidateRequest},
-    policy_evaluator_builder::PolicyEvaluatorBuilder,
+    policy_evaluator_builder::{PolicyEvaluatorBuilder, ResourceLimits},
     policy_group_evaluator::evaluator::PolicyGroupEvaluator,
     policy_metadata::{ContextAwareResource, Metadata, PolicyType},
 };
@@ -117,7 +117,11 @@ impl Evaluator {
 
                 let mut policy_evaluator_builder = PolicyEvaluatorBuilder::new()
                     .policy_file(local_data.local_path(uri)?)?
-                    .execution_mode(execution_mode);
+                    .execution_mode(execution_mode)
+                    .enable_resource_limits(ResourceLimits {
+                        max_memory_size: cfg.policy_memory_limit_bytes,
+                        max_table_elements: None,
+                    });
                 if cfg.enable_wasmtime_cache {
                     policy_evaluator_builder = policy_evaluator_builder.enable_wasmtime_cache();
                 }
@@ -181,8 +185,11 @@ impl Evaluator {
 
                     let mut policy_evaluator_builder = PolicyEvaluatorBuilder::new()
                         .policy_file(local_data.local_path(&member.uri)?)?
-                        .execution_mode(execution_mode);
-
+                        .execution_mode(execution_mode)
+                        .enable_resource_limits(ResourceLimits {
+                            max_memory_size: cfg.policy_memory_limit_bytes,
+                            max_table_elements: None,
+                        });
                     if cfg.enable_wasmtime_cache {
                         policy_evaluator_builder = policy_evaluator_builder.enable_wasmtime_cache();
                     }
