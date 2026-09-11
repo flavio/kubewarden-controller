@@ -65,19 +65,20 @@ fn kubernetes_resource_denied(
 }
 
 /// Checks that `eval_ctx` grants access to the host capability identified by
-/// `{namespace}/{operation}`, and -- for the Kubernetes read operations that
-/// carry a resource type -- that it also grants access to that specific
-/// `apiVersion`/`kind`.
+/// `{namespace}/{operation}`.
 ///
-/// This is the single authorization gate shared by every caller of the
-/// callback channel.
-fn check_authorization(
+/// "tracing" is not gated by host capabilities.
+///
+/// This check does not depend on the (potentially guest-controlled) request
+/// payload, so callers that deserialize an untrusted payload into a
+/// [`CallbackRequestType`] -- namely [`host_callback`] -- should run it
+/// *before* deserializing, to avoid doing that work for a policy that's
+/// denied the capability anyway.
+fn check_host_capability(
     eval_ctx: &EvaluationContext,
     namespace: &str,
     operation: &str,
-    req: &CallbackRequestType,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // "tracing" is not gated by host capabilities.
     if namespace != "tracing" {
         let capability_path = format!("{namespace}/{operation}");
         if !eval_ctx.can_access_host_capability(&capability_path) {
@@ -85,6 +86,18 @@ fn check_authorization(
         }
     }
 
+    Ok(())
+}
+
+/// Checks that, for the Kubernetes read operations that carry a resource
+/// type, `eval_ctx` grants access to that specific `apiVersion`/`kind`.
+///
+/// Requests that don't carry a Kubernetes resource type are always allowed
+/// by this check.
+fn check_kubernetes_resource(
+    eval_ctx: &EvaluationContext,
+    req: &CallbackRequestType,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let resource = match req {
         CallbackRequestType::KubernetesListResourceNamespace {
             api_version, kind, ..
@@ -103,6 +116,25 @@ fn check_authorization(
     {
         kubernetes_resource_denied(&eval_ctx.policy_id, api_version, kind, eval_ctx)?;
     }
+
+    Ok(())
+}
+
+/// Checks that `eval_ctx` grants access to the host capability identified by
+/// `{namespace}/{operation}`, and -- for the Kubernetes read operations that
+/// carry a resource type -- that it also grants access to that specific
+/// `apiVersion`/`kind`.
+///
+/// This is the single authorization gate shared by every caller of the
+/// callback channel.
+fn check_authorization(
+    eval_ctx: &EvaluationContext,
+    namespace: &str,
+    operation: &str,
+    req: &CallbackRequestType,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    check_host_capability(eval_ctx, namespace, operation)?;
+    check_kubernetes_resource(eval_ctx, req)?;
 
     Ok(())
 }
@@ -161,6 +193,15 @@ pub(crate) fn host_callback(
             _ => unknown_operation(namespace, operation),
         };
     }
+
+    // Check the host-capability gate *before* deserializing the (guest
+    // controlled) payload below: a policy denied the capability must be
+    // rejected without paying the cost of allocating and parsing
+    // potentially large payloads (e.g. verification keys, certificates, or
+    // Kubernetes request fields). The Kubernetes-resource check still runs
+    // afterwards, once the payload has been parsed into a typed request, via
+    // `host_callback_typed` -> `check_authorization`.
+    check_host_capability(eval_ctx, namespace, operation)?;
 
     let req: CallbackRequestType = match (namespace, operation) {
         ("oci", "v1/verify") => {
@@ -294,8 +335,8 @@ mod tests {
 
     /// A minimal, valid payload for each `(namespace, operation)` pair handled
     /// by [`host_callback`], used by both the denial and allowed tests below
-    /// so the capability gate -- checked after payload deserialization -- is
-    /// what's actually being exercised, rather than a payload-parsing failure.
+    /// so it's the capability/resource gates being exercised, rather than a
+    /// payload-parsing failure.
     fn valid_payload_for(namespace: &str, operation: &str) -> &'static [u8] {
         match (namespace, operation) {
             // oci: v1/verify uses externally-tagged SigstoreVerificationInputV1
@@ -351,16 +392,94 @@ mod tests {
         let ctx = test_ctx(HostCapabilities::DenyAll, BTreeSet::new());
         let payload = valid_payload_for(namespace, operation);
 
-        // The capability gate (inside `check_authorization`) fires right after
-        // payload deserialization, before any Kubernetes-resource check or
-        // channel send, so a denied policy is rejected even with a fully valid
-        // payload.
+        // The capability gate fires in `host_callback`, before the payload
+        // is deserialized into a `CallbackRequestType`, so a denied policy is
+        // rejected even with a fully valid payload.
         let result = host_callback("kubewarden", namespace, operation, payload, &ctx);
 
         let err = result.expect_err("expected Err for denied capability");
         assert!(
             err.to_string().contains("has not been granted access"),
             "namespace={namespace}, operation={operation}: unexpected error: {err}"
+        );
+    }
+
+    #[rstest]
+    #[case("oci", "v1/verify")]
+    #[case("oci", "v2/verify")]
+    #[case("oci", "v1/manifest_digest")]
+    #[case("oci", "v1/oci_manifest")]
+    #[case("oci", "v1/oci_manifest_config")]
+    #[case("net", "v1/dns_lookup_host")]
+    #[case("crypto", "v1/is_certificate_trusted")]
+    #[case("kubernetes", "list_resources_by_namespace")]
+    #[case("kubernetes", "list_resources_all")]
+    #[case("kubernetes", "get_resource")]
+    #[case("kubernetes", "can_i")]
+    // Also cover an operation that isn't even recognized: a denied policy
+    // must be rejected on the capability gate rather than reaching the
+    // `unknown operation` branch of the payload-decoding match.
+    #[case("oci", "v1/does_not_exist")]
+    fn host_capability_denied_rejects_before_deserializing_payload(
+        #[case] namespace: &str,
+        #[case] operation: &str,
+    ) {
+        let ctx = test_ctx(HostCapabilities::DenyAll, BTreeSet::new());
+        // Not valid JSON for any of the request types handled below: if the
+        // capability gate did not fire before payload deserialization, this
+        // would fail with a `serde_json` parse error instead of a denial.
+        let payload = b"this is not valid json";
+
+        let result = host_callback("kubewarden", namespace, operation, payload, &ctx);
+
+        let err = result.expect_err("expected Err for denied capability");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("has not been granted access"),
+            "namespace={namespace}, operation={operation}: expected a capability denial \
+             (payload should never have been parsed), got: {msg}"
+        );
+    }
+
+    #[rstest]
+    #[case("oci", "v1/verify")]
+    #[case("oci", "v2/verify")]
+    #[case("oci", "v1/manifest_digest")]
+    #[case("oci", "v1/oci_manifest")]
+    #[case("oci", "v1/oci_manifest_config")]
+    #[case("net", "v1/dns_lookup_host")]
+    #[case("crypto", "v1/is_certificate_trusted")]
+    #[case("kubernetes", "list_resources_by_namespace")]
+    #[case("kubernetes", "list_resources_all")]
+    #[case("kubernetes", "get_resource")]
+    #[case("kubernetes", "can_i")]
+    fn host_capability_allowed_then_invalid_payload_is_parse_error(
+        #[case] namespace: &str,
+        #[case] operation: &str,
+    ) {
+        // The capability gate passes, so an invalid payload must now be
+        // rejected by `serde_json` deserialization -- confirming the
+        // capability check runs first without swallowing the (still
+        // mandatory) payload validation that happens afterwards.
+        let ctx = test_ctx(HostCapabilities::AllowAll, BTreeSet::new());
+        let payload = b"this is not valid json";
+
+        let result = host_callback("kubewarden", namespace, operation, payload, &ctx);
+
+        let err = result.expect_err("expected Err for invalid payload");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("has not been granted access"),
+            "namespace={namespace}, operation={operation}: expected a payload parse error, \
+             got a capability denial: {msg}"
+        );
+        // serde_json errors carry a `line`/`column` location marker (e.g.
+        // "expected value at line 1 column 1"); assert on that rather than
+        // the exact message, since it varies by target type.
+        assert!(
+            msg.contains("line 1 column"),
+            "namespace={namespace}, operation={operation}: expected a serde_json parse error, \
+             got: {msg}"
         );
     }
 
