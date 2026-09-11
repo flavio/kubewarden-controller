@@ -76,6 +76,35 @@ These resources are owned and reconciled by the controller. Manual
 changes are reverted on the next reconciliation. Setting `enabled`
 to `false` removes all managed resources.
 
+### Resources that namespaced policies can target
+
+Namespaced policies (`AdmissionPolicy` and `AdmissionPolicyGroup`) can
+target only the resources listed in `namespacedPoliciesAllowedResources`.
+`ClusterAdmissionPolicy` and `ClusterAdmissionPolicyGroup` are not affected.
+A policy that targets both permitted and not permitted resources is
+rejected as a whole.
+
+```yaml
+namespacedPoliciesAllowedResources:
+  - apiGroups: [""]
+    resources: [pods, configmaps, secrets]
+  - apiGroups: ["apps"]
+    resources: [deployments, statefulsets]
+```
+
+Each entry has the same shape as the `apiGroups` and `resources` fields of a
+policy rule. Wildcards (`*`) and subresources (`pods/exec`) are not permitted
+in this list. The controller skips these items and logs them. A policy rule
+that targets a subresource of a permitted resource is permitted.
+
+The controller accepts a namespaced policy that targets other resources, but
+it does not deploy the policy. The policy status is `rejected`. The
+`PolicyActive` condition lists the resources that are not permitted. When you
+add these resources to the list, the controller deploys the policy.
+
+The chart comes with a default list of Kubernetes resources that are considered
+safe to be validated or mutated by namespaced policies.
+
 ### CRDs
 
 CRDs are installed with the `helm.sh/resource-policy: keep` annotation:
