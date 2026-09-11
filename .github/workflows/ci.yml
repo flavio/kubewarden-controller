@@ -22,6 +22,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # Disable incremental compilation, CI doesn't do them
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   # Detect which files changed to run appropriate checks
   changes:
@@ -324,6 +328,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Free disk space
+        # Remove preinstalled toolchains that we don't use
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/.ghcup
+          df -h /
       - name: Run integration tests
         run: make -C crates/policy-server integration-tests
 
