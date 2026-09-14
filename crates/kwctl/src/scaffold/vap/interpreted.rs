@@ -1,12 +1,10 @@
-use std::collections::BTreeSet;
-
 use anyhow::Result;
 use policy_evaluator::policy_fetcher::oci_client::Reference;
 use tracing::warn;
 
 use crate::scaffold::{
     kubewarden_crds::{ClusterAdmissionPolicy, ClusterAdmissionPolicySpec},
-    vap::{VapData, vap_uses_kw_k8s, warn_kw_k8s_requires_grants},
+    vap::{VapData, base_context_aware_resources, vap_uses_kw_k8s, warn_kw_k8s_requires_grants},
 };
 
 /// Interpreter path: validates the OCI reference and builds a
@@ -43,8 +41,26 @@ pub(crate) fn vap_interpreted(
         );
     }
 
-    let mut settings = vap_data.settings;
+    // No compiled module is available on this path, so
+    // `vap_data.uses_namespace_object` (a best-effort text search, see
+    // `vap_uses_namespace_object`) is the only source for whether the
+    // interpreted policy may read `namespaceObject`.
+    let context_aware_resources =
+        base_context_aware_resources(&vap_data, vap_data.uses_namespace_object);
 
+    // Unlike `paramKind` and `namespaceObject`, there is no static way
+    // (short of parsing the CEL AST ourselves) to know *which*
+    // apiVersion/kind an explicit `kw.k8s.get`/`.list` call targets, so we
+    // can only warn that `context_aware_resources` may need to be extended
+    // by hand, not derive the grant automatically. Detection here is the
+    // same best-effort textual search used for `namespaceObject` (see
+    // `vap_uses_kw_k8s`), since there is no compiled artifact to inspect
+    // for actual host-extension usage on this path.
+    if vap_uses_kw_k8s(&vap_data.vap) {
+        warn_kw_k8s_requires_grants(&context_aware_resources);
+    }
+
+    let mut settings = vap_data.settings;
     if let Some(vap_variables) = vap_spec.variables.clone() {
         let vap_variables: Vec<serde_yaml::Value> = vap_variables
             .iter()
@@ -59,26 +75,6 @@ pub(crate) fn vap_interpreted(
             .map(|v| serde_yaml::to_value(v).expect("cannot convert VAP validation to YAML"))
             .collect();
         settings.insert("validations".into(), kw_cel_validations.into());
-    }
-
-    let mut context_aware_resources = BTreeSet::new();
-    if let Some(param_resource) = &vap_data.param_resource {
-        warn!(
-            "granting access to {}/{} via spec.contextAwareResources (required by paramKind); review before applying",
-            param_resource.api_version, param_resource.kind
-        );
-        context_aware_resources.insert(param_resource.clone());
-    }
-
-    // Unlike `paramKind`, there is no static way (short of parsing the CEL
-    // AST ourselves) to know *which* apiVersion/kind a `kw.k8s.get`/`.list`
-    // call targets, so we can only warn that `context_aware_resources` may
-    // need to be extended by hand, not derive the grants automatically.
-    // Detection here is a best-effort textual search over the raw CEL
-    // expressions (see `vap_uses_kw_k8s`), since there is no compiled
-    // artifact to inspect for actual host-extension usage on this path.
-    if vap_uses_kw_k8s(&vap_data.vap) {
-        warn_kw_k8s_requires_grants(&context_aware_resources);
     }
 
     Ok(ClusterAdmissionPolicy {
@@ -310,6 +306,35 @@ mod tests {
                 .context_aware_resources
                 .is_empty(),
             "context_aware_resources should stay empty: kw.k8s targets are not statically derived, got: {:?}",
+            cluster_admission_policy.spec.context_aware_resources
+        );
+    }
+
+    /// The interpreted cel-policy resolves `namespaceObject` through the
+    /// gated `kw.k8s.get` call, exactly like the compiled path does since
+    /// ferricel 0.11. Unlike an explicit `kw.k8s` call, `namespaceObject`
+    /// always targets `v1/Namespace`, so this scaffold path can (and must)
+    /// grant it automatically, the same way it does for `paramKind`.
+    #[test]
+    fn namespace_object_usage_populates_context_aware_resources() {
+        let yaml_file = File::open(test_data("vap/vap-with-namespace-object.yml")).unwrap();
+        let vap: ValidatingAdmissionPolicy = serde_yaml::from_reader(yaml_file).unwrap();
+        let yaml_file = File::open(test_data("vap/vap-binding.yml")).unwrap();
+        let vap_binding: ValidatingAdmissionPolicyBinding =
+            serde_yaml::from_reader(yaml_file).unwrap();
+
+        let vap_data = VapData::new(vap, vap_binding).unwrap();
+        let cluster_admission_policy = vap_interpreted(CEL_POLICY_MODULE, vap_data).unwrap();
+
+        assert!(
+            cluster_admission_policy
+                .spec
+                .context_aware_resources
+                .contains(&ContextAwareResource {
+                    api_version: "v1".to_string(),
+                    kind: "Namespace".to_string(),
+                }),
+            "context_aware_resources should contain v1/Namespace, got: {:?}",
             cluster_admission_policy.spec.context_aware_resources
         );
     }

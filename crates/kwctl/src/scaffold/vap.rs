@@ -114,8 +114,8 @@ pub(crate) fn vap(
 /// Warn that this policy calls `kw.k8s`, which reads Kubernetes resources at
 /// evaluation time. The `granted` set holds the resources currently allowed
 /// in `spec.contextAwareResources` and `metadata.yml`. This set only comes
-/// from `paramKind`, so it can miss resources the policy reads through
-/// `kw.k8s`.
+/// from `paramKind` and `namespaceObject`, so it can miss resources the
+/// policy reads through an explicit `kw.k8s` call in its own CEL.
 ///
 /// The runtime denies a `kw.k8s` call when its apiVersion and kind are not in
 /// `granted` (see `EvaluationContext::can_access_kubernetes_resource`). The
@@ -133,14 +133,52 @@ pub(crate) fn warn_kw_k8s_requires_grants(granted: &BTreeSet<ContextAwareResourc
             .collect::<Vec<_>>()
             .join(", ");
         warn!(
-            "this policy calls kw.k8s.*. Only {granted_list} is granted through spec.contextAwareResources, derived from paramKind. Add every other apiVersion/kind that the policy reads through kw.k8s to spec.contextAwareResources by hand, and to metadata.yml if that file was generated. Without this, the runtime denies the call at evaluation time."
+            "this policy calls kw.k8s.*. Only {granted_list} is granted through spec.contextAwareResources, derived from paramKind and namespaceObject. Add every other apiVersion/kind that the policy reads through kw.k8s to spec.contextAwareResources by hand, and to metadata.yml if that file was generated. Without this, the runtime denies the call at evaluation time."
         );
     }
 }
 
-/// Check whether any CEL expression in `vap` mentions `kw.k8s`. The check
-/// looks at `validations`, `variables`, and `matchConditions`, and searches
-/// only for the text `kw.k8s`.
+/// Build the base `spec.contextAwareResources` allow list for a VAP: the
+/// resource named by `paramKind` (from `vap_data.param_resource`), and
+/// `v1/Namespace` when `uses_namespace_object` is true. Without these
+/// grants, the compiled/interpreted policy would be denied access when it
+/// fetches the param resource via `paramRef`, or the Namespace via
+/// `namespaceObject`, at evaluation time (see
+/// `EvaluationContext::can_access_kubernetes_resource`).
+///
+/// Both output paths call this with the same shape of input; only how
+/// `uses_namespace_object` is computed differs (see the field docs on
+/// [`VapData::uses_namespace_object`]). A `warn!` announces every grant
+/// added, so the administrator reviews it before applying the generated
+/// policy.
+pub(crate) fn base_context_aware_resources(
+    vap_data: &VapData,
+    uses_namespace_object: bool,
+) -> BTreeSet<ContextAwareResource> {
+    let mut context_aware_resources = BTreeSet::new();
+
+    if let Some(param_resource) = &vap_data.param_resource {
+        warn!(
+            "granting access to {}/{} via spec.contextAwareResources (required by paramKind); review before applying",
+            param_resource.api_version, param_resource.kind
+        );
+        context_aware_resources.insert(param_resource.clone());
+    }
+
+    if uses_namespace_object {
+        warn!(
+            "granting access to v1/Namespace via spec.contextAwareResources (required by namespaceObject); review before applying"
+        );
+        context_aware_resources.insert(ContextAwareResource {
+            api_version: "v1".to_string(),
+            kind: "Namespace".to_string(),
+        });
+    }
+
+    context_aware_resources
+}
+
+/// Check whether any CEL expression in `vap` mentions `kw.k8s`.
 ///
 /// The interpreted path uses this check because it has no compiled Wasm
 /// module to inspect. The compiled path instead reads the exact list of
@@ -151,27 +189,44 @@ pub(crate) fn warn_kw_k8s_requires_grants(granted: &BTreeSet<ContextAwareResourc
 /// never produces a false negative. A false positive only causes an extra
 /// warning. It does not hide a real one.
 fn vap_uses_kw_k8s(vap: &ValidatingAdmissionPolicy) -> bool {
-    let Some(spec) = vap.spec.as_ref() else {
-        return false;
-    };
+    cel_expressions(vap).any(|expr| expr.contains("kw.k8s"))
+}
 
-    let validations_use_it = spec
-        .validations
-        .iter()
-        .flatten()
-        .any(|v| v.expression.contains("kw.k8s"));
-    let variables_use_it = spec
-        .variables
-        .iter()
-        .flatten()
-        .any(|v| v.expression.contains("kw.k8s"));
-    let match_conditions_use_it = spec
-        .match_conditions
-        .iter()
-        .flatten()
-        .any(|m| m.expression.contains("kw.k8s"));
+/// Check whether any CEL expression in `vap` mentions `namespaceObject`.
+///
+/// Since ferricel 0.11, a compiled VAP that reads `namespaceObject`
+/// resolves it on its own, through a `kw.k8s.get` call that the runtime
+/// gates the same way as every other Kubernetes read: the policy needs the
+/// `kubernetes/get_resource` host capability and a `v1/Namespace` grant in
+/// `spec.contextAwareResources`. `ferricel_core::vap_variables_used` gives
+/// the compiled path an exact answer (see `compiled::vap_compiled`); the
+/// interpreted path has no compiled module to inspect, so it falls back to
+/// this same text search used for `kw.k8s` (see `vap_uses_kw_k8s`), with
+/// the same false-positive-only guarantee.
+fn vap_uses_namespace_object(vap: &ValidatingAdmissionPolicy) -> bool {
+    cel_expressions(vap).any(|expr| expr.contains("namespaceObject"))
+}
 
-    validations_use_it || variables_use_it || match_conditions_use_it
+/// Every CEL expression in `vap`: the `validations`, `variables`, and
+/// `matchConditions` expressions, in that order. Empty when `vap` has no
+/// spec.
+fn cel_expressions(vap: &ValidatingAdmissionPolicy) -> impl Iterator<Item = &str> {
+    let spec = vap.spec.as_ref();
+    let validations = spec
+        .and_then(|s| s.validations.as_deref())
+        .unwrap_or_default();
+    let variables = spec
+        .and_then(|s| s.variables.as_deref())
+        .unwrap_or_default();
+    let match_conditions = spec
+        .and_then(|s| s.match_conditions.as_deref())
+        .unwrap_or_default();
+
+    validations
+        .iter()
+        .map(|v| v.expression.as_str())
+        .chain(variables.iter().map(|v| v.expression.as_str()))
+        .chain(match_conditions.iter().map(|m| m.expression.as_str()))
 }
 
 /// Data extracted from a VAP + binding pair, shared by both output paths.
@@ -192,6 +247,13 @@ pub(crate) struct VapData {
     /// at evaluation time via `paramRef`, and must be granted access to via
     /// `spec.contextAwareResources` for the fetch to succeed.
     pub(crate) param_resource: Option<ContextAwareResource>,
+    /// Whether any CEL expression in `vap` mentions `namespaceObject` (see
+    /// `vap_uses_namespace_object`). The interpreted path reads this
+    /// directly; the compiled path prefers the exact answer from
+    /// `ferricel_core::vap_variables_used` on the compiled module, and only
+    /// falls back to this text-search result when that section can't be
+    /// read.
+    pub(crate) uses_namespace_object: bool,
 }
 
 impl VapData {
@@ -349,6 +411,8 @@ impl VapData {
             .collect::<Result<Vec<Rule>, &'static str>>()
             .map_err(|e| anyhow!("error converting VAP matchConstraints into rules: {e}"))?;
 
+        let uses_namespace_object = vap_uses_namespace_object(&vap);
+
         Ok(VapData {
             vap,
             metadata: vap_binding.metadata,
@@ -358,6 +422,7 @@ impl VapData {
             object_selector,
             settings,
             param_resource,
+            uses_namespace_object,
         })
     }
 }
@@ -457,6 +522,21 @@ pub(crate) mod tests {
     fn vap_uses_kw_k8s_is_false_when_not_used(#[case] vap_yaml_path: &str) {
         let vap = open_vap(vap_yaml_path);
         assert!(!super::vap_uses_kw_k8s(&vap));
+    }
+
+    #[test]
+    fn vap_uses_namespace_object_detects_it_in_validations() {
+        let vap = open_vap("vap/vap-with-namespace-object.yml");
+        assert!(super::vap_uses_namespace_object(&vap));
+    }
+
+    #[rstest]
+    #[case::without_variables("vap/vap-without-variables.yml")]
+    #[case::with_variables("vap/vap-with-variables.yml")]
+    #[case::with_k8s("vap/vap-with-k8s.yml")]
+    fn vap_uses_namespace_object_is_false_when_not_used(#[case] vap_yaml_path: &str) {
+        let vap = open_vap(vap_yaml_path);
+        assert!(!super::vap_uses_namespace_object(&vap));
     }
 
     #[test]
