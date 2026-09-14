@@ -1,3 +1,4 @@
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use kubewarden_policy_sdk::{
     response::ValidationResponse as PolicyValidationResponse, settings::SettingsValidationResponse,
 };
@@ -360,7 +361,7 @@ fn validate_param_ref(value: &Value) -> Result<(), String> {
     let name = optional_str_field(obj, "paramRef", "name")?.filter(|s| !s.is_empty());
     let selector = match obj.get("selector") {
         None | Some(Value::Null) => None,
-        Some(Value::Object(o)) => Some(o),
+        Some(v @ Value::Object(_)) => Some(v),
         Some(_) => return Err("paramRef.selector must be an object".to_string()),
     };
 
@@ -371,7 +372,8 @@ fn validate_param_ref(value: &Value) -> Result<(), String> {
         (Some(_), Some(_)) => {
             return Err("paramRef cannot have both name and selector specified".to_string());
         }
-        _ => {}
+        (None, Some(selector)) => validate_label_selector(selector)?,
+        (Some(_), None) => {}
     }
 
     match optional_str_field(obj, "paramRef", "parameterNotFoundAction")? {
@@ -383,38 +385,109 @@ fn validate_param_ref(value: &Value) -> Result<(), String> {
     }
 }
 
-/// Validates the `paramKind`/`paramRef` settings, when present.
+/// Validates a Kubernetes `LabelSelector` found in `paramRef.selector`.
 ///
-/// If `paramKind` is present, it must fully specify `apiVersion` and `kind`
-/// (this is required regardless of grants: the wasm module has this
-/// resource baked in at compile time via `compile_vap_from_policy`, so an
-/// incomplete `paramKind` here can never be legitimate). If `paramRef` is
-/// present, it must specify exactly one of `name`/`selector`, and a valid
-/// `parameterNotFoundAction`.
+/// The compiled module turns the selector into a label selector string at
+/// evaluation time (see `format_label_selector` in the ferricel guest
+/// runtime). A malformed selector would trap there, on the first request
+/// that reaches the policy, and the request would be rejected or the policy
+/// skipped depending on `failurePolicy`. This check moves that failure to
+/// load time.
+///
+/// The type shape (`matchLabels` is a string map, `matchExpressions` items
+/// have a string `key`, `operator` and an optional string list `values`)
+/// comes from deserializing into the `k8s_openapi` `LabelSelector` type. The
+/// operator check comes from `kube::core::Selector::try_from`, which knows
+/// `In`, `NotIn`, `Exists` and `DoesNotExist`. On top of that, this function
+/// applies two rules from `ValidateLabelSelectorRequirement` in
+/// `k8s.io/apimachinery` that neither crate enforces: `key` must not be
+/// empty (`k8s_openapi` defaults a missing key to `""`), and `values` must
+/// be non-empty for `In`/`NotIn` and empty for `Exists`/`DoesNotExist`.
+fn validate_label_selector(selector: &Value) -> Result<(), String> {
+    const PATH: &str = "paramRef.selector";
+
+    let selector: LabelSelector = serde_json::from_value(selector.clone())
+        .map_err(|e| format!("{PATH} is not a valid LabelSelector: {e}"))?;
+
+    for (i, requirement) in selector
+        .match_expressions
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+    {
+        if requirement.key.is_empty() {
+            return Err(format!(
+                "{PATH}.matchExpressions[{i}].key must be a non-empty string"
+            ));
+        }
+
+        let has_values = requirement.values.as_ref().is_some_and(|v| !v.is_empty());
+        let operator = requirement.operator.as_str();
+        match operator {
+            "In" | "NotIn" if !has_values => {
+                return Err(format!(
+                    "{PATH}.matchExpressions[{i}].values must be non-empty when operator is {operator}"
+                ));
+            }
+            "Exists" | "DoesNotExist" if has_values => {
+                return Err(format!(
+                    "{PATH}.matchExpressions[{i}].values must be empty when operator is {operator}"
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    kube::core::Selector::try_from(selector)
+        .map(|_| ())
+        .map_err(|e| format!("{PATH} is not a valid LabelSelector: {e}"))
+}
+
+/// Validates the `paramKind`/`paramRef` settings.
+///
+/// The two fields must be present together, or both absent. The compiled
+/// module reads `paramRef` from the bindings on every request when the VAP
+/// was compiled with `paramKind`; without it, every evaluation fails. A
+/// `paramRef` without `paramKind` is inert, but it is a sign of a broken
+/// scaffold, so it is rejected too. `kwctl scaffold vap` applies the same
+/// rule.
+///
+/// `paramKind` must fully specify `apiVersion` and `kind` (this is required
+/// regardless of grants: the wasm module has this resource baked in at
+/// compile time via `compile_vap_from_policy`, so an incomplete `paramKind`
+/// here can never be legitimate). `paramRef` must specify exactly one of
+/// `name`/`selector`, a well-formed selector when `selector` is used, and a
+/// valid `parameterNotFoundAction`.
 ///
 /// Separately, if `paramKind` is complete but its resource is not listed in
 /// `eval_ctx`'s `ctx_aware_resources_allow_list` (populated from
 /// `spec.contextAwareResources` on the CRD), this only warns rather than
-/// failing validation: fetching the param resource via `paramRef`/
-/// `kw.k8s.get` at evaluation time will be denied by the authorization gate
-/// (see `EvaluationContext::can_access_kubernetes_resource`), causing the
-/// policy to fail on every request that reaches it, but the Kubewarden
+/// failing validation: fetching the param resource via `kw.k8s.get`/`list`
+/// at evaluation time will be denied by the authorization gate (see
+/// `EvaluationContext::can_access_kubernetes_resource`), causing the policy
+/// to fail on every request that reaches it, but the Kubewarden
 /// administrator may intentionally withhold the grant (e.g. because a
 /// policy's declared `paramKind` looks suspicious), and settings validation
 /// must not block loading the policy in that case.
 fn validate_params(settings: &Value, eval_ctx: &EvaluationContext) -> Result<(), String> {
-    let param_kind_resource = match settings.get("paramKind") {
-        Some(param_kind) => Some(validate_param_kind(param_kind)?),
-        None => None,
+    let param_kind = settings.get("paramKind").filter(|v| !v.is_null());
+    let param_ref = settings.get("paramRef").filter(|v| !v.is_null());
+
+    let (param_kind, param_ref) = match (param_kind, param_ref) {
+        (None, None) => return Ok(()),
+        (Some(param_kind), Some(param_ref)) => (param_kind, param_ref),
+        _ => {
+            return Err(
+                "Both paramKind and paramRef must be present together, or both absent".to_string(),
+            );
+        }
     };
 
-    if let Some(param_ref) = settings.get("paramRef") {
-        validate_param_ref(param_ref)?;
-    }
+    let (api_version, kind) = validate_param_kind(param_kind)?;
+    validate_param_ref(param_ref)?;
 
-    if let Some((api_version, kind)) = param_kind_resource
-        && !eval_ctx.can_access_kubernetes_resource(&api_version, &kind)
-    {
+    if !eval_ctx.can_access_kubernetes_resource(&api_version, &kind) {
         warn!(
             %api_version,
             %kind,
@@ -530,103 +603,249 @@ mod tests {
         );
     }
 
+    /// A complete `paramKind`, used to pair with the `paramRef` under test.
+    fn config_map_param_kind() -> serde_json::Value {
+        json!({"apiVersion": "v1", "kind": "ConfigMap"})
+    }
+
+    /// A complete `paramRef`, used to pair with the `paramKind` under test.
+    fn named_param_ref() -> serde_json::Value {
+        json!({"name": "replica-limit", "parameterNotFoundAction": "Deny"})
+    }
+
     #[rstest]
     #[case::no_params(json!({}))]
     #[case::unrelated_settings(json!({"validations": []}))]
+    #[case::both_null(json!({"paramKind": null, "paramRef": null}))]
     fn validate_params_without_param_kind_or_ref_is_ok(#[case] settings: serde_json::Value) {
         validate_params(&settings, &EvaluationContext::default())
             .expect("settings without paramKind/paramRef should be valid");
     }
 
     #[rstest]
-    #[case::not_an_object(json!({"paramKind": "v1/ConfigMap"}), "paramKind must be an object")]
+    #[case::param_kind_only(json!({"paramKind": config_map_param_kind()}))]
+    #[case::param_kind_with_null_ref(json!({"paramKind": config_map_param_kind(), "paramRef": null}))]
+    #[case::param_ref_only(json!({"paramRef": named_param_ref()}))]
+    #[case::param_ref_with_null_kind(json!({"paramKind": null, "paramRef": named_param_ref()}))]
+    fn validate_params_requires_param_kind_and_param_ref_together(
+        #[case] settings: serde_json::Value,
+    ) {
+        let err = validate_params(&settings, &EvaluationContext::default())
+            .expect_err("paramKind and paramRef must be present together");
+        assert_eq!(
+            "Both paramKind and paramRef must be present together, or both absent",
+            err
+        );
+    }
+
+    #[rstest]
+    #[case::not_an_object(json!("v1/ConfigMap"), "paramKind must be an object")]
     #[case::missing_kind(
-        json!({"paramKind": {"apiVersion": "v1"}}),
+        json!({"apiVersion": "v1"}),
         "paramKind must have both apiVersion and kind specified"
     )]
     #[case::missing_api_version(
-        json!({"paramKind": {"kind": "ConfigMap"}}),
+        json!({"kind": "ConfigMap"}),
         "paramKind must have both apiVersion and kind specified"
     )]
     #[case::empty_strings(
-        json!({"paramKind": {"apiVersion": "", "kind": ""}}),
+        json!({"apiVersion": "", "kind": ""}),
         "paramKind must have both apiVersion and kind specified"
     )]
     #[case::api_version_wrong_type(
-        json!({"paramKind": {"apiVersion": 1, "kind": "ConfigMap"}}),
+        json!({"apiVersion": 1, "kind": "ConfigMap"}),
         "paramKind.apiVersion must be a string"
     )]
     #[case::kind_wrong_type(
-        json!({"paramKind": {"apiVersion": "v1", "kind": []}}),
+        json!({"apiVersion": "v1", "kind": []}),
         "paramKind.kind must be a string"
     )]
     fn validate_params_rejects_malformed_param_kind(
-        #[case] settings: serde_json::Value,
+        #[case] param_kind: serde_json::Value,
         #[case] expected_message: &str,
     ) {
+        let settings = json!({"paramKind": param_kind, "paramRef": named_param_ref()});
         let err = validate_params(&settings, &EvaluationContext::default())
             .expect_err("expected an error for malformed paramKind");
         assert_eq!(expected_message, err);
     }
 
     #[rstest]
-    #[case::not_an_object(json!({"paramRef": "replica-limit"}), "paramRef must be an object")]
+    #[case::not_an_object(json!("replica-limit"), "paramRef must be an object")]
     #[case::missing_name_and_selector(
-        json!({"paramRef": {"parameterNotFoundAction": "Deny"}}),
+        json!({"parameterNotFoundAction": "Deny"}),
         "paramRef must have either name or selector specified"
     )]
     #[case::both_name_and_selector(
-        json!({"paramRef": {
+        json!({
             "name": "replica-limit",
             "selector": {"matchLabels": {"app": "demo"}},
             "parameterNotFoundAction": "Deny"
-        }}),
+        }),
         "paramRef cannot have both name and selector specified"
     )]
     #[case::name_wrong_type(
-        json!({"paramRef": {"name": 1, "parameterNotFoundAction": "Deny"}}),
+        json!({"name": 1, "parameterNotFoundAction": "Deny"}),
         "paramRef.name must be a string"
     )]
     #[case::selector_wrong_type(
-        json!({"paramRef": {"selector": "app=demo", "parameterNotFoundAction": "Deny"}}),
+        json!({"selector": "app=demo", "parameterNotFoundAction": "Deny"}),
         "paramRef.selector must be an object"
     )]
     #[case::missing_parameter_not_found_action(
-        json!({"paramRef": {"name": "replica-limit"}}),
+        json!({"name": "replica-limit"}),
         "parameterNotFoundAction must be 'Deny' or 'Allow' if paramRef is specified"
     )]
     #[case::invalid_parameter_not_found_action(
-        json!({"paramRef": {"name": "replica-limit", "parameterNotFoundAction": "Maybe"}}),
+        json!({"name": "replica-limit", "parameterNotFoundAction": "Maybe"}),
         "parameterNotFoundAction must be 'Deny' or 'Allow' if paramRef is specified"
     )]
     #[case::parameter_not_found_action_wrong_type(
-        json!({"paramRef": {"name": "replica-limit", "parameterNotFoundAction": 1}}),
+        json!({"name": "replica-limit", "parameterNotFoundAction": 1}),
         "paramRef.parameterNotFoundAction must be a string"
     )]
     fn validate_params_rejects_malformed_param_ref(
-        #[case] settings: serde_json::Value,
+        #[case] param_ref: serde_json::Value,
         #[case] expected_message: &str,
     ) {
+        let settings = json!({"paramKind": config_map_param_kind(), "paramRef": param_ref});
         let err = validate_params(&settings, &EvaluationContext::default())
             .expect_err("expected an error for malformed paramRef");
         assert_eq!(expected_message, err);
     }
 
+    /// Type-shape errors come from deserializing into the `k8s_openapi`
+    /// `LabelSelector`, operator errors from `kube::core::Selector`. Their
+    /// exact wording belongs to those crates, so only the prefix is
+    /// asserted here.
     #[rstest]
-    #[case::name_with_allow(json!({"paramRef": {"name": "replica-limit", "parameterNotFoundAction": "Allow"}}))]
-    #[case::name_with_deny(json!({"paramRef": {"name": "replica-limit", "parameterNotFoundAction": "Deny"}}))]
-    #[case::selector_with_deny(json!({"paramRef": {
+    #[case::match_labels_not_an_object(json!({"matchLabels": "app=demo"}))]
+    #[case::match_labels_value_not_a_string(json!({"matchLabels": {"app": 1}}))]
+    #[case::match_expressions_not_an_array(json!({"matchExpressions": {"key": "tier"}}))]
+    #[case::expression_not_an_object(json!({"matchExpressions": ["tier in (web)"]}))]
+    #[case::expression_missing_operator(json!({"matchExpressions": [{"key": "tier"}]}))]
+    #[case::expression_unknown_operator(
+        json!({"matchExpressions": [{"key": "tier", "operator": "Like", "values": ["web"]}]})
+    )]
+    #[case::expression_lowercase_operator(
+        json!({"matchExpressions": [{"key": "tier", "operator": "in", "values": ["web"]}]})
+    )]
+    #[case::expression_values_not_an_array(
+        json!({"matchExpressions": [{"key": "tier", "operator": "In", "values": "web"}]})
+    )]
+    #[case::expression_values_not_strings(
+        json!({"matchExpressions": [{"key": "tier", "operator": "In", "values": [1]}]})
+    )]
+    fn validate_params_rejects_malformed_selector(#[case] selector: serde_json::Value) {
+        let settings = json!({
+            "paramKind": config_map_param_kind(),
+            "paramRef": {"selector": selector, "parameterNotFoundAction": "Deny"}
+        });
+        let err = validate_params(&settings, &EvaluationContext::default())
+            .expect_err("expected an error for malformed selector");
+        assert!(
+            err.starts_with("paramRef.selector is not a valid LabelSelector: "),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The `key` and `values` rules are not enforced by `k8s_openapi` or
+    /// `kube`, so they are checked here and the messages are ours.
+    #[rstest]
+    #[case::missing_key(
+        json!({"matchExpressions": [{"operator": "Exists"}]}),
+        "paramRef.selector.matchExpressions[0].key must be a non-empty string"
+    )]
+    #[case::empty_key(
+        json!({"matchExpressions": [{"key": "", "operator": "Exists"}]}),
+        "paramRef.selector.matchExpressions[0].key must be a non-empty string"
+    )]
+    #[case::in_without_values(
+        json!({"matchExpressions": [{"key": "tier", "operator": "In"}]}),
+        "paramRef.selector.matchExpressions[0].values must be non-empty when operator is In"
+    )]
+    #[case::in_with_null_values(
+        json!({"matchExpressions": [{"key": "tier", "operator": "In", "values": null}]}),
+        "paramRef.selector.matchExpressions[0].values must be non-empty when operator is In"
+    )]
+    #[case::not_in_with_empty_values(
+        json!({"matchExpressions": [{"key": "tier", "operator": "NotIn", "values": []}]}),
+        "paramRef.selector.matchExpressions[0].values must be non-empty when operator is NotIn"
+    )]
+    #[case::exists_with_values(
+        json!({"matchExpressions": [{"key": "tier", "operator": "Exists", "values": ["web"]}]}),
+        "paramRef.selector.matchExpressions[0].values must be empty when operator is Exists"
+    )]
+    #[case::does_not_exist_with_values(
+        json!({"matchExpressions": [{"key": "tier", "operator": "DoesNotExist", "values": ["web"]}]}),
+        "paramRef.selector.matchExpressions[0].values must be empty when operator is DoesNotExist"
+    )]
+    #[case::second_expression_is_reported_by_index(
+        json!({"matchExpressions": [
+            {"key": "tier", "operator": "Exists"},
+            {"key": "env", "operator": "In"}
+        ]}),
+        "paramRef.selector.matchExpressions[1].values must be non-empty when operator is In"
+    )]
+    fn validate_params_rejects_selector_with_wrong_key_or_values(
+        #[case] selector: serde_json::Value,
+        #[case] expected_message: &str,
+    ) {
+        let settings = json!({
+            "paramKind": config_map_param_kind(),
+            "paramRef": {"selector": selector, "parameterNotFoundAction": "Deny"}
+        });
+        let err = validate_params(&settings, &EvaluationContext::default())
+            .expect_err("expected an error for a selector with a wrong key or values");
+        assert_eq!(expected_message, err);
+    }
+
+    #[rstest]
+    #[case::name_with_allow(json!({"name": "replica-limit", "parameterNotFoundAction": "Allow"}))]
+    #[case::name_with_deny(json!({"name": "replica-limit", "parameterNotFoundAction": "Deny"}))]
+    #[case::name_with_namespace(json!({
+        "name": "replica-limit",
+        "namespace": "team-a",
+        "parameterNotFoundAction": "Deny"
+    }))]
+    #[case::selector_with_deny(json!({
         "selector": {"matchLabels": {"app": "demo"}},
         "parameterNotFoundAction": "Deny"
-    }}))]
-    fn validate_params_accepts_well_formed_param_ref(#[case] settings: serde_json::Value) {
+    }))]
+    #[case::selector_with_allow(json!({
+        "selector": {"matchLabels": {"app": "demo"}},
+        "parameterNotFoundAction": "Allow"
+    }))]
+    #[case::empty_selector_matches_everything(json!({
+        "selector": {},
+        "parameterNotFoundAction": "Deny"
+    }))]
+    #[case::selector_with_null_fields(json!({
+        "selector": {"matchLabels": null, "matchExpressions": null},
+        "parameterNotFoundAction": "Deny"
+    }))]
+    #[case::selector_with_every_operator(json!({
+        "selector": {
+            "matchLabels": {"app": "demo"},
+            "matchExpressions": [
+                {"key": "tier", "operator": "In", "values": ["web", "api"]},
+                {"key": "env", "operator": "NotIn", "values": ["dev"]},
+                {"key": "owner", "operator": "Exists"},
+                {"key": "legacy", "operator": "DoesNotExist", "values": []},
+                {"key": "deprecated", "operator": "DoesNotExist", "values": null}
+            ]
+        },
+        "parameterNotFoundAction": "Deny"
+    }))]
+    fn validate_params_accepts_well_formed_param_ref(#[case] param_ref: serde_json::Value) {
+        let settings = json!({"paramKind": config_map_param_kind(), "paramRef": param_ref});
         validate_params(&settings, &EvaluationContext::default())
             .expect("well-formed paramRef should be valid");
     }
 
     #[test]
     fn validate_params_ok_when_param_kind_resource_is_granted() {
-        let settings = json!({"paramKind": {"apiVersion": "v1", "kind": "ConfigMap"}});
+        let settings = json!({"paramKind": config_map_param_kind(), "paramRef": named_param_ref()});
         let eval_ctx = eval_ctx_with_allow_list(BTreeSet::from([ContextAwareResource {
             api_version: "v1".to_string(),
             kind: "ConfigMap".to_string(),
@@ -643,7 +862,7 @@ mod tests {
         // `validate_params`). It only produces a `tracing::warn!`, which
         // this test can't assert on directly, but the important contract
         // -- that validation still succeeds -- is what's checked here.
-        let settings = json!({"paramKind": {"apiVersion": "v1", "kind": "ConfigMap"}});
+        let settings = json!({"paramKind": config_map_param_kind(), "paramRef": named_param_ref()});
 
         validate_params(&settings, &EvaluationContext::default())
             .expect("a missing grant should only warn, not fail settings validation");
