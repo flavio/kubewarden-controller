@@ -26,6 +26,23 @@ pub(crate) fn parse_field_masks(map: &Value) -> Option<std::collections::BTreeSe
     })
 }
 
+/// Extract the optional `namespace` of a `kw.k8s` builder map.
+///
+/// An absent key and an empty string both mean "no namespace". A `kw.k8s`
+/// chain written in CEL sets the key only when the policy calls
+/// `.namespace(...)`. The `params` lookup that a compiled VAP module runs on
+/// its own always sets the key, and uses `""` when neither
+/// `paramRef.namespace` nor `request.namespace` is set (for example, a
+/// cluster-scoped param resource). Treating `""` as a real namespace would
+/// build a broken API path, or reject a cluster-scoped resource with
+/// "cannot search for it inside of a namespace".
+pub(crate) fn optional_namespace(map: &Value) -> Option<String> {
+    map["namespace"]
+        .as_str()
+        .filter(|ns| !ns.is_empty())
+        .map(str::to_owned)
+}
+
 /// Authorize and dispatch a `CallbackRequestType` built from a ferricel
 /// extension handler, synchronously waiting for the response.
 ///
@@ -47,4 +64,25 @@ pub(crate) fn call_host(
         .map_err(|e| e.to_string())?;
 
     serde_json::from_slice(&payload).map_err(|e| format!("failed to deserialize response: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+    use serde_json::json;
+
+    use super::*;
+
+    #[rstest]
+    #[case::absent(json!({"kind": "ConfigMap"}), None)]
+    #[case::null(json!({"namespace": null}), None)]
+    #[case::empty(json!({"namespace": ""}), None)]
+    #[case::not_a_string(json!({"namespace": 1}), None)]
+    #[case::set(json!({"namespace": "team-a"}), Some("team-a".to_string()))]
+    fn optional_namespace_treats_empty_as_absent(
+        #[case] map: Value,
+        #[case] expected: Option<String>,
+    ) {
+        assert_eq!(optional_namespace(&map), expected);
+    }
 }

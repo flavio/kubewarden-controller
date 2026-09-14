@@ -163,9 +163,12 @@ impl Runtime<'_> {
     ///     Derived from `AdmissionRequest.namespace` rather than `object.metadata.namespace`
     ///     because `object` is null for DELETE requests, even though the request is
     ///     still namespace-scoped.
-    ///   - `paramRef`        Forwarded from `settings["paramRef"]` when present, so that
-    ///     the compiled wasm can use it to fetch the param resource via the
-    ///     `kw.k8s.get` extension (registered in StackPre::rehydrate).
+    ///   - `paramRef`        Forwarded from `settings["paramRef"]` when present. The
+    ///     compiled wasm reads `name`/`namespace` or `selector`, plus
+    ///     `parameterNotFoundAction`, and fetches the param resources itself via
+    ///     the `kw.k8s.get`/`kw.k8s.list` extensions (registered in
+    ///     `StackPre::rehydrate`). When `paramRef.namespace` is empty the wasm
+    ///     falls back to `request.namespace`, so `request` must always be bound.
     ///
     /// Returns `Err(AdmissionResponse)` on failure so that `validate` can return the
     /// error response immediately.
@@ -240,9 +243,11 @@ impl Runtime<'_> {
     /// bulk of their behavior: all validation logic is compiled into the
     /// Wasm module. This function only validates the settings that the
     /// runtime itself consumes, not the compiled wasm: the value of
-    /// `failurePolicy` and the shape of `paramKind`/`paramRef`. On top of
-    /// that, it warns -- without failing validation -- when a `paramKind`
-    /// grant is missing.
+    /// `failurePolicy` and the shape of `paramKind`/`paramRef`. The latter
+    /// is consumed by the compiled wasm, but a malformed value would only
+    /// surface on the first request; validating it here fails fast at load
+    /// time instead. On top of that, it warns -- without failing validation
+    /// -- when a `paramKind` grant is missing.
     pub fn validate_settings(&self, settings: String) -> SettingsValidationResponse {
         match validate_settings_json(&settings, self.0.eval_ctx()) {
             Ok(()) => SettingsValidationResponse {

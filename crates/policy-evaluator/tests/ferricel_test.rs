@@ -610,9 +610,13 @@ spec:
     let _ = shutdown_tx.send(());
 }
 
-/// A VAP that uses `paramKind`/`paramRef` requires the `kw.k8s.get` extension.
-/// The policy fetches a ConfigMap via the callback channel and uses its data
-/// to evaluate the validation expression.
+/// A VAP that uses `paramKind`/`paramRef` fetches its params through the
+/// `kw.k8s.get` (by name) or `kw.k8s.list` (by selector) extension. This test
+/// goes through a mocked Kubernetes API server: the policy fetches a
+/// ConfigMap by name via the callback channel and uses its data to evaluate
+/// the validation expression. The tests in the "params" section below mock
+/// the callback channel directly and cover selectors and
+/// `parameterNotFoundAction`.
 ///
 /// - accept case: 3 replicas <= 50 (from ConfigMap)
 /// - reject case: 51 replicas > 50 (from ConfigMap)
@@ -652,7 +656,8 @@ spec:
     let mut evaluator = build_evaluator(&wasm, Some(callback_channel), ctx_aware_resources);
 
     // paramRef is stored in the ClusterAdmissionPolicy settings and forwarded
-    // to the wasm as a binding so it can call kw.k8s.get to fetch the param resource.
+    // to the wasm as a binding. The wasm reads it and calls kw.k8s.get to
+    // fetch the param resource.
     let settings = PolicySettings::try_from(&json!({
         "paramRef": {
             "name": "replica-limit",
@@ -683,6 +688,528 @@ spec:
     }
 
     let _ = shutdown_tx.send(());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// params: selector, parameterNotFoundAction, namespace defaulting
+//
+// Since ferricel 0.10 the compiled module resolves `params` on its own, the
+// way the Kubernetes API server does:
+//
+//   - `paramRef.name` calls `kw.k8s.get`, `paramRef.selector` calls
+//     `kw.k8s.list` with the selector formatted as a label selector string.
+//   - `paramRef.namespace` wins; when empty, `request.namespace` is used;
+//     when that is empty too, the module sends `namespace: ""` and the host
+//     must treat it as "no namespace".
+//   - The policy is evaluated once per param. The first rejection wins.
+//   - `parameterNotFoundAction: Allow` admits the request when nothing is
+//     found. `Deny` (the default) traps with a CEL runtime error, which the
+//     host handles with `failurePolicy`.
+//
+// The host never sees `paramRef`: it only serves `kw.k8s.get`/`kw.k8s.list`.
+// These tests mock the callback channel directly. Each test hands the mock
+// the exact answer it wants (see `ParamsResponse`); the mock does not
+// evaluate names or selectors. The mock records every request the module
+// sends, so the tests assert on the exact name, namespace and label
+// selector the host received.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A VAP with `paramKind`. The `messageExpression` names the param that
+/// rejected the request, so tests can tell which of several params matched.
+const VAP_PARAMS: &str = r#"
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: params-replicas
+spec:
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  validations:
+    - expression: "object.spec.replicas <= int(params.data.maxReplicas)"
+      messageExpression: "'too many replicas, ' + params.metadata.name + ' allows at most ' + params.data.maxReplicas"
+      message: "too many replicas"
+"#;
+
+/// The same policy, with the param value read through `variables`.
+/// Kubernetes lets a variable reference `params`.
+const VAP_PARAMS_IN_VARIABLES: &str = r#"
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: params-in-variables
+spec:
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  variables:
+    - name: maxReplicas
+      expression: "int(params.data.maxReplicas)"
+  validations:
+    - expression: "object.spec.replicas <= variables.maxReplicas"
+      message: "too many replicas"
+"#;
+
+/// A `paramKind` policy that does not read `object`, for cluster-scoped
+/// requests whose object has no `spec.replicas`.
+const VAP_PARAMS_CLUSTER_SCOPED: &str = r#"
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: params-cluster-scoped
+spec:
+  paramKind:
+    apiVersion: v1
+    kind: ConfigMap
+  validations:
+    - expression: "int(params.data.maxReplicas) > 0"
+      message: "maxReplicas must be positive"
+"#;
+
+/// A ConfigMap param with the only fields the module reads:
+/// `metadata.name` (for the `messageExpression`) and `data.maxReplicas`.
+fn config_map(name: &str, max_replicas: u64) -> serde_json::Value {
+    json!({
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {"name": name},
+        "data": {"maxReplicas": max_replicas.to_string()}
+    })
+}
+
+/// The error the real callback handler returns for a `get` of a resource
+/// that does not exist (see `callback_handler::kubernetes::client`).
+fn not_found(name: &str, namespace: &str) -> Result<serde_json::Value, String> {
+    Err(format!(
+        "Cannot find v1/ConfigMap named '{name}' inside of namespace '{namespace}'"
+    ))
+}
+
+/// `{"paramRef": ...}`, the settings envelope every params test sends.
+fn param_settings(param_ref: serde_json::Value) -> serde_json::Value {
+    json!({"paramRef": param_ref})
+}
+
+/// What the mock answers to the module's params fetch. A test builds one of
+/// these to describe the API server it wants, nothing more. The mock does not
+/// evaluate names or selectors: every test asserts the exact request the
+/// module sent instead.
+enum ParamsResponse {
+    /// The answer to `kw.k8s.get`: the ConfigMap, or the host error for a
+    /// missing resource.
+    Get(Result<serde_json::Value, String>),
+    /// The answer to `kw.k8s.list`: the ConfigMaps in `items`, possibly none.
+    List(Vec<serde_json::Value>),
+}
+
+/// Every Kubernetes request the compiled module sent to the host, serialized
+/// as JSON so tests can assert on the exact variant and fields.
+type RecordedRequests = std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+
+/// Spawn a callback-channel mock that answers every params fetch with
+/// `response`. A request of the wrong kind (a `list` when the test expects
+/// a `get`, or the other way around) panics: the test then fails on the
+/// module's behavior, not on a silent mismatch. Returns the channel and the
+/// log of the requests it received.
+fn spawn_params_mock(
+    response: ParamsResponse,
+) -> (mpsc::Sender<CallbackRequest>, RecordedRequests) {
+    let recorded: RecordedRequests = Default::default();
+    let log = recorded.clone();
+
+    let (tx, mut rx) = mpsc::channel::<CallbackRequest>(8);
+    tokio::spawn(async move {
+        while let Some(req) = rx.recv().await {
+            log.lock()
+                .unwrap()
+                .push(serde_json::to_value(&req.request).unwrap());
+
+            let answer = match (&req.request, &response) {
+                (
+                    CallbackRequestType::KubernetesGetResource { kind, .. },
+                    ParamsResponse::Get(answer),
+                ) => {
+                    assert_eq!(kind, "ConfigMap");
+                    answer.clone().map_err(|e| anyhow::anyhow!(e))
+                }
+                (
+                    CallbackRequestType::KubernetesListResourceNamespace { kind, .. }
+                    | CallbackRequestType::KubernetesListResourceAll { kind, .. },
+                    ParamsResponse::List(items),
+                ) => {
+                    assert_eq!(kind, "ConfigMap");
+                    Ok(json!({"apiVersion": "v1", "kind": "ConfigMapList", "items": items}))
+                }
+                (other, _) => {
+                    let expected = match response {
+                        ParamsResponse::Get(_) => "kw.k8s.get",
+                        ParamsResponse::List(_) => "kw.k8s.list",
+                    };
+                    panic!("the test expects a {expected} call, got: {other:?}")
+                }
+            };
+
+            let _ = req
+                .response_channel
+                .send(answer.map(|value| CallbackResponse {
+                    payload: serde_json::to_vec(&value).unwrap(),
+                }));
+        }
+    });
+
+    (tx, recorded)
+}
+
+fn build_params_evaluator(
+    vap: &str,
+    callback_channel: mpsc::Sender<CallbackRequest>,
+) -> policy_evaluator::policy_evaluator::PolicyEvaluator {
+    let ctx_aware_resources = BTreeSet::from([ContextAwareResource {
+        api_version: "v1".to_owned(),
+        kind: "ConfigMap".to_owned(),
+    }]);
+    build_evaluator(
+        &compile_vap(vap),
+        Some(callback_channel),
+        ctx_aware_resources,
+    )
+}
+
+/// `deployment_accept.json` (namespace `default`) with `spec.replicas` set
+/// to `replicas`.
+fn deployment_request(replicas: u64) -> AdmissionRequest {
+    let mut request: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(data_path("deployment_accept.json")).expect("cannot read fixture"),
+    )
+    .expect("cannot parse fixture");
+    request["object"]["spec"]["replicas"] = json!(replicas);
+    serde_json::from_value(request).expect("cannot deserialize AdmissionRequest")
+}
+
+fn validate(
+    evaluator: &mut policy_evaluator::policy_evaluator::PolicyEvaluator,
+    request: AdmissionRequest,
+    settings: serde_json::Value,
+) -> policy_evaluator::admission_response::AdmissionResponse {
+    let settings = settings_from_json(settings);
+    tokio::task::block_in_place(|| {
+        evaluator.validate(
+            ValidateRequest::AdmissionRequest(Box::new(request)),
+            &settings,
+        )
+    })
+}
+
+fn rejection_message(response: &policy_evaluator::admission_response::AdmissionResponse) -> &str {
+    assert!(!response.allowed, "expected a rejection, got: {response:?}");
+    response
+        .status
+        .as_ref()
+        .and_then(|s| s.message.as_deref())
+        .unwrap_or_default()
+}
+
+/// The selector matches two params: `replica-limit` (max 50) and
+/// `replica-limit-strict` (max 10). The module evaluates the policy once per
+/// param and the first rejection wins, so a Deployment with 20 replicas is
+/// rejected by the strict param only.
+#[rstest]
+#[case::within_both_limits(3, None)]
+#[case::over_the_strict_limit_only(20, Some("replica-limit-strict allows at most 10"))]
+#[case::over_both_limits(51, Some("allows at most"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_params_by_selector(#[case] replicas: u64, #[case] expected_rejection: Option<&str>) {
+    let (channel, recorded) = spawn_params_mock(ParamsResponse::List(vec![
+        config_map("replica-limit", 50),
+        config_map("replica-limit-strict", 10),
+    ]));
+    let mut evaluator = build_params_evaluator(VAP_PARAMS, channel);
+
+    let response = validate(
+        &mut evaluator,
+        deployment_request(replicas),
+        param_settings(json!({
+            "selector": {"matchLabels": {"app": "demo"}},
+            "parameterNotFoundAction": "Deny"
+        })),
+    );
+
+    match expected_rejection {
+        None => assert!(response.allowed, "expected allowed, got: {response:?}"),
+        Some(expected) => {
+            let message = rejection_message(&response);
+            assert!(
+                message.contains(expected),
+                "expected {expected:?} in the rejection message, got: {message:?}"
+            );
+        }
+    }
+
+    // The module listed the params in the request namespace, with the
+    // selector formatted as a label selector string.
+    let recorded = recorded.lock().unwrap();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "expected one list call, got: {recorded:?}"
+    );
+    assert_eq!(
+        recorded[0]["KubernetesListResourceNamespace"]["namespace"],
+        "default"
+    );
+    assert_eq!(
+        recorded[0]["KubernetesListResourceNamespace"]["label_selector"],
+        "app=demo"
+    );
+}
+
+/// `matchExpressions` are formatted like `labels.Selector.String()` does in
+/// Kubernetes. The API server answers with the lenient param only (max 50),
+/// so 20 replicas are fine.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_params_by_selector_with_match_expressions() {
+    let (channel, recorded) =
+        spawn_params_mock(ParamsResponse::List(vec![config_map("replica-limit", 50)]));
+    let mut evaluator = build_params_evaluator(VAP_PARAMS, channel);
+
+    let response = validate(
+        &mut evaluator,
+        deployment_request(20),
+        param_settings(json!({
+            "selector": {
+                "matchLabels": {"app": "demo"},
+                "matchExpressions": [
+                    {"key": "tier", "operator": "In", "values": ["web"]},
+                    {"key": "legacy", "operator": "DoesNotExist"}
+                ]
+            },
+            "parameterNotFoundAction": "Deny"
+        })),
+    );
+
+    assert!(response.allowed, "expected allowed, got: {response:?}");
+    let recorded = recorded.lock().unwrap();
+    assert_eq!(
+        recorded[0]["KubernetesListResourceNamespace"]["label_selector"],
+        "app=demo,!legacy,tier in (web)"
+    );
+}
+
+/// No param matches the selector. `Deny` (the default in Kubernetes) makes
+/// the module trap with a CEL runtime error, so `failurePolicy` decides.
+/// `Allow` admits the request without running the validations.
+#[rstest]
+#[case::deny_and_fail("Deny", json!({}), false)]
+#[case::deny_and_ignore("Deny", json!({"failurePolicy": "Ignore"}), true)]
+#[case::allow("Allow", json!({}), true)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_params_by_selector_without_matches(
+    #[case] parameter_not_found_action: &str,
+    #[case] extra_settings: serde_json::Value,
+    #[case] expected_allowed: bool,
+) {
+    let (channel, _) = spawn_params_mock(ParamsResponse::List(vec![]));
+    let mut evaluator = build_params_evaluator(VAP_PARAMS, channel);
+
+    let mut settings = param_settings(json!({
+        "selector": {"matchLabels": {"app": "no-such-app"}},
+        "parameterNotFoundAction": parameter_not_found_action
+    }));
+    settings
+        .as_object_mut()
+        .unwrap()
+        .extend(extra_settings.as_object().unwrap().clone());
+
+    // With no params there is nothing to compare 51 replicas against: an
+    // `allowed` response proves that no validation ran.
+    let response = validate(&mut evaluator, deployment_request(51), settings);
+
+    assert_eq!(expected_allowed, response.allowed, "got: {response:?}");
+    match (parameter_not_found_action, expected_allowed) {
+        ("Deny", false) => {
+            assert_eq!(response.status.as_ref().and_then(|s| s.code), Some(500));
+            let message = rejection_message(&response);
+            assert!(
+                message.contains("no parameters found"),
+                "expected the not-found cause in the rejection message, got: {message:?}"
+            );
+        }
+        ("Deny", true) => {
+            let warnings = response.warnings.as_deref().unwrap_or_default();
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.contains("failurePolicy is Ignore")
+                        && w.contains("no parameters found")),
+                "expected a skipped-policy warning naming the cause, got: {warnings:?}"
+            );
+        }
+        ("Allow", true) => {
+            assert!(
+                response.warnings.is_none(),
+                "Allow is a regular accept, not a skipped policy, got: {response:?}"
+            );
+        }
+        other => unreachable!("{other:?}"),
+    }
+}
+
+/// A named param that does not exist. The host `kw.k8s.get` call fails;
+/// under `Deny` the error reaches `failurePolicy`, under `Allow` the request
+/// is admitted.
+#[rstest]
+#[case::deny("Deny", false)]
+#[case::allow("Allow", true)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_params_by_name_not_found(
+    #[case] parameter_not_found_action: &str,
+    #[case] expected_allowed: bool,
+) {
+    let (channel, _) = spawn_params_mock(ParamsResponse::Get(not_found(
+        "no-such-config-map",
+        "default",
+    )));
+    let mut evaluator = build_params_evaluator(VAP_PARAMS, channel);
+
+    let response = validate(
+        &mut evaluator,
+        deployment_request(51),
+        param_settings(json!({
+            "name": "no-such-config-map",
+            "namespace": "default",
+            "parameterNotFoundAction": parameter_not_found_action
+        })),
+    );
+
+    assert_eq!(expected_allowed, response.allowed, "got: {response:?}");
+    if !expected_allowed {
+        assert_eq!(response.status.as_ref().and_then(|s| s.code), Some(500));
+        let message = rejection_message(&response);
+        assert!(
+            message.contains("no-such-config-map"),
+            "expected the host error in the rejection message, got: {message:?}"
+        );
+    }
+}
+
+/// `paramRef.namespace` is optional. When it is empty, Kubernetes looks the
+/// param up in the namespace of the request being admitted.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_params_namespace_defaults_to_the_request_namespace() {
+    let (channel, recorded) =
+        spawn_params_mock(ParamsResponse::Get(Ok(config_map("replica-limit", 50))));
+    let mut evaluator = build_params_evaluator(VAP_PARAMS, channel);
+
+    let response = validate(
+        &mut evaluator,
+        deployment_request(20),
+        param_settings(json!({"name": "replica-limit", "parameterNotFoundAction": "Deny"})),
+    );
+
+    assert!(response.allowed, "expected allowed, got: {response:?}");
+    let recorded = recorded.lock().unwrap();
+    assert_eq!(
+        recorded[0]["KubernetesGetResource"]["name"],
+        "replica-limit"
+    );
+    assert_eq!(recorded[0]["KubernetesGetResource"]["namespace"], "default");
+}
+
+/// An explicit `paramRef.namespace` wins over the request namespace. The
+/// recorded request is the proof; the rejection only confirms the returned
+/// param was the one evaluated.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_params_explicit_namespace_wins_over_the_request_namespace() {
+    let (channel, recorded) =
+        spawn_params_mock(ParamsResponse::Get(Ok(config_map("replica-limit", 1))));
+    let mut evaluator = build_params_evaluator(VAP_PARAMS, channel);
+
+    let response = validate(
+        &mut evaluator,
+        deployment_request(3),
+        param_settings(json!({
+            "name": "replica-limit",
+            "namespace": "team-a",
+            "parameterNotFoundAction": "Deny"
+        })),
+    );
+
+    let message = rejection_message(&response);
+    assert!(
+        message.contains("allows at most 1"),
+        "expected the returned param to reject, got: {message:?}"
+    );
+    let recorded = recorded.lock().unwrap();
+    assert_eq!(recorded[0]["KubernetesGetResource"]["namespace"], "team-a");
+}
+
+/// A cluster-scoped request has no namespace, and neither does the
+/// `paramRef`. The module then sends `namespace: ""`, which the host must
+/// read as "list across all namespaces" rather than as a namespace named
+/// `""`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_params_by_selector_on_a_cluster_scoped_request_lists_all_namespaces() {
+    let (channel, recorded) =
+        spawn_params_mock(ParamsResponse::List(vec![config_map("replica-limit", 50)]));
+    let mut evaluator = build_params_evaluator(VAP_PARAMS_CLUSTER_SCOPED, channel);
+
+    let response = validate(
+        &mut evaluator,
+        cluster_scoped_request(),
+        param_settings(json!({
+            "selector": {"matchLabels": {"app": "demo"}},
+            "parameterNotFoundAction": "Deny"
+        })),
+    );
+
+    assert!(response.allowed, "expected allowed, got: {response:?}");
+    let recorded = recorded.lock().unwrap();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "expected one list call, got: {recorded:?}"
+    );
+    assert!(
+        recorded[0].get("KubernetesListResourceAll").is_some(),
+        "expected a cluster-wide list, got: {:?}",
+        recorded[0]
+    );
+    assert_eq!(
+        recorded[0]["KubernetesListResourceAll"]["label_selector"],
+        "app=demo"
+    );
+}
+
+/// `variables` can read `params`, as in Kubernetes. Before ferricel 0.10 the
+/// module bound `params` after evaluating the variables, so this saw `null`.
+#[rstest]
+#[case::within_limit(3, true)]
+#[case::over_limit(20, false)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_params_are_available_to_variables(
+    #[case] replicas: u64,
+    #[case] expected_allowed: bool,
+) {
+    let (channel, _) = spawn_params_mock(ParamsResponse::Get(Ok(config_map(
+        "replica-limit-strict",
+        10,
+    ))));
+    let mut evaluator = build_params_evaluator(VAP_PARAMS_IN_VARIABLES, channel);
+
+    let response = validate(
+        &mut evaluator,
+        deployment_request(replicas),
+        param_settings(json!({
+            "name": "replica-limit-strict",
+            "namespace": "default",
+            "parameterNotFoundAction": "Deny"
+        })),
+    );
+
+    assert_eq!(expected_allowed, response.allowed, "got: {response:?}");
+    if !expected_allowed {
+        assert!(rejection_message(&response).contains("too many replicas"));
+    }
 }
 
 // ─── Authorization gating tests ──────────────────────────────────────────────
