@@ -81,7 +81,7 @@ fn builder_arg<'a>(
 /// Every registration pairs the handler with the same [`ExtensionDecl`] used
 /// to configure the compiler (see [`compiler_extension_decls`] and
 /// [`kw_k8s_get_extension`]/[`kw_k8s_list_extension`]), so the compile-time
-/// and runtime argument counts can never drift apart. Rembmer, `ferricel-core`
+/// and runtime argument counts can never drift apart. Remember, `ferricel-core`
 /// enforces `args.len() == decl.num_args` for every guest call before it
 /// reaches these closures.
 ///
