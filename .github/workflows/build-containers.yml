@@ -1,6 +1,7 @@
 name: Build, Sign, and Generate SBOM, Attestation & Provenance
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - "main"
