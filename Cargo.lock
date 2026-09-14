@@ -2266,9 +2266,9 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "ferricel-core"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06ec62da90e37eda309c71ec7d57a5395eacb326d61b5b08de1c3f6247013abf"
+checksum = "b268ce0432497759f1c5d12a2ac71131d18f1e093a45926d3a94b7419a26daa4"
 dependencies = [
  "anyhow",
  "cel",
@@ -2279,17 +2279,17 @@ dependencies = [
  "serde",
  "serde_json",
  "slog",
- "walrus",
- "wasmparser 0.258.0",
+ "walrus 0.27.2",
+ "wasmparser 0.259.0",
  "wasmtime",
  "yaml_serde",
 ]
 
 [[package]]
 name = "ferricel-types"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "902ef3c7924f47efa0d750e4cd3a3fdd6436460910b6db1d031e0c1b32829aa8"
+checksum = "0b914c5bb48b75407ff4d363bdfc40b7fff8f89edc0cfbf506fbb6de58a95bcb"
 dependencies = [
  "prost 0.14.4",
  "prost-build 0.14.4",
@@ -3850,7 +3850,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "walrus",
+ "walrus 0.26.5",
  "wasm-encoder 0.258.0",
  "yaml_serde",
 ]
@@ -5200,7 +5200,7 @@ dependencies = [
  "tracing",
  "url",
  "validator",
- "walrus",
+ "walrus 0.26.5",
  "wapc",
  "wasmparser 0.258.0",
  "wasmtime",
@@ -8192,6 +8192,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "walrus"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e124668d1bce62ae1d2183c1e85da2b08aa53f36baa3b975427fa6f0ec2fb1e8"
+dependencies = [
+ "anyhow",
+ "gimli 0.32.3",
+ "id-arena",
+ "leb128",
+ "log",
+ "walrus-macro",
+ "wasm-encoder 0.245.1",
+ "wasmparser 0.245.1",
+]
+
+[[package]]
 name = "walrus-macro"
 version = "0.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8433,8 +8449,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0f7c12eac7bb587801590f6a67ff0bc84d0748513864b71108e4b311cc3df694"
 dependencies = [
  "bitflags 2.13.2",
+ "hashbrown 0.17.1",
  "indexmap 2.14.2",
  "semver",
+ "serde",
 ]
 
 [[package]]

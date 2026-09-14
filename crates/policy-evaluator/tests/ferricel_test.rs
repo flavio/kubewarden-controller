@@ -197,11 +197,12 @@ async fn namespace_scenario(handle: Handle<Request<Body>, Response<Body>>) {
 }
 
 /// Mock scenario that handles namespace and ConfigMap GET requests.
-/// Used by the params test, which needs both namespaceObject and params fetching.
+/// Used by `test_params`.
 ///
 /// Handles:
 /// - GET /api/v1            -- API discovery
-/// - GET /api/v1/namespaces/{name}        -- namespace fetch
+/// - GET /api/v1/namespaces/{name}        -- namespace fetch (unused by `test_params`,
+///   kept in case a future test in this file needs it too)
 /// - GET /api/v1/namespaces/{ns}/configmaps/{name}  -- ConfigMap fetch for params
 async fn params_scenario(handle: Handle<Request<Body>, Response<Body>>) {
     tokio::spawn(async move {
@@ -345,10 +346,9 @@ async fn test_simple_validation(
 /// successfully against a namespace-scoped request, regardless of whether a
 /// callback channel/Kubernetes client is available.
 ///
-/// Before the `ferricel.vap-variables` Wasm section was consulted, the
-/// runtime unconditionally tried to fetch `namespaceObject` for every
-/// namespaced request, failing evaluation even though the compiled policy
-/// never uses that value.
+/// The compiled module only calls `kw.k8s.get` for the Namespace when the
+/// policy references `namespaceObject`. A policy that doesn't must not pay
+/// for a Kubernetes client it never needs.
 fn assert_namespaced_request_is_allowed_without_namespace_object(
     callback_channel: Option<mpsc::Sender<CallbackRequest>>,
     scenario: &str,
@@ -370,8 +370,8 @@ fn assert_namespaced_request_is_allowed_without_namespace_object(
 }
 
 /// A callback channel is available, but no Kubernetes client was configured
-/// for it: if `fetch_namespace_object` were called, the callback handler
-/// would answer with "kube::Client was not initialized properly".
+/// for it: a `kw.k8s.get` call for the Namespace would fail with
+/// "kube::Client was not initialized properly" if the module made one.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_policy_without_namespace_object_reference_works_without_kube_client() {
     let (shutdown_tx, callback_channel) = setup_callback_handler(None, None).await;
@@ -384,8 +384,9 @@ async fn test_policy_without_namespace_object_reference_works_without_kube_clien
     let _ = shutdown_tx.send(());
 }
 
-/// No callback channel at all: `fetch_namespace_object` would fail
-/// immediately with "callback channel is not available" if called.
+/// No callback channel at all: a `kw.k8s.get` call for the Namespace would
+/// fail immediately with "callback channel is not available" if the module
+/// made one.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_policy_without_namespace_object_reference_works_without_callback_channel() {
     assert_namespaced_request_is_allowed_without_namespace_object(
@@ -570,10 +571,15 @@ async fn test_missing_epoch_deadline_on_interruption_enabled_engine_is_reported_
 
 /// On DELETE, Kubernetes typically sends `object: null` (the resource being
 /// deleted is only available via `oldObject`), but `request.namespace` is
-/// still populated. `namespaceObject` must be derived from `request.namespace`
-/// rather than `object.metadata.namespace`, otherwise it would incorrectly be
-/// treated as cluster-scoped and skipped for every DELETE of a namespaced
-/// resource. This is a regression test for that behavior.
+/// still populated. The compiled module must resolve `namespaceObject` from
+/// `request.namespace` rather than `object.metadata.namespace`, otherwise it
+/// would incorrectly treat the request as cluster-scoped and skip the fetch
+/// for every DELETE of a namespaced resource. This is a regression test for
+/// that behavior.
+///
+/// Since ferricel 0.11 the compiled module resolves `namespaceObject` on its
+/// own, through the gated `kw.k8s.get` extension: the policy needs the
+/// `v1/Namespace` grant, like every other Kubernetes read.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_namespace_object_is_fetched_on_delete_with_null_object() {
     let vap = r#"
@@ -593,7 +599,11 @@ spec:
     let (shutdown_tx, callback_channel) = setup_callback_handler(Some(client), None).await;
 
     let wasm = compile_vap(vap);
-    let mut evaluator = build_evaluator(&wasm, Some(callback_channel), BTreeSet::new());
+    let ctx_aware_resources = BTreeSet::from([ContextAwareResource {
+        api_version: "v1".to_owned(),
+        kind: "Namespace".to_owned(),
+    }]);
+    let mut evaluator = build_evaluator(&wasm, Some(callback_channel), ctx_aware_resources);
     let request = ValidateRequest::AdmissionRequest(Box::new(load_admission_request(
         "deployment_delete.json",
     )));
@@ -1315,6 +1325,152 @@ spec:
         actual_message.is_some_and(|m| m.contains(expected_denial_substring)),
         "expected rejection message to contain {expected_denial_substring:?}, got: {actual_message:?}"
     );
+}
+
+/// A policy that references `namespaceObject` needs a `v1/Namespace` grant
+/// like any other Kubernetes read, since ferricel 0.11 resolves it through
+/// the gated `kw.k8s.get` extension.
+///
+/// This is the `namespaceObject` equivalent of the `kw.k8s.get` cases in
+/// `test_extension_denied_by_authorization_gate`, but it needs a
+/// namespace-scoped request: `cluster_scoped_request()` has `kind:
+/// Namespace`, and the compiled module skips the `namespaceObject` fetch
+/// entirely when the object under admission is itself a Namespace (see
+/// ferricel's docs on `namespaceObject`), so it can't exercise the gate
+/// here.
+#[rstest]
+#[case::without_host_capability(
+    HostCapabilities::DenyAll,
+    "kw.k8s.get: Policy has not been granted access to the 'kubernetes/get_resource' host capability"
+)]
+#[case::without_kubernetes_resource_grant(
+    HostCapabilities::AllowAll, // capability passes; empty resource allow-list denies
+    "kw.k8s.get: Policy has not been granted access to Kubernetes v1/Namespace resources"
+)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_namespace_object_denied_by_authorization_gate(
+    #[case] host_capabilities: HostCapabilities,
+    #[case] expected_denial_substring: &str,
+) {
+    let vap = r#"
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: namespace-object-authorization-gate-deny
+spec:
+  validations:
+    - expression: "namespaceObject.metadata.name == 'default'"
+      message: "unused: the validation errors, it never actually evaluates to false"
+"#;
+    let wasm = compile_vap(vap);
+    let channel = spawn_direct_mock(|req| {
+        panic!("callback channel should not be reached when the request is denied: {req:?}")
+    });
+    let mut evaluator = build_evaluator_with_host_capabilities(
+        &wasm,
+        Some(channel),
+        BTreeSet::new(),
+        host_capabilities,
+    );
+
+    let request = ValidateRequest::AdmissionRequest(Box::new(load_admission_request(
+        "deployment_accept.json",
+    )));
+    let response =
+        tokio::task::block_in_place(|| evaluator.validate(request, &PolicySettings::default()));
+
+    assert!(!response.allowed, "expected denial, got: {response:?}");
+    assert_eq!(
+        response.status.as_ref().and_then(|s| s.code),
+        Some(500),
+        "expected a fail-closed 500, got: {response:?}"
+    );
+    let actual_message = response.status.as_ref().and_then(|s| s.message.as_deref());
+    assert!(
+        actual_message.is_some_and(|m| m.contains(expected_denial_substring)),
+        "expected rejection message to contain {expected_denial_substring:?}, got: {actual_message:?}"
+    );
+}
+
+/// Under `failurePolicy: Ignore`, a denied `namespaceObject` fetch is a CEL
+/// runtime error like any other, so the policy is skipped and the request
+/// is admitted with a warning -- it is not a hard 500 as it would be
+/// without a `failurePolicy`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_namespace_object_denied_by_authorization_gate_is_ignored_when_failure_policy_is_ignore()
+ {
+    let vap = r#"
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: namespace-object-authorization-gate-ignore
+spec:
+  validations:
+    - expression: "namespaceObject.metadata.name == 'default'"
+      message: "unused: the validation errors, it never actually evaluates to false"
+"#;
+    let wasm = compile_vap(vap);
+    let channel = spawn_direct_mock(|req| {
+        panic!("callback channel should not be reached when the request is denied: {req:?}")
+    });
+    let mut evaluator = build_evaluator_with_host_capabilities(
+        &wasm,
+        Some(channel),
+        BTreeSet::new(),
+        HostCapabilities::DenyAll,
+    );
+
+    let request = ValidateRequest::AdmissionRequest(Box::new(load_admission_request(
+        "deployment_accept.json",
+    )));
+    let settings = settings_from_json(json!({"failurePolicy": "Ignore"}));
+    let response = tokio::task::block_in_place(|| evaluator.validate(request, &settings));
+
+    assert!(response.allowed, "expected allowed, got: {response:?}");
+    let warnings = response.warnings.as_deref().unwrap_or_default();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("failurePolicy is Ignore") && w.contains("kubernetes/get_resource")),
+        "expected a skipped-policy warning naming the cause, got: {warnings:?}"
+    );
+}
+
+/// When the object under admission is itself a Namespace,
+/// `namespaceObject` is null and the compiled module does not call
+/// `kw.k8s.get` at all -- fetching the Namespace being created would 404 on
+/// CREATE. Grant every capability and resource so that, if the module made
+/// the call anyway, the mock would receive it and panic; the absence of a
+/// panic is the proof that no call was made.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_namespace_object_is_not_fetched_when_the_admitted_object_is_a_namespace() {
+    let vap = r#"
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: namespace-object-on-namespace-request
+spec:
+  validations:
+    - expression: "namespaceObject == null"
+      message: "namespaceObject should be null for a Namespace request"
+"#;
+    let wasm = compile_vap(vap);
+    let channel =
+        spawn_direct_mock(|req| panic!("callback channel should not be reached: {req:?}"));
+    let ctx_aware_resources = BTreeSet::from([ContextAwareResource {
+        api_version: "v1".to_owned(),
+        kind: "Namespace".to_owned(),
+    }]);
+    let mut evaluator = build_evaluator(&wasm, Some(channel), ctx_aware_resources);
+
+    let response = tokio::task::block_in_place(|| {
+        evaluator.validate(
+            ValidateRequest::AdmissionRequest(Box::new(cluster_scoped_request())),
+            &PolicySettings::default(),
+        )
+    });
+
+    assert!(response.allowed, "expected allowed, got: {response:?}");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
