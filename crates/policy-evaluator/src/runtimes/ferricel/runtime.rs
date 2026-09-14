@@ -3,12 +3,10 @@ use kubewarden_policy_sdk::{
     response::ValidationResponse as PolicyValidationResponse, settings::SettingsValidationResponse,
 };
 use serde_json::{Value, json};
-use tokio::sync::oneshot;
 use tracing::{error, warn};
 
 use crate::{
     admission_response::AdmissionResponse,
-    callback_requests::{CallbackRequest, CallbackRequestType},
     evaluation_context::EvaluationContext,
     policy_evaluator::{PolicySettings, ValidateRequest},
     runtimes::ferricel::{
@@ -152,24 +150,20 @@ impl Runtime<'_> {
     /// Build the JSON bindings object passed to the compiled VAP module.
     ///
     /// Bindings provided:
-    ///   - `object`          The resource being admitted.
-    ///   - `oldObject`       The previous version of the resource (UPDATE/DELETE) or null.
-    ///   - `request`         The full AdmissionRequest map (operation, userInfo, etc.).
-    ///   - `namespaceObject` The Namespace resource for `request.namespace`, fetched from
-    ///     the cluster via the callback channel. null for cluster-scoped resources, and
-    ///     also null (without fetching) when the compiled policy's `ferricel.vap-variables`
-    ///     Wasm custom section proves that `namespaceObject` is never referenced (see
-    ///     `StackPre::references_vap_variable`). Error if the request is namespace-scoped,
-    ///     the policy may reference `namespaceObject`, but no callback channel is available.
-    ///     Derived from `AdmissionRequest.namespace` rather than `object.metadata.namespace`
-    ///     because `object` is null for DELETE requests, even though the request is
-    ///     still namespace-scoped.
-    ///   - `paramRef`        Forwarded from `settings["paramRef"]` when present. The
+    ///   - `object`     The resource being admitted.
+    ///   - `oldObject`  The previous version of the resource (UPDATE/DELETE) or null.
+    ///   - `request`    The full AdmissionRequest map (operation, userInfo, etc.).
+    ///   - `paramRef`   Forwarded from `settings["paramRef"]` when present. The
     ///     compiled wasm reads `name`/`namespace` or `selector`, plus
     ///     `parameterNotFoundAction`, and fetches the param resources itself via
     ///     the `kw.k8s.get`/`kw.k8s.list` extensions (registered in
     ///     `StackPre::rehydrate`). When `paramRef.namespace` is empty the wasm
     ///     falls back to `request.namespace`, so `request` must always be bound.
+    ///
+    /// Since ferricel 0.11, the compiled wasm resolves `namespaceObject` on
+    /// its own, the same way it resolves `paramRef`: it reads
+    /// `request.namespace` and calls `kw.k8s.get` for the Namespace. The
+    /// host does not build or bind `namespaceObject` any more.
     ///
     /// Returns `Err(AdmissionResponse)` on failure so that `validate` can return the
     /// error response immediately.
@@ -195,39 +189,13 @@ impl Runtime<'_> {
                         ))
                     })?;
 
-                let namespace_object = if self.0.references_vap_variable("namespaceObject") {
-                    fetch_namespace_object(
-                        admission_request.namespace.as_deref(),
-                        self.0.eval_ctx(),
-                    )
-                    .map_err(|e| {
-                        error!(error = e.as_str(), "failed to fetch namespace object");
-                        Box::new(AdmissionResponse::reject_internal_server_error(
-                            request.uid().to_string(),
-                            e,
-                        ))
-                    })?
-                } else {
-                    // The compiled policy's `ferricel.vap-variables` Wasm
-                    // custom section (see `StackPre::references_vap_variable`)
-                    // proves that `namespaceObject` is never referenced by
-                    // this policy's CEL: skip the fetch entirely, avoiding an
-                    // unnecessary Kubernetes API call and (more importantly)
-                    // a hard failure when no Kubernetes client/callback
-                    // channel is available (e.g. `kwctl run` without cluster
-                    // access), which would otherwise reject every namespaced
-                    // request even though the policy never needs this value.
-                    Value::Null
-                };
-
                 let param_ref = settings.0.get("paramRef").cloned().unwrap_or(Value::Null);
 
                 Ok(json!({
-                    "object":          object,
-                    "oldObject":       old_object,
-                    "request":         request_map,
-                    "namespaceObject": namespace_object,
-                    "paramRef":        param_ref,
+                    "object":    object,
+                    "oldObject": old_object,
+                    "request":   request_map,
+                    "paramRef":  param_ref,
                 }))
             }
             ValidateRequest::Raw(_raw) => {
@@ -248,9 +216,10 @@ impl Runtime<'_> {
     /// is consumed by the compiled wasm, but a malformed value would only
     /// surface on the first request; validating it here fails fast at load
     /// time instead. On top of that, it warns -- without failing validation
-    /// -- when a `paramKind` grant is missing.
+    /// -- when a `paramKind` grant, or a `namespaceObject` grant, is missing.
     pub fn validate_settings(&self, settings: String) -> SettingsValidationResponse {
-        match validate_settings_json(&settings, self.0.eval_ctx()) {
+        let references_namespace_object = self.0.references_vap_variable("namespaceObject");
+        match validate_settings_json(&settings, self.0.eval_ctx(), references_namespace_object) {
             Ok(()) => SettingsValidationResponse {
                 valid: true,
                 message: None,
@@ -269,11 +238,32 @@ impl Runtime<'_> {
 /// Kept as a free function (rather than a `Runtime` method) so it only
 /// depends on `&EvaluationContext`, making it unit-testable without a real
 /// `Stack` (which requires a compiled wasm module).
-fn validate_settings_json(settings: &str, eval_ctx: &EvaluationContext) -> Result<(), String> {
+///
+/// `references_namespace_object` tells whether the compiled policy may read
+/// `namespaceObject` (from the `ferricel.vap-variables` Wasm custom
+/// section, see `Stack::references_vap_variable`). When it does, and
+/// `v1/Namespace` is not in `eval_ctx`'s allow list, this only warns: the
+/// compiled module fetches the Namespace itself via `kw.k8s.get`, and that
+/// call will be denied at evaluation time (see
+/// `EvaluationContext::can_access_kubernetes_resource`), but the
+/// administrator may withhold the grant on purpose.
+fn validate_settings_json(
+    settings: &str,
+    eval_ctx: &EvaluationContext,
+    references_namespace_object: bool,
+) -> Result<(), String> {
     let settings_json: Value = serde_json::from_str(settings)
         .map_err(|e| format!("cannot parse policy settings as JSON: {e}"))?;
 
     FailurePolicy::from_value(settings_json.get("failurePolicy"))?;
+
+    if references_namespace_object && !eval_ctx.can_access_kubernetes_resource("v1", "Namespace") {
+        warn!(
+            "policy may reference namespaceObject, but v1/Namespace is not listed in spec.contextAwareResources; \
+             fetching the Namespace via kw.k8s.get will be denied at evaluation time"
+        );
+    }
+
     validate_params(&settings_json, eval_ctx)
 }
 
@@ -499,58 +489,6 @@ fn validate_params(settings: &Value, eval_ctx: &EvaluationContext) -> Result<(),
     Ok(())
 }
 
-fn fetch_namespace_object(
-    namespace: Option<&str>,
-    eval_ctx: &EvaluationContext,
-) -> Result<Value, String> {
-    let namespace = namespace.unwrap_or("");
-
-    if namespace.is_empty() {
-        return Ok(Value::Null);
-    }
-
-    // Intentionally bypasses the `kubernetes/get_resource` host-capability and
-    // Kubernetes-resource authorization gate (see
-    // `runtimes::callback::host_callback_typed`): this fetch implements VAP's
-    // built-in `namespaceObject` CEL binding, which is runtime infrastructure
-    // rather than a policy-invoked capability. Gating it would force every
-    // ferricel policy evaluating a namespaced resource to be explicitly
-    // granted access to `v1/Namespace`, even though the policy itself never
-    // calls `kw.k8s.get`/`list`.
-    let channel = match &eval_ctx.callback_channel {
-        Some(ch) => ch,
-        None => {
-            return Err(
-                "cannot fetch namespaceObject: callback channel is not available".to_string(),
-            );
-        }
-    };
-
-    let (tx, rx) = oneshot::channel::<anyhow::Result<crate::callback_requests::CallbackResponse>>();
-    let req = CallbackRequest {
-        request: CallbackRequestType::KubernetesGetResource {
-            api_version: "v1".to_string(),
-            kind: "Namespace".to_string(),
-            name: namespace.to_string(),
-            namespace: None,
-            disable_cache: false,
-            field_masks: None,
-        },
-        response_channel: tx,
-    };
-
-    channel
-        .try_send(req)
-        .map_err(|e| format!("failed to send namespace fetch request: {e}"))?;
-
-    match rx.blocking_recv() {
-        Ok(Ok(response)) => serde_json::from_slice(&response.payload)
-            .map_err(|e| format!("failed to deserialize namespace object: {e}")),
-        Ok(Err(e)) => Err(format!("failed to fetch namespace object: {e}")),
-        Err(e) => Err(format!("namespace fetch channel closed: {e}")),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -588,14 +526,15 @@ mod tests {
     #[case::unknown_value(json!({"failurePolicy": "Sometimes"}))]
     #[case::wrong_type(json!({"failurePolicy": true}))]
     fn failure_policy_rejects_invalid_values(#[case] settings: serde_json::Value) {
-        let err = validate_settings_json(&settings.to_string(), &EvaluationContext::default())
-            .expect_err("expected an error for an invalid failurePolicy");
+        let err =
+            validate_settings_json(&settings.to_string(), &EvaluationContext::default(), false)
+                .expect_err("expected an error for an invalid failurePolicy");
         assert_eq!(err, "failurePolicy must be either 'Fail' or 'Ignore'");
     }
 
     #[test]
     fn validate_settings_json_invalid_json_is_rejected() {
-        let err = validate_settings_json("not json", &EvaluationContext::default())
+        let err = validate_settings_json("not json", &EvaluationContext::default(), false)
             .expect_err("expected an error for invalid JSON");
         assert!(
             err.contains("cannot parse policy settings as JSON"),
@@ -611,6 +550,14 @@ mod tests {
     /// A complete `paramRef`, used to pair with the `paramKind` under test.
     fn named_param_ref() -> serde_json::Value {
         json!({"name": "replica-limit", "parameterNotFoundAction": "Deny"})
+    }
+
+    /// The resource `namespaceObject` fetches via `kw.k8s.get`.
+    fn namespace_resource() -> ContextAwareResource {
+        ContextAwareResource {
+            api_version: "v1".to_string(),
+            kind: "Namespace".to_string(),
+        }
     }
 
     #[rstest]
@@ -866,5 +813,30 @@ mod tests {
 
         validate_params(&settings, &EvaluationContext::default())
             .expect("a missing grant should only warn, not fail settings validation");
+    }
+
+    /// The `namespaceObject` grant follows the same contract as the
+    /// `paramKind` grant above: a compiled policy that may read
+    /// `namespaceObject` but has no `v1/Namespace` grant must still load.
+    /// The compiled module fetches the Namespace itself via `kw.k8s.get`,
+    /// and that call will be denied at evaluation time, but only a
+    /// `tracing::warn!` reports it here, which this test can't assert on
+    /// directly. What it pins is that validation succeeds regardless of
+    /// whether the policy references `namespaceObject` and whether the
+    /// grant is present.
+    #[rstest]
+    #[case::referenced_and_not_granted(true, BTreeSet::new())]
+    #[case::referenced_and_granted(true, BTreeSet::from([namespace_resource()]))]
+    #[case::not_referenced_and_not_granted(false, BTreeSet::new())]
+    fn validate_settings_json_is_ok_regardless_of_the_namespace_object_grant(
+        #[case] references_namespace_object: bool,
+        #[case] allow_list: BTreeSet<ContextAwareResource>,
+    ) {
+        validate_settings_json(
+            "{}",
+            &eval_ctx_with_allow_list(allow_list),
+            references_namespace_object,
+        )
+        .expect("a missing v1/Namespace grant should only warn, not fail settings validation");
     }
 }

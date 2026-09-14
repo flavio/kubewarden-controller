@@ -32,9 +32,13 @@ impl Stack {
     /// Whether the compiled policy may reference the well-known VAP variable
     /// `name` (e.g. `"namespaceObject"`).
     ///
+    /// Used at settings-validation time to warn when a Kubernetes resource
+    /// that the compiled wasm may need is not granted (see
+    /// `validate_settings_json`'s `references_namespace_object` parameter).
+    ///
     /// Returns `true` conservatively when this information isn't available
     /// (see [`StackPre`]'s `vap_variables` field docs), so that callers
-    /// default to their historical, always-provide behavior in that case.
+    /// default to warning rather than silently missing a real gap.
     pub(crate) fn references_vap_variable(&self, name: &str) -> bool {
         self.vap_variables
             .as_deref()
