@@ -522,6 +522,29 @@ mod tests {
             "spec.contextAwareResources should contain the param resource (v1/ConfigMap), got: {:?}",
             cap.spec.context_aware_resources
         );
+
+        // The compiled module fetches the params itself, by name
+        // (`kw.k8s.get`) or by label selector (`kw.k8s.list`). Which one
+        // runs depends on the binding, not on the policy, so the module
+        // records both and metadata.yml must grant both. `kw.k8s.list` maps
+        // to the two list capabilities because the module lists across all
+        // namespaces when neither paramRef nor the request has one.
+        let caps = metadata
+            .host_capabilities
+            .as_ref()
+            .expect("host_capabilities should be Some for a policy with paramKind");
+        let expected_caps: BTreeSet<String> = [
+            "kubernetes/get_resource",
+            "kubernetes/list_resources_by_namespace",
+            "kubernetes/list_resources_all",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        assert_eq!(
+            caps, &expected_caps,
+            "a paramKind policy must be granted both get and list"
+        );
     }
 
     #[test]

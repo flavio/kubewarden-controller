@@ -5,7 +5,9 @@ use serde_json::Value;
 use crate::{
     callback_requests::CallbackRequestType,
     evaluation_context::EvaluationContext,
-    runtimes::ferricel::extensions::helpers::{call_host, parse_field_masks, str_field},
+    runtimes::ferricel::extensions::helpers::{
+        call_host, optional_namespace, parse_field_masks, str_field,
+    },
 };
 
 pub(crate) fn get_handler(
@@ -15,7 +17,7 @@ pub(crate) fn get_handler(
     let api_version = str_field(builder_map, "apiVersion")?;
     let kind = str_field(builder_map, "kind")?;
     let name = str_field(builder_map, "name")?;
-    let namespace = builder_map["namespace"].as_str().map(str::to_owned);
+    let namespace = optional_namespace(builder_map);
     let field_masks = parse_field_masks(builder_map);
 
     call_host(
@@ -43,13 +45,13 @@ pub(crate) fn list_handler(
     let field_selector = builder_map["fieldSelector"].as_str().map(str::to_owned);
     let field_masks = parse_field_masks(builder_map);
 
-    let (operation, request_type) = if let Some(namespace) = builder_map["namespace"].as_str() {
+    let (operation, request_type) = if let Some(namespace) = optional_namespace(builder_map) {
         (
             "list_resources_by_namespace",
             CallbackRequestType::KubernetesListResourceNamespace {
                 api_version,
                 kind,
-                namespace: namespace.to_owned(),
+                namespace,
                 label_selector,
                 field_selector,
                 field_masks,
