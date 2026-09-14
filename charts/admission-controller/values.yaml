@@ -182,6 +182,7 @@ namespacedPoliciesAllowedResources: # @schema type:[array, null]
       - deployments
       - statefulsets
       - replicasets
+      - daemonsets
   - apiGroups: ["batch"]
     resources:
       - jobs
