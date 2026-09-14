@@ -17,7 +17,7 @@ use tracing::warn;
 /// Kubernetes runs the policy on an object only when the object matches
 /// two selectors at the same time: the VAP `matchConstraints` selector
 /// and the binding `matchResources` selector. A missing selector matches
-/// every object, so an absent side adds no condition.
+/// every object. An absent side adds no condition.
 ///
 /// A `LabelSelector` already combines `matchLabels` and `matchExpressions`
 /// with AND logic. This function merges two selectors into one selector
@@ -30,9 +30,20 @@ use tracing::warn;
 ///
 /// When a key has a different value on each side, the merged selector
 /// can match no object: an object cannot have two different values for
-/// the same label at once. kwctl returns an error instead of building
-/// that selector. `field` names the selector in the error message, for
-/// example `"namespaceSelector"`.
+/// the same label at the same time. kwctl returns an error instead of
+/// building that selector. `field` names the selector in the error
+/// message, for example `"namespaceSelector"`.
+///
+/// This AND merge gives the correct result only when both selectors read
+/// the same set of labels on the same object at match time. That is true
+/// for `namespaceSelector`: both sides read the labels of the one
+/// Namespace object the request targets. It is not true for
+/// `objectSelector`. On an UPDATE request, Kubernetes evaluates each
+/// object selector on its own, against the old object or the new object
+/// (`match(old) || match(new)`). ANDing the two merged predicates does
+/// not give the same result as ANDing the two original ones. Do not use
+/// this function for `objectSelector`. See the dedicated handling in
+/// `VapData::new`.
 fn and_label_selectors(
     field: &str,
     a: Option<LabelSelector>,
@@ -57,7 +68,7 @@ fn and_label_selectors(
             }
             Some(a_value) => {
                 return Err(anyhow!(
-                    "{field}: the ValidatingAdmissionPolicy sets the label '{key}' to '{a_value}', and the ValidatingAdmissionPolicyBinding sets it to '{b_value}'. A selector with both values matches no object. Set the same value on both sides, or remove the label from one side"
+                    "{field}: the ValidatingAdmissionPolicy sets the label '{key}' to '{a_value}'. The ValidatingAdmissionPolicyBinding sets it to '{b_value}'. A selector with both values matches no object. Set the same value on both sides, or remove the label from one side"
                 ));
             }
             None => {
@@ -78,6 +89,58 @@ fn and_label_selectors(
             Some(match_labels)
         },
     }))
+}
+
+/// Whether `selector` sets no condition: both `matchLabels` and
+/// `matchExpressions` are absent or empty. Such a selector matches every
+/// object, the same as a missing selector. Callers treat the two cases
+/// the same way.
+fn label_selector_is_empty(selector: &LabelSelector) -> bool {
+    selector
+        .match_labels
+        .as_ref()
+        .is_none_or(|labels| labels.is_empty())
+        && selector
+            .match_expressions
+            .as_ref()
+            .is_none_or(|exprs| exprs.is_empty())
+}
+
+/// Combine a VAP `objectSelector` and a binding `objectSelector` into the
+/// single selector a `ClusterAdmissionPolicy` can hold.
+///
+/// Unlike `namespaceSelector` (see `and_label_selectors`), an AND merge of
+/// the two `objectSelector`s does not give the same result as what
+/// Kubernetes runs. On an UPDATE request, Kubernetes evaluates each
+/// selector on its own, against the old object or the new object:
+/// `(A(old) || A(new)) && (B(old) || B(new))`. Merging first and then
+/// applying old-or-new gives a different result:
+/// `(A && B)(old) || (A && B)(new)`. The merged form can miss an UPDATE
+/// that changes which object version satisfies which selector. It can
+/// skip validation that the original VAP and binding pair would have
+/// run.
+///
+/// kwctl has no target field that can hold two independent selectors. So
+/// when both sides set a nonempty `objectSelector`, kwctl returns an
+/// error instead of building a merge that gives the wrong result. An
+/// empty selector (present but with no `matchLabels` and no
+/// `matchExpressions`) matches every object. kwctl treats it as absent
+/// and does not raise the error for it.
+fn combine_object_selectors(
+    vap_selector: Option<LabelSelector>,
+    binding_selector: Option<LabelSelector>,
+) -> Result<Option<LabelSelector>> {
+    let vap_selector = vap_selector.filter(|s| !label_selector_is_empty(s));
+    let binding_selector = binding_selector.filter(|s| !label_selector_is_empty(s));
+
+    match (vap_selector, binding_selector) {
+        (Some(_), Some(_)) => Err(anyhow!(
+            "objectSelector: both the ValidatingAdmissionPolicy (spec.matchConstraints.objectSelector) and the ValidatingAdmissionPolicyBinding (spec.matchResources.objectSelector) set a selector. On an UPDATE request, Kubernetes matches each selector against the old object or the new object on its own. A single ClusterAdmissionPolicy.spec.objectSelector cannot express that pair. A merge of the two would skip UPDATE requests that the original VAP and binding validate. Remove objectSelector from one side. Keep it only on the VAP, or only on the binding"
+        )),
+        (Some(vap_selector), None) => Ok(Some(vap_selector)),
+        (None, Some(binding_selector)) => Ok(Some(binding_selector)),
+        (None, None) => Ok(None),
+    }
 }
 
 pub(crate) fn vap(
@@ -111,20 +174,21 @@ pub(crate) fn vap(
     Ok(())
 }
 
-/// Warn that this policy calls `kw.k8s`, which reads Kubernetes resources at
-/// evaluation time. The `granted` set holds the resources currently allowed
-/// in `spec.contextAwareResources` and `metadata.yml`. This set only comes
-/// from `paramKind` and `namespaceObject`, so it can miss resources the
-/// policy reads through an explicit `kw.k8s` call in its own CEL.
+/// Warn that this policy calls `kw.k8s`. This call reads Kubernetes
+/// resources at evaluation time. The `granted` set holds the resources
+/// allowed in `spec.contextAwareResources` and in `metadata.yml`. This set
+/// comes only from `paramKind` and `namespaceObject`. It can miss
+/// resources that the policy reads through an explicit `kw.k8s` call in
+/// its own CEL.
 ///
-/// The runtime denies a `kw.k8s` call when its apiVersion and kind are not in
-/// `granted` (see `EvaluationContext::can_access_kubernetes_resource`). The
-/// user must review the generated `contextAwareResources` list and add each
-/// missing apiVersion and kind by hand before they apply the policy.
+/// The runtime denies a `kw.k8s` call when its apiVersion and kind are not
+/// in `granted` (see `EvaluationContext::can_access_kubernetes_resource`).
+/// Review the generated `contextAwareResources` list. Add each missing
+/// apiVersion and kind by hand before you apply the policy.
 pub(crate) fn warn_kw_k8s_requires_grants(granted: &BTreeSet<ContextAwareResource>) {
     if granted.is_empty() {
         warn!(
-            "this policy calls kw.k8s.*, but spec.contextAwareResources is empty. Every kw.k8s get/list call will be denied at evaluation time. Add each apiVersion/kind that the policy reads through kw.k8s to spec.contextAwareResources in the generated ClusterAdmissionPolicy. Add the same entries to contextAwareResources in metadata.yml, if that file was generated."
+            "this policy calls kw.k8s.*. spec.contextAwareResources is empty. At evaluation time, the runtime will deny every kw.k8s get and list call. Add each apiVersion/kind that the policy reads through kw.k8s to spec.contextAwareResources in the generated ClusterAdmissionPolicy. If kwctl generated a metadata.yml file, add the same entries to contextAwareResources in that file."
         );
     } else {
         let granted_list = granted
@@ -133,7 +197,7 @@ pub(crate) fn warn_kw_k8s_requires_grants(granted: &BTreeSet<ContextAwareResourc
             .collect::<Vec<_>>()
             .join(", ");
         warn!(
-            "this policy calls kw.k8s.*. Only {granted_list} is granted through spec.contextAwareResources, derived from paramKind and namespaceObject. Add every other apiVersion/kind that the policy reads through kw.k8s to spec.contextAwareResources by hand, and to metadata.yml if that file was generated. Without this, the runtime denies the call at evaluation time."
+            "this policy calls kw.k8s.*. spec.contextAwareResources grants only {granted_list}, derived from paramKind and namespaceObject. Add every other apiVersion/kind that the policy reads through kw.k8s to spec.contextAwareResources by hand. If kwctl generated a metadata.yml file, add the same entries there. Without this step, the runtime denies the call at evaluation time."
         );
     }
 }
@@ -141,16 +205,16 @@ pub(crate) fn warn_kw_k8s_requires_grants(granted: &BTreeSet<ContextAwareResourc
 /// Build the base `spec.contextAwareResources` allow list for a VAP: the
 /// resource named by `paramKind` (from `vap_data.param_resource`), and
 /// `v1/Namespace` when `uses_namespace_object` is true. Without these
-/// grants, the compiled/interpreted policy would be denied access when it
+/// grants, the compiled or interpreted policy is denied access when it
 /// fetches the param resource via `paramRef`, or the Namespace via
 /// `namespaceObject`, at evaluation time (see
 /// `EvaluationContext::can_access_kubernetes_resource`).
 ///
-/// Both output paths call this with the same shape of input; only how
-/// `uses_namespace_object` is computed differs (see the field docs on
-/// [`VapData::uses_namespace_object`]). A `warn!` announces every grant
-/// added, so the administrator reviews it before applying the generated
-/// policy.
+/// Both output paths call this function with the same shape of input.
+/// Only how `uses_namespace_object` is computed differs (see the field
+/// docs on [`VapData::uses_namespace_object`]). A `warn!` call announces
+/// every grant added, so the administrator can review it before they
+/// apply the generated policy.
 pub(crate) fn base_context_aware_resources(
     vap_data: &VapData,
     uses_namespace_object: bool,
@@ -159,7 +223,7 @@ pub(crate) fn base_context_aware_resources(
 
     if let Some(param_resource) = &vap_data.param_resource {
         warn!(
-            "granting access to {}/{} via spec.contextAwareResources (required by paramKind); review before applying",
+            "granting access to {}/{} via spec.contextAwareResources. paramKind requires this grant. Review it before you apply the policy",
             param_resource.api_version, param_resource.kind
         );
         context_aware_resources.insert(param_resource.clone());
@@ -167,7 +231,7 @@ pub(crate) fn base_context_aware_resources(
 
     if uses_namespace_object {
         warn!(
-            "granting access to v1/Namespace via spec.contextAwareResources (required by namespaceObject); review before applying"
+            "granting access to v1/Namespace via spec.contextAwareResources. namespaceObject requires this grant. Review it before you apply the policy"
         );
         context_aware_resources.insert(ContextAwareResource {
             api_version: "v1".to_string(),
@@ -185,9 +249,9 @@ pub(crate) fn base_context_aware_resources(
 /// host extensions from the `ferricel.extensions` section of the module.
 ///
 /// A text search can find `kw.k8s` inside a string literal and report a
-/// false positive. It cannot miss a real use in valid CEL, so this check
-/// never produces a false negative. A false positive only causes an extra
-/// warning. It does not hide a real one.
+/// false positive. It cannot miss a real use in valid CEL. So this check
+/// never produces a false negative. A false positive only causes an
+/// extra warning. It does not hide a real one.
 fn vap_uses_kw_k8s(vap: &ValidatingAdmissionPolicy) -> bool {
     cel_expressions(vap).any(|expr| expr.contains("kw.k8s"))
 }
@@ -195,14 +259,15 @@ fn vap_uses_kw_k8s(vap: &ValidatingAdmissionPolicy) -> bool {
 /// Check whether any CEL expression in `vap` mentions `namespaceObject`.
 ///
 /// Since ferricel 0.11, a compiled VAP that reads `namespaceObject`
-/// resolves it on its own, through a `kw.k8s.get` call that the runtime
-/// gates the same way as every other Kubernetes read: the policy needs the
-/// `kubernetes/get_resource` host capability and a `v1/Namespace` grant in
-/// `spec.contextAwareResources`. `ferricel_core::vap_variables_used` gives
-/// the compiled path an exact answer (see `compiled::vap_compiled`); the
-/// interpreted path has no compiled module to inspect, so it falls back to
-/// this same text search used for `kw.k8s` (see `vap_uses_kw_k8s`), with
-/// the same false-positive-only guarantee.
+/// resolves it on its own, through a `kw.k8s.get` call. The runtime gates
+/// this call the same way it gates every other Kubernetes read: the
+/// policy needs the `kubernetes/get_resource` host capability and a
+/// `v1/Namespace` grant in `spec.contextAwareResources`.
+/// `ferricel_core::vap_variables_used` gives the compiled path an exact
+/// answer (see `compiled::vap_compiled`). The interpreted path has no
+/// compiled module to inspect. So it falls back to the same text search
+/// used for `kw.k8s` (see `vap_uses_kw_k8s`), with the same
+/// false-positive-only guarantee.
 fn vap_uses_namespace_object(vap: &ValidatingAdmissionPolicy) -> bool {
     cel_expressions(vap).any(|expr| expr.contains("namespaceObject"))
 }
@@ -342,11 +407,13 @@ impl VapData {
         // Kubernetes runs the policy on a request only when the request
         // matches two match sets at the same time: `matchConstraints`
         // (set on the VAP) and `matchResources` (set on the binding).
-        // See the function `and_label_selectors` for more information.
-        // kwctl must merge or reject every field that can narrow that
-        // match. If kwctl does not, the generated ClusterAdmissionPolicy
-        // can run against resources that the original VAP and binding
-        // pair excluded.
+        // See the functions `and_label_selectors` (namespaceSelector,
+        // exact AND merge) and `combine_object_selectors` (objectSelector,
+        // rejected instead of merged) for more information. kwctl must
+        // merge or reject every field that can narrow that match. If
+        // kwctl does not, the generated ClusterAdmissionPolicy can run
+        // against resources that the original VAP and binding pair
+        // excluded.
         let vap_match_constraints = vap_spec.match_constraints.clone().unwrap_or_default();
         let binding_match_resources = vap_binding_spec.match_resources.unwrap_or_default();
 
@@ -397,8 +464,7 @@ impl VapData {
             vap_match_constraints.namespace_selector.clone(),
             binding_match_resources.namespace_selector,
         )?;
-        let object_selector = and_label_selectors(
-            "objectSelector",
+        let object_selector = combine_object_selectors(
             vap_match_constraints.object_selector.clone(),
             binding_match_resources.object_selector,
         )?;
@@ -440,7 +506,7 @@ pub(crate) mod tests {
     };
     use rstest::*;
 
-    use super::{VapData, and_label_selectors};
+    use super::{VapData, and_label_selectors, combine_object_selectors, label_selector_is_empty};
 
     pub(crate) const CEL_POLICY_MODULE: &str = "ghcr.io/kubewarden/policies/cel-policy:latest";
 
@@ -771,6 +837,155 @@ pub(crate) mod tests {
         );
     }
 
+    #[rstest]
+    fn new_keeps_vap_object_selector_that_the_binding_does_not_set(
+        vap_pair: (ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding),
+    ) {
+        let (mut vap, vap_binding) = vap_pair;
+        vap_match_constraints(&mut vap).object_selector = Some(label_selector(&[("app", "web")]));
+
+        let vap_data = VapData::new(vap, vap_binding).expect("VapData::new should succeed");
+
+        assert_eq!(
+            vap_data
+                .object_selector
+                .expect("object_selector should be present")
+                .match_labels,
+            Some(BTreeMap::from([("app".to_string(), "web".to_string())]))
+        );
+    }
+
+    #[rstest]
+    #[case::empty_struct(LabelSelector { match_labels: None, match_expressions: None }, true)]
+    #[case::empty_match_labels(
+        LabelSelector { match_labels: Some(BTreeMap::new()), match_expressions: None },
+        true
+    )]
+    #[case::empty_match_expressions(
+        LabelSelector { match_labels: None, match_expressions: Some(Vec::new()) },
+        true
+    )]
+    #[case::nonempty_match_labels(label_selector(&[("env", "prod")]), false)]
+    #[case::nonempty_match_expressions(
+        expressions_selector(vec![in_requirement("env", "prod")]),
+        false
+    )]
+    fn label_selector_is_empty_cases(#[case] selector: LabelSelector, #[case] expected: bool) {
+        assert_eq!(label_selector_is_empty(&selector), expected);
+    }
+
+    #[rstest]
+    #[case::both_absent(None, None)]
+    #[case::only_vap(Some(label_selector(&[("env", "prod")])), None)]
+    #[case::only_binding(None, Some(label_selector(&[("env", "prod")])))]
+    #[case::vap_selector_is_empty(
+        Some(LabelSelector { match_labels: None, match_expressions: None }),
+        Some(label_selector(&[("env", "prod")]))
+    )]
+    #[case::binding_selector_is_empty(
+        Some(label_selector(&[("env", "prod")])),
+        Some(LabelSelector { match_labels: None, match_expressions: None })
+    )]
+    fn combine_object_selectors_accepts_at_most_one_nonempty_selector(
+        #[case] vap: Option<LabelSelector>,
+        #[case] binding: Option<LabelSelector>,
+    ) {
+        combine_object_selectors(vap, binding).expect("at most one side sets a selector");
+    }
+
+    #[rstest]
+    #[case::disjoint_selectors(
+        label_selector(&[("protected", "yes")]),
+        label_selector(&[("team", "security")])
+    )]
+    #[case::same_key_same_value(
+        label_selector(&[("env", "prod")]),
+        label_selector(&[("env", "prod")])
+    )]
+    fn combine_object_selectors_rejects_two_nonempty_selectors(
+        #[case] vap: LabelSelector,
+        #[case] binding: LabelSelector,
+    ) {
+        // Even when the two selectors agree (same key, same value), kwctl
+        // still rejects the pair: on an UPDATE the two sides are matched
+        // independently against the old and the new object (see
+        // `combine_object_selectors`), so the rule stays simple rather
+        // than trying to prove the merge sound case by case.
+        let err = match combine_object_selectors(Some(vap), Some(binding)) {
+            Ok(_) => panic!("two nonempty objectSelectors should be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("objectSelector"), "{err}");
+    }
+
+    /// A minimal model of how Kubernetes matches `matchLabels` selectors,
+    /// used only by the test below. It does not exercise any production
+    /// code.
+    fn matches_labels(selector: &LabelSelector, labels: &BTreeMap<String, String>) -> bool {
+        selector
+            .match_labels
+            .as_ref()
+            .unwrap_or(&BTreeMap::new())
+            .iter()
+            .all(|(k, v)| labels.get(k) == Some(v))
+    }
+
+    /// How Kubernetes matches an `objectSelector` on an UPDATE request: the
+    /// selector matches when it matches the old object or the new object.
+    /// See `admission.NewMatcher` / the VAP admission plugin in
+    /// `k8s.io/apiserver`.
+    fn k8s_object_selector_matches(
+        selector: &LabelSelector,
+        old: &BTreeMap<String, String>,
+        new: &BTreeMap<String, String>,
+    ) -> bool {
+        matches_labels(selector, old) || matches_labels(selector, new)
+    }
+
+    /// Pins the report's counterexample: merging the VAP and binding
+    /// `objectSelector` with AND, then applying old-or-new matching to the
+    /// merged selector, is not the same predicate as ANDing the two
+    /// old-or-new matches Kubernetes actually runs. This test builds no
+    /// `VapData` and calls no scaffold code; it only documents, with a
+    /// small label matcher, why `combine_object_selectors` rejects the
+    /// pair instead of merging it.
+    #[test]
+    fn merging_object_selectors_would_change_which_update_requests_match() {
+        let vap_selector = label_selector(&[("protected", "yes")]);
+        let binding_selector = label_selector(&[("team", "security")]);
+
+        let old = BTreeMap::from([
+            ("protected".to_string(), "yes".to_string()),
+            ("team".to_string(), "other".to_string()),
+        ]);
+        let new = BTreeMap::from([
+            ("protected".to_string(), "no".to_string()),
+            ("team".to_string(), "security".to_string()),
+        ]);
+
+        // The original VAP + binding pair: each selector is matched
+        // independently against old and new, and the two results are
+        // ANDed.
+        let original = k8s_object_selector_matches(&vap_selector, &old, &new)
+            && k8s_object_selector_matches(&binding_selector, &old, &new);
+        assert!(
+            original,
+            "the original VAP and binding pair should validate this UPDATE"
+        );
+
+        // The merged selector kwctl would build if it ANDed the two sides
+        // first (what `and_label_selectors` does for namespaceSelector).
+        let merged =
+            and_label_selectors("objectSelector", Some(vap_selector), Some(binding_selector))
+                .expect("disjoint labels merge without conflict")
+                .expect("both sides are present");
+        let merged_matches = k8s_object_selector_matches(&merged, &old, &new);
+        assert!(
+            !merged_matches,
+            "a merged objectSelector would (wrongly) skip this UPDATE, which is exactly why combine_object_selectors rejects the pair instead of merging it"
+        );
+    }
+
     type MutatePair = fn(&mut ValidatingAdmissionPolicy, &mut ValidatingAdmissionPolicyBinding);
 
     #[rstest]
@@ -822,6 +1037,31 @@ pub(crate) mod tests {
                 Some(label_selector(&[("kubernetes.io/metadata.name", "other")]));
         }) as MutatePair,
         Some("namespaceSelector")
+    )]
+    #[case::vap_and_binding_object_selector_both_set(
+        // Neither fixture sets objectSelector. Setting it on both sides
+        // is rejected: see `combine_object_selectors`.
+        (|vap: &mut ValidatingAdmissionPolicy, binding: &mut ValidatingAdmissionPolicyBinding| {
+            vap_match_constraints(vap).object_selector =
+                Some(label_selector(&[("protected", "yes")]));
+            binding_match_resources(binding).object_selector =
+                Some(label_selector(&[("team", "security")]));
+        }) as MutatePair,
+        Some("objectSelector")
+    )]
+    #[case::vap_object_selector_and_empty_binding_object_selector_is_allowed(
+        // An empty objectSelector on the binding matches every object,
+        // exactly like an absent one, so it does not conflict with the
+        // VAP's objectSelector.
+        (|vap: &mut ValidatingAdmissionPolicy, binding: &mut ValidatingAdmissionPolicyBinding| {
+            vap_match_constraints(vap).object_selector =
+                Some(label_selector(&[("protected", "yes")]));
+            binding_match_resources(binding).object_selector = Some(LabelSelector {
+                match_labels: None,
+                match_expressions: None,
+            });
+        }) as MutatePair,
+        None
     )]
     fn new_checks_match_fields(
         vap_pair: (ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding),
