@@ -18,7 +18,7 @@ use tracing::warn;
 
 use crate::scaffold::{
     kubewarden_crds::{ClusterAdmissionPolicy, ClusterAdmissionPolicySpec},
-    vap::{VapData, warn_kw_k8s_requires_grants},
+    vap::{VapData, base_context_aware_resources, vap_uses_kw_k8s, warn_kw_k8s_requires_grants},
 };
 
 /// Derive the path of the `metadata.yml` file that sits alongside `wasm_path`.
@@ -152,18 +152,35 @@ pub(crate) fn vap_compiled(
     let caps = ferricel_host_capabilities(&used);
     let host_capabilities = if caps.is_empty() { None } else { Some(caps) };
 
-    let context_aware_resources = context_aware_resources_from_param(&vap_data);
+    // Since ferricel 0.11, a compiled module that reads `namespaceObject`
+    // resolves it on its own via `kw.k8s.get` (recorded in `used` above,
+    // which is why `host_capabilities` already grants `kubernetes/get_resource`
+    // in that case). Read the exact answer from the module's
+    // `ferricel.vap-variables` section; fall back to `vap_data`'s
+    // best-effort text search (see `VapData::uses_namespace_object`) if the
+    // section can't be read, e.g. a module built by an older ferricel.
+    let uses_namespace_object = match ferricel_core::vap_variables_used(&wasm_bytes) {
+        Ok(vars) => vars.iter().any(|v| v == "namespaceObject"),
+        Err(e) => {
+            warn!(
+                error = e.to_string().as_str(),
+                "cannot read VAP variables from the compiled module; falling back to a text search for namespaceObject"
+            );
+            vap_data.uses_namespace_object
+        }
+    };
+
+    let context_aware_resources = base_context_aware_resources(&vap_data, uses_namespace_object);
 
     // The `ferricel.extensions` section records every host extension the
-    // compiled module actually calls, including `kw.k8s.get`/`kw.k8s.list`.
-    // Unlike `paramKind`, there is no static way (short of parsing the CEL
-    // AST ourselves) to know *which* apiVersion/kind those calls target, so
-    // we can only warn that `context_aware_resources` may need to be
-    // extended by hand, not derive the grants automatically.
-    if used
-        .iter()
-        .any(|extension| extension.namespace.as_deref() == Some("kw.k8s"))
-    {
+    // compiled module actually calls. `paramKind` and `namespaceObject`
+    // already have their grants derived automatically above; only an
+    // explicit `kw.k8s.*` call in the policy's own CEL can target an
+    // apiVersion/kind this scaffold cannot derive (there is no static way,
+    // short of parsing the CEL AST ourselves, to know which one), so the
+    // warning is gated on that (a best-effort text search, see
+    // `vap_uses_kw_k8s`) rather than on any use of `kw.k8s` in `used`.
+    if vap_uses_kw_k8s(&vap_data.vap) {
         warn_kw_k8s_requires_grants(&context_aware_resources);
     }
 
@@ -209,23 +226,6 @@ pub(crate) fn vap_compiled(
             settings: vap_data.settings,
         },
     })
-}
-
-/// Build the `spec.contextAwareResources` allow list granting the policy
-/// access to the resource named by `paramKind`, when present. Without this
-/// grant, a parameterized policy would be denied access to the resource it
-/// fetches via `paramRef` at evaluation time (see
-/// `EvaluationContext::can_access_kubernetes_resource`).
-fn context_aware_resources_from_param(vap_data: &VapData) -> BTreeSet<ContextAwareResource> {
-    let mut context_aware_resources = BTreeSet::new();
-    if let Some(param_resource) = &vap_data.param_resource {
-        warn!(
-            "granting access to {}/{} via spec.contextAwareResources (required by paramKind); review before applying",
-            param_resource.api_version, param_resource.kind
-        );
-        context_aware_resources.insert(param_resource.clone());
-    }
-    context_aware_resources
 }
 
 /// Write a `metadata.yml` file at `metadata_path`. Existence of the file was
@@ -544,6 +544,52 @@ mod tests {
         assert_eq!(
             caps, &expected_caps,
             "a paramKind policy must be granted both get and list"
+        );
+    }
+
+    /// Since ferricel 0.11 a compiled module that reads `namespaceObject`
+    /// resolves it on its own via `kw.k8s.get`, the same way it resolves
+    /// `params`. The scaffold must grant `v1/Namespace`, or every namespaced
+    /// evaluation would be denied.
+    #[test]
+    fn metadata_yml_contains_context_aware_resources_for_namespace_object() {
+        let dir = TempDir::new().unwrap();
+        let wasm_path = dir.path().join("policy.wasm");
+
+        let vap_data = open_vap_data("vap/vap-with-namespace-object.yml", "vap/vap-binding.yml");
+        let cap = vap_compiled(vap_data, &wasm_path, false).unwrap();
+
+        let metadata_path = dir.path().join("metadata.yml");
+        let metadata: Metadata =
+            serde_yaml::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
+
+        let expected_resource = ContextAwareResource {
+            api_version: "v1".to_string(),
+            kind: "Namespace".to_string(),
+        };
+
+        assert!(
+            metadata
+                .context_aware_resources
+                .contains(&expected_resource),
+            "context_aware_resources should contain v1/Namespace, got: {:?}",
+            metadata.context_aware_resources
+        );
+        assert!(
+            cap.spec
+                .context_aware_resources
+                .contains(&expected_resource),
+            "spec.contextAwareResources should contain v1/Namespace, got: {:?}",
+            cap.spec.context_aware_resources
+        );
+
+        let caps = metadata
+            .host_capabilities
+            .as_ref()
+            .expect("host_capabilities should be Some for a policy reading namespaceObject");
+        assert!(
+            caps.contains("kubernetes/get_resource"),
+            "expected kubernetes/get_resource in host_capabilities, got: {caps:?}"
         );
     }
 
