@@ -384,3 +384,6 @@ questions:
     type: boolean
   # Some recommended policies settings are not possible due Rancher limitations.
   # sequence[ is not implemented in rancher/dashboard yet: https://github.com/rancher/dashboard/issues/10826
+  # For the same reason, namespacedPoliciesAllowedResources has no question here.
+  # It is an array of objects with the fields apiGroups and resources. The
+  # Rancher dashboard cannot render this type as a form field.
