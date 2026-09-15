@@ -23,6 +23,9 @@ tests:
       - matchRegex:
           path: data["config.yaml"]
           pattern: "- secrets"
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: "daemonsets"
       - notMatchRegex:
           path: data["config.yaml"]
           pattern: "networkpolicies"
@@ -32,9 +35,6 @@ tests:
       - notMatchRegex:
           path: data["config.yaml"]
           pattern: "ingresses"
-      - notMatchRegex:
-          path: data["config.yaml"]
-          pattern: "daemonsets"
 
   - it: "should render a custom allow list"
     template: controller/controller-config-configmap.yaml
