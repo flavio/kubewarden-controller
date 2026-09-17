@@ -1632,9 +1632,15 @@ spec:
     );
 }
 
-/// A host extension call that the authorization gate denies is a CEL runtime
-/// error. With `failurePolicy: Ignore` the policy is skipped. The gate still
-/// runs: the request must never reach the callback channel.
+/// A host extension call that the authorization gate denies is a CEL
+/// runtime error. With `failurePolicy: Ignore`, the module skips the
+/// validation. The gate still runs. The request must never reach the
+/// callback channel.
+///
+/// The module builds the warning from the extension's error message
+/// alone. It does not restate which extension produced the error
+/// (`kw.oci.manifest`). As a result, the assertion below matches on the
+/// message from the authorization gate, not on the extension name.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_denied_extension_is_ignored_when_failure_policy_is_ignore() {
     let vap = r#"
@@ -1672,8 +1678,10 @@ spec:
     );
     let warnings = response.warnings.as_deref().unwrap_or_default();
     assert!(
-        warnings.iter().any(|w| w.contains("kw.oci.manifest")),
-        "the warning must name the extension that failed, got: {warnings:?}"
+        warnings
+            .iter()
+            .any(|w| w.contains("validation[0]") && w.contains("has not been granted access")),
+        "the warning must name the skipped expression and the denial reason, got: {warnings:?}"
     );
 }
 
@@ -1700,6 +1708,153 @@ async fn test_deadline_exceeded_is_rejected_when_failure_policy_is_ignore() {
     assert!(
         msg.contains("exceeded the allowed execution time"),
         "expected message to mention the execution deadline, got: {msg:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-expression failurePolicy and validation results
+//
+// These tests pin three rules that Kubernetes applies to a
+// ValidatingAdmissionPolicy. The compiled module must follow the same
+// rules. Under `failurePolicy: Ignore`, an error in one expression must
+// not stop the other expressions. A validation that does not evaluate
+// to `true` must reject the request. A `false` matchCondition must win
+// over an error in another matchCondition.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Under `failurePolicy: Ignore`, an error in one `validations`
+/// expression must not hide a `false` result from a later, unrelated
+/// one. The module must skip the expression with the error, record a
+/// warning, and run the next validation.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ignore_does_not_suppress_a_later_independent_denial() {
+    let vap = r#"
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: ignore-does-not-suppress-later-denial
+spec:
+  validations:
+    - expression: "int(object.metadata.annotations['count']) <= 10"
+      message: "unused: the first validation errors, it never actually evaluates to false"
+    - expression: "false"
+      message: "replicas over the limit"
+"#;
+    let wasm = compile_vap(vap);
+    let mut evaluator = build_evaluator(&wasm, None, BTreeSet::new());
+    let settings = settings_from_json(json!({"failurePolicy": "Ignore"}));
+
+    let mut request = cluster_scoped_request();
+    request.object = Some(k8s_openapi::apimachinery::pkg::runtime::RawExtension(
+        json!({
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "cm", "annotations": {"count": "not-a-number"}},
+        }),
+    ));
+
+    let response = tokio::task::block_in_place(|| {
+        evaluator.validate(
+            ValidateRequest::AdmissionRequest(Box::new(request)),
+            &settings,
+        )
+    });
+
+    assert!(
+        !response.allowed,
+        "the second validation's false result must still reject the request, got: {response:?}"
+    );
+    assert_eq!(
+        response.status.as_ref().and_then(|s| s.message.as_deref()),
+        Some("replicas over the limit")
+    );
+    let warnings = response.warnings.as_deref().unwrap_or_default();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("validation[0]") && w.contains("failurePolicy is Ignore")),
+        "expected a warning naming the skipped first validation, got: {warnings:?}"
+    );
+}
+
+/// A `validations` expression that evaluates to a non-boolean value must
+/// reject the request. Kubernetes works the same way. A string, a
+/// number, `null`, an array, or a map is not `true`, so it is not a pass.
+#[rstest]
+#[case::string("'not-a-bool'")]
+#[case::number("1")]
+#[case::null("null")]
+#[case::list("[1, 2]")]
+#[case::map("{'ok': true}")]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_non_boolean_validation_result_is_rejected(#[case] expression: &str) {
+    let vap = format!(
+        r#"
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: non-boolean-validation-result
+spec:
+  validations:
+    - expression: "{expression}"
+"#
+    );
+    let wasm = compile_vap(&vap);
+    let mut evaluator = build_evaluator(&wasm, None, BTreeSet::new());
+
+    let response = tokio::task::block_in_place(|| {
+        evaluator.validate(
+            ValidateRequest::AdmissionRequest(Box::new(cluster_scoped_request())),
+            &PolicySettings::default(),
+        )
+    });
+
+    assert!(
+        !response.allowed,
+        "a non-boolean validation result must reject the request, got: {response:?}"
+    );
+    assert_eq!(response.status.as_ref().and_then(|s| s.code), Some(422));
+}
+
+/// A `false` `matchConditions` result must win over a runtime error in
+/// another `matchConditions` expression of the same param. The order of
+/// the two conditions must not change the outcome. This test puts the
+/// erroring condition first, which is the harder case.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_false_match_condition_wins_over_an_error_in_another_condition() {
+    let vap = r#"
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: false_match_condition_wins
+spec:
+  matchConditions:
+    - name: errors
+      expression: "(1 / 0) == 1"
+    - name: never-matches
+      expression: "false"
+  validations:
+    - expression: "false"
+      message: "unused: the policy must be skipped by matchConditions, not reach here"
+"#;
+    let wasm = compile_vap(vap);
+    let mut evaluator = build_evaluator(&wasm, None, BTreeSet::new());
+
+    let response = tokio::task::block_in_place(|| {
+        evaluator.validate(
+            ValidateRequest::AdmissionRequest(Box::new(cluster_scoped_request())),
+            &PolicySettings::default(),
+        )
+    });
+
+    assert!(
+        response.allowed,
+        "a false matchCondition must skip the policy even under failurePolicy: Fail, got: {response:?}"
+    );
+    assert!(
+        response.warnings.is_none(),
+        "a false matchCondition must win without adding a warning, got: {:?}",
+        response.warnings
     );
 }
 

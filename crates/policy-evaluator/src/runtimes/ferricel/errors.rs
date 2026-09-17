@@ -5,14 +5,13 @@ pub enum FerricelRuntimeError {
     #[error("failed to build ferricel engine: {0}")]
     EngineBuild(#[source] anyhow::Error),
 
-    /// The CEL expression of the policy evaluated to an error. Examples: a
-    /// division by zero, a field that does not exist, or a `kw.*` call that
-    /// the host denied. The `origin` field of the inner error names the host
-    /// extension that produced the error, when there is one.
+    /// A CEL runtime error that made the module trap instead of returning a
+    /// validation response. When a host extension produced the error, the
+    /// `origin` field of the inner error names that extension.
     ///
-    /// This is the only failure that the VAP `failurePolicy` applies to.
-    /// The runtime decides what to do with it. See
-    /// `runtimes::ferricel::runtime::Runtime::validate`.
+    /// This is the only failure that the host's own handling of the VAP
+    /// `failurePolicy` applies to. See
+    /// `runtimes::ferricel::runtime::Runtime::handle_cel_runtime_error`.
     #[error("CEL runtime error: {}", format_cel_error(.0))]
     CelRuntimeError(ferricel_core::CelRuntimeError),
 

@@ -45,17 +45,24 @@ impl Stack {
             .is_none_or(|vars| vars.contains(name))
     }
 
-    /// Evaluate the compiled Wasm module with the given JSON-encoded bindings.
+    /// Evaluate the compiled Wasm module with the given JSON-encoded
+    /// bindings.
     ///
     /// The error tells the caller what went wrong:
     ///   - [`FerricelRuntimeError::ExecutionDeadlineExceeded`] when the
-    ///     evaluation ran past the epoch deadline configured with
+    ///     evaluation ran past the epoch deadline. See
     ///     [`EvaluationContext::epoch_deadline`].
-    ///   - [`FerricelRuntimeError::CelRuntimeError`] when the CEL expression
-    ///     of the policy evaluated to an error. Only this error is subject to
-    ///     the VAP `failurePolicy`.
-    ///   - [`FerricelRuntimeError::EvalFailed`] for every other failure: a
-    ///     Wasm trap, a memory limit, a missing export, or a bug in the host.
+    ///   - [`FerricelRuntimeError::CelRuntimeError`] when the module trapped
+    ///     on a CEL runtime error. A `matchConditions` or `validations`
+    ///     expression that evaluates to an error does not trap. The module
+    ///     applies the `failurePolicy` binding to it on its own. Under
+    ///     `Ignore`, it records a warning in the response instead. As a
+    ///     result, this variant now happens only when the module cannot
+    ///     fetch `params` or `namespaceObject`. Only this error goes
+    ///     through the host's own handling of the VAP `failurePolicy`.
+    ///   - [`FerricelRuntimeError::EvalFailed`] for every other failure.
+    ///     This covers a Wasm trap, a memory limit, a missing export, or a
+    ///     bug in the host.
     pub fn eval(&self, bindings_json: Option<&str>) -> Result<String, FerricelRuntimeError> {
         self.engine.eval(bindings_json).map_err(|e| {
             if matches!(

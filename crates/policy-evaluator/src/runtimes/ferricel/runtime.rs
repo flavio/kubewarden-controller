@@ -34,7 +34,7 @@ impl Runtime<'_> {
             FailurePolicy::Fail
         });
 
-        let bindings = match self.build_bindings(settings, request) {
+        let bindings = match build_bindings(settings, request, failure_policy) {
             Ok(b) => b,
             Err(response) => return *response,
         };
@@ -96,18 +96,29 @@ impl Runtime<'_> {
         }
     }
 
-    /// Apply the VAP `failurePolicy` to a CEL runtime error.
+    /// Apply the VAP `failurePolicy` to a CEL runtime error that reaches the
+    /// host. This error made the module trap instead of returning a
+    /// validation response.
     ///
     /// This mirrors what the Kubernetes API server does with a
     /// `ValidatingAdmissionPolicy` whose expression cannot be evaluated:
     ///   - `Fail`: reject the request. The message names the error.
     ///   - `Ignore`: skip the policy and admit the request. The response
-    ///     carries a warning, so the client and the audit results show that
-    ///     the policy did not run.
+    ///     carries a warning. As a result, the client and the audit log
+    ///     show that the policy did not run.
+    ///
+    /// The compiled module applies `failurePolicy` to each
+    /// `matchConditions` and `validations` expression on its own. It
+    /// reads the `failurePolicy` binding that [`build_bindings`] sets.
+    /// Under `Ignore`, the module skips an expression that evaluates to a
+    /// CEL runtime error. It records the skip in the response's
+    /// `warnings` list. As a result, this function now runs only when the
+    /// module cannot fetch `params` or `namespaceObject`. Those two
+    /// lookups always trap, whatever `failurePolicy` says.
     ///
     /// Only a CEL runtime error reaches this function. A deadline, a Wasm
-    /// trap, or a host bug always rejects the request, whatever the
-    /// `failurePolicy` says.
+    /// trap, or a host bug always rejects the request. `failurePolicy`
+    /// does not change this.
     fn handle_cel_runtime_error(
         &self,
         request: &ValidateRequest,
@@ -147,67 +158,6 @@ impl Runtime<'_> {
         }
     }
 
-    /// Build the JSON bindings object passed to the compiled VAP module.
-    ///
-    /// Bindings provided:
-    ///   - `object`     The resource being admitted.
-    ///   - `oldObject`  The previous version of the resource (UPDATE/DELETE) or null.
-    ///   - `request`    The full AdmissionRequest map (operation, userInfo, etc.).
-    ///   - `paramRef`   Forwarded from `settings["paramRef"]` when present. The
-    ///     compiled wasm reads `name`/`namespace` or `selector`, plus
-    ///     `parameterNotFoundAction`, and fetches the param resources itself via
-    ///     the `kw.k8s.get`/`kw.k8s.list` extensions (registered in
-    ///     `StackPre::rehydrate`). When `paramRef.namespace` is empty the wasm
-    ///     falls back to `request.namespace`, so `request` must always be bound.
-    ///
-    /// Since ferricel 0.11, the compiled wasm resolves `namespaceObject` on
-    /// its own, the same way it resolves `paramRef`: it reads
-    /// `request.namespace` and calls `kw.k8s.get` for the Namespace. The
-    /// host does not build or bind `namespaceObject` any more.
-    ///
-    /// Returns `Err(AdmissionResponse)` on failure so that `validate` can return the
-    /// error response immediately.
-    fn build_bindings(
-        &self,
-        settings: &PolicySettings,
-        request: &ValidateRequest,
-    ) -> Result<Value, Box<AdmissionResponse>> {
-        match request {
-            ValidateRequest::AdmissionRequest(admission_request) => {
-                let object = admission_request.object.as_ref().map(|o| &o.0);
-                let old_object = admission_request.old_object.as_ref().map(|o| &o.0);
-
-                let request_map =
-                    serde_json::to_value(admission_request.as_ref()).map_err(|e| {
-                        error!(
-                            error = e.to_string().as_str(),
-                            "cannot serialize AdmissionRequest"
-                        );
-                        Box::new(AdmissionResponse::reject_internal_server_error(
-                            request.uid().to_string(),
-                            e.to_string(),
-                        ))
-                    })?;
-
-                let param_ref = settings.0.get("paramRef").cloned().unwrap_or(Value::Null);
-
-                Ok(json!({
-                    "object":    object,
-                    "oldObject": old_object,
-                    "request":   request_map,
-                    "paramRef":  param_ref,
-                }))
-            }
-            ValidateRequest::Raw(_raw) => {
-                error!("ferricel runtime does not support raw validation requests");
-                Err(Box::new(AdmissionResponse::reject_internal_server_error(
-                    request.uid().to_string(),
-                    "ferricel runtime does not support raw validation requests".to_string(),
-                )))
-            }
-        }
-    }
-
     /// Ferricel/VAP policies do not have runtime settings validation for the
     /// bulk of their behavior: all validation logic is compiled into the
     /// Wasm module. This function only validates the settings that the
@@ -228,6 +178,81 @@ impl Runtime<'_> {
                 valid: false,
                 message: Some(message),
             },
+        }
+    }
+}
+
+/// Build the JSON bindings object that goes to the compiled VAP module.
+///
+/// This is a free function, not a `Runtime` method. A test can call it
+/// directly, without a real `Stack`. A real `Stack` needs a compiled wasm
+/// module, and this function does not depend on one.
+///
+/// Bindings provided:
+///   - `object`     The resource under admission.
+///   - `oldObject`  The previous version of the resource (UPDATE or DELETE),
+///     or null.
+///   - `request`    The full AdmissionRequest map (operation, userInfo, and
+///     more).
+///   - `paramRef`   Copied from `settings["paramRef"]` when present. The
+///     compiled wasm reads `name` and `namespace`, or `selector`, plus
+///     `parameterNotFoundAction`. It fetches the param resources itself,
+///     through the `kw.k8s.get` and `kw.k8s.list` extensions.
+///     `StackPre::rehydrate` registers these extensions. When
+///     `paramRef.namespace` is empty, the wasm falls back to
+///     `request.namespace`. As a result, `request` must always be bound.
+///   - `failurePolicy` This is `"Fail"` or `"Ignore"`. The module reads
+///     it to decide, for each `matchConditions` and `validations`
+///     expression, whether a CEL runtime error traps (`Fail`) or is
+///     skipped and recorded as a warning (`Ignore`). This value is
+///     always the normalized string form of `failure_policy`. Even when
+///     the settings value is absent, which means `Fail`, this binding
+///     still holds `"Fail"`.
+///
+/// The compiled wasm resolves `namespaceObject` on its own, the same way
+/// it resolves `paramRef`. It reads `request.namespace` and calls
+/// `kw.k8s.get` for the Namespace. The host does not build or bind
+/// `namespaceObject`.
+///
+/// This function returns `Err(AdmissionResponse)` on failure. As a
+/// result, `validate` can return the error response right away.
+fn build_bindings(
+    settings: &PolicySettings,
+    request: &ValidateRequest,
+    failure_policy: FailurePolicy,
+) -> Result<Value, Box<AdmissionResponse>> {
+    match request {
+        ValidateRequest::AdmissionRequest(admission_request) => {
+            let object = admission_request.object.as_ref().map(|o| &o.0);
+            let old_object = admission_request.old_object.as_ref().map(|o| &o.0);
+
+            let request_map = serde_json::to_value(admission_request.as_ref()).map_err(|e| {
+                error!(
+                    error = e.to_string().as_str(),
+                    "cannot serialize AdmissionRequest"
+                );
+                Box::new(AdmissionResponse::reject_internal_server_error(
+                    request.uid().to_string(),
+                    e.to_string(),
+                ))
+            })?;
+
+            let param_ref = settings.0.get("paramRef").cloned().unwrap_or(Value::Null);
+
+            Ok(json!({
+                "object":    object,
+                "oldObject": old_object,
+                "request":   request_map,
+                "paramRef":  param_ref,
+                "failurePolicy": failure_policy.as_str(),
+            }))
+        }
+        ValidateRequest::Raw(_raw) => {
+            error!("ferricel runtime does not support raw validation requests");
+            Err(Box::new(AdmissionResponse::reject_internal_server_error(
+                request.uid().to_string(),
+                "ferricel runtime does not support raw validation requests".to_string(),
+            )))
         }
     }
 }
@@ -304,6 +329,18 @@ impl FailurePolicy {
             Some(Value::String(s)) if s == "Fail" => Ok(Self::Fail),
             Some(Value::String(s)) if s == "Ignore" => Ok(Self::Ignore),
             Some(_) => Err(Self::INVALID_VALUE_MESSAGE.to_string()),
+        }
+    }
+
+    /// The value sent to the compiled module in the `failurePolicy`
+    /// binding. See [`build_bindings`]. Ferricel reads this string, not
+    /// `settings["failurePolicy"]` directly. As a result, the module also
+    /// gets the normalization that [`Self::from_settings`] does: a
+    /// missing or `null` value becomes `Fail`.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fail => "Fail",
+            Self::Ignore => "Ignore",
         }
     }
 }
@@ -530,6 +567,89 @@ mod tests {
             validate_settings_json(&settings.to_string(), &EvaluationContext::default(), false)
                 .expect_err("expected an error for an invalid failurePolicy");
         assert_eq!(err, "failurePolicy must be either 'Fail' or 'Ignore'");
+    }
+
+    /// A minimal `AdmissionRequest` that `build_bindings` accepts. These
+    /// tests care only about the fields that the ferricel runtime forwards
+    /// to the module. The rest exist because `AdmissionRequest` requires
+    /// them.
+    fn minimal_admission_request() -> ValidateRequest {
+        let admission_request: crate::admission_request::AdmissionRequest =
+            serde_json::from_value(json!({
+                "uid": "req-uid",
+                "kind": {"group": "", "version": "v1", "kind": "ConfigMap"},
+                "resource": {"group": "", "version": "v1", "resource": "configmaps"},
+                "operation": "CREATE",
+                "userInfo": {},
+            }))
+            .expect("minimal AdmissionRequest should deserialize");
+        ValidateRequest::AdmissionRequest(Box::new(admission_request))
+    }
+
+    /// The module reads `failurePolicy` from the bindings. It decides,
+    /// for each expression, whether a CEL runtime error traps (`Fail`)
+    /// or is skipped with a warning (`Ignore`). The binding must always
+    /// be present, and it must hold the normalized string. An absent
+    /// `settings["failurePolicy"]` must still produce `"Fail"`, not an
+    /// absent binding.
+    #[rstest]
+    #[case::fail(FailurePolicy::Fail, "Fail")]
+    #[case::ignore(FailurePolicy::Ignore, "Ignore")]
+    fn build_bindings_sets_the_failure_policy_binding(
+        #[case] failure_policy: FailurePolicy,
+        #[case] expected: &str,
+    ) {
+        let settings = PolicySettings(serde_json::Map::new());
+        let request = minimal_admission_request();
+
+        let bindings = build_bindings(&settings, &request, failure_policy)
+            .expect("build_bindings should succeed for a well-formed AdmissionRequest");
+
+        assert_eq!(
+            bindings["failurePolicy"],
+            json!(expected),
+            "unexpected bindings: {bindings}"
+        );
+    }
+
+    #[test]
+    fn build_bindings_forwards_param_ref_and_request_fields() {
+        let settings = PolicySettings(
+            json!({"paramRef": {"name": "replica-limit", "parameterNotFoundAction": "Deny"}})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        let request = minimal_admission_request();
+
+        let bindings = build_bindings(&settings, &request, FailurePolicy::Fail)
+            .expect("build_bindings should succeed for a well-formed AdmissionRequest");
+
+        assert_eq!(bindings["object"], Value::Null);
+        assert_eq!(bindings["oldObject"], Value::Null);
+        assert_eq!(bindings["request"]["uid"], json!("req-uid"));
+        assert_eq!(bindings["paramRef"]["name"], json!("replica-limit"));
+    }
+
+    #[test]
+    fn build_bindings_defaults_param_ref_to_null_when_absent() {
+        let settings = PolicySettings(serde_json::Map::new());
+        let request = minimal_admission_request();
+
+        let bindings = build_bindings(&settings, &request, FailurePolicy::Fail)
+            .expect("build_bindings should succeed for a well-formed AdmissionRequest");
+
+        assert_eq!(bindings["paramRef"], Value::Null);
+    }
+
+    #[test]
+    fn build_bindings_rejects_raw_validation_requests() {
+        let settings = PolicySettings(serde_json::Map::new());
+        let request = ValidateRequest::Raw(json!({}));
+
+        let err = build_bindings(&settings, &request, FailurePolicy::Fail)
+            .expect_err("ferricel does not support raw validation requests");
+        assert!(!err.allowed);
     }
 
     #[test]
