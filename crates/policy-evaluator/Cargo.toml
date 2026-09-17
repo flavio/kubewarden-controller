@@ -46,6 +46,7 @@ rustls-webpki = { version = "0.103", default-features = false, features = [
 semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_path_to_error = "0.1"
 serde_yaml = { workspace = true }
 sha2 = { workspace = true }
 slog = "2"

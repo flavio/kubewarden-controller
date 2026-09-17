@@ -2474,3 +2474,116 @@ spec:
     });
     assert!(response.allowed, "expected allowed, got: {response:?}");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// kw.sigstore / kw.crypto: wrong-type dynamic arguments are rejected
+//
+// The tests above pass only CEL literals to the sigstore builder chain.
+// These cases pass a value read from the admitted object instead, so the
+// wrong type only exists at evaluation time, not at compile time. Each one
+// asserts that the request is rejected and that the callback channel is
+// never reached: the parse step must fail before any host call is made.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `sigstore_request`, plus extra fields merged into `object.spec`, so a VAP
+/// can read a dynamically typed value (e.g. `object.spec.repo`) instead of
+/// a CEL literal.
+fn sigstore_request_with_spec(
+    image: &str,
+    extra_spec_fields: serde_json::Value,
+) -> AdmissionRequest {
+    let mut request = json!({
+        "uid": "sigstore-uid",
+        "kind": {"group": "", "version": "v1", "kind": "Pod"},
+        "resource": {"group": "", "version": "v1", "resource": "pods"},
+        "name": "test",
+        "operation": "CREATE",
+        "userInfo": {"username": "admin", "groups": []},
+        "object": {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": "test"},
+            "spec": {"image": image}
+        }
+    });
+    request["object"]["spec"]
+        .as_object_mut()
+        .unwrap()
+        .extend(extra_spec_fields.as_object().unwrap().clone());
+    serde_json::from_value(request).unwrap()
+}
+
+/// - `githubAction`: the 2-arg overload was used, so `repo` must be a
+///   string; a `null` value must not fall back to "no repository
+///   restriction".
+/// - `requireRekorBundle`: a string must not be coerced to a boolean.
+/// - `pubKey`: a `null` accumulated element must not be silently dropped
+///   from the list of required public keys.
+/// - `kw.crypto.notAfter`: a number is not the RFC-3339 string that a CEL
+///   timestamp serializes to.
+#[rstest]
+#[case::sigstore_github_action_null_repo(
+    "kw.sigstore.image(object.spec.image).githubAction('myorg', object.spec.repo).verify().isTrusted()",
+    json!({"repo": null}),
+    "repo"
+)]
+#[case::sigstore_certificate_non_boolean_require_rekor_bundle(
+    "kw.sigstore.image(object.spec.image).certificate('cert-pem').requireRekorBundle(object.spec.strict).verify().isTrusted()",
+    json!({"strict": "true"}),
+    "requireRekorBundle"
+)]
+#[case::sigstore_pub_key_null_element(
+    "kw.sigstore.image(object.spec.image).pubKey('goodkey').pubKey(object.spec.key).verify().isTrusted()",
+    json!({"key": null}),
+    "pubKeys[1]"
+)]
+#[case::crypto_non_string_not_after(
+    "kw.crypto.certificate('cert.pem').notAfter(object.spec.expiry).verify().isTrusted()",
+    json!({"expiry": 1704067200}),
+    "notAfter"
+)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wrong_type_argument_from_object_is_rejected(
+    #[case] expression: &str,
+    #[case] extra_spec_fields: serde_json::Value,
+    #[case] needle: &str,
+) {
+    let vap = format!(
+        r#"
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: wrong-type-argument-from-object
+spec:
+  validations:
+    - expression: >-
+        {expression}
+      message: "unused: the validation errors before it evaluates"
+"#
+    );
+    let wasm = compile_vap(&vap);
+    let channel = spawn_direct_mock(|req| {
+        panic!("callback channel should not be reached when the argument is rejected: {req:?}")
+    });
+    let mut evaluator = build_evaluator_with_channel(&wasm, channel);
+
+    let request = sigstore_request_with_spec("registry.example.com/app:latest", extra_spec_fields);
+    let response = tokio::task::block_in_place(|| {
+        evaluator.validate(
+            ValidateRequest::AdmissionRequest(Box::new(request)),
+            &PolicySettings::default(),
+        )
+    });
+
+    assert!(!response.allowed, "expected rejection, got: {response:?}");
+    assert_eq!(response.status.as_ref().and_then(|s| s.code), Some(500));
+    let message = response
+        .status
+        .as_ref()
+        .and_then(|s| s.message.as_deref())
+        .unwrap_or("");
+    assert!(
+        message.contains(needle),
+        "expected {needle:?} in the rejection message, got: {message:?}"
+    );
+}

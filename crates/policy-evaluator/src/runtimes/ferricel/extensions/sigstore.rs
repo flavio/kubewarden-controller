@@ -2,11 +2,13 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use ferricel_types::extensions::{BuilderChainDecl, BuilderStep, ExtensionDecl};
 use kubewarden_policy_sdk::host_capabilities::verification::{KeylessInfo, KeylessPrefixInfo};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::{
-    callback_requests::CallbackRequestType, evaluation_context::EvaluationContext,
-    runtimes::ferricel::extensions::helpers::call_host,
+    callback_requests::CallbackRequestType,
+    evaluation_context::EvaluationContext,
+    runtimes::ferricel::extensions::helpers::{call_host, parse_builder_map, reject_null},
 };
 
 /// `BuilderChainDecl` for the `kw.sigstore` library.
@@ -257,171 +259,219 @@ pub(crate) fn pub_key_verify_handler(
     eval_ctx: &Arc<EvaluationContext>,
     builder_map: &Value,
 ) -> Result<Value, String> {
-    let image = builder_map["image"]
-        .as_str()
-        .ok_or_else(|| "missing 'image'".to_string())?
-        .to_owned();
-
-    let pub_keys: Vec<String> = builder_map["pubKeys"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let annotations = parse_annotations(builder_map);
-
     call_host(
         eval_ctx,
         "oci",
         "v2/verify",
-        CallbackRequestType::SigstorePubKeyVerify {
-            image,
-            pub_keys,
-            annotations,
-        },
+        parse_pub_key_verify(builder_map)?,
     )
+}
+
+/// Fields of the builder map that `.pubKey(...).verify()` produces.
+/// `#[serde(rename_all = "camelCase")]` matches the map's own key names
+/// (`pubKeys`).
+///
+/// `pubKeys` defaults to empty when `.pubKey()` was never called. Every
+/// element, and every value of `annotations`, must be a string: a
+/// wrong-type element is rejected rather than dropped. Dropping a key
+/// would silently require fewer keys than the policy author wrote;
+/// dropping an annotation would silently remove a required annotation
+/// from the check.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PubKeyVerifyArgs {
+    image: String,
+    #[serde(default)]
+    pub_keys: Vec<String>,
+    #[serde(default)]
+    annotations: Option<BTreeMap<String, String>>,
+}
+
+fn parse_pub_key_verify(builder_map: &Value) -> Result<CallbackRequestType, String> {
+    let args: PubKeyVerifyArgs = parse_builder_map(builder_map)?;
+
+    Ok(CallbackRequestType::SigstorePubKeyVerify {
+        image: args.image,
+        pub_keys: args.pub_keys,
+        annotations: args.annotations,
+    })
 }
 
 pub(crate) fn keyless_verify_handler(
     eval_ctx: &Arc<EvaluationContext>,
     builder_map: &Value,
 ) -> Result<Value, String> {
-    let image = builder_map["image"]
-        .as_str()
-        .ok_or_else(|| "missing 'image'".to_string())?
-        .to_owned();
-
-    // issuers and subjects are stored as parallel arrays; zip them into KeylessInfo pairs.
-    let keyless = zip_keyless(builder_map, "keylessIssuers", "keylessSubjects")?;
-
-    let annotations = parse_annotations(builder_map);
-
     call_host(
         eval_ctx,
         "oci",
         "v2/verify",
-        CallbackRequestType::SigstoreKeylessVerify {
-            image,
-            keyless,
-            annotations,
-        },
+        parse_keyless_verify(builder_map)?,
     )
+}
+
+/// Fields of the builder map that `.keyless(issuer, subject).verify()`
+/// produces. `keylessIssuers` and `keylessSubjects` are parallel arrays:
+/// serde parses each one fully, by index, before [`zip_keyless`] pairs
+/// them. This way a wrong-type issuer or subject is reported at the
+/// position where it appears, rather than shifting every pair that
+/// follows it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KeylessVerifyArgs {
+    image: String,
+    #[serde(default)]
+    keyless_issuers: Vec<String>,
+    #[serde(default)]
+    keyless_subjects: Vec<String>,
+    #[serde(default)]
+    annotations: Option<BTreeMap<String, String>>,
+}
+
+fn parse_keyless_verify(builder_map: &Value) -> Result<CallbackRequestType, String> {
+    let args: KeylessVerifyArgs = parse_builder_map(builder_map)?;
+    let keyless = zip_keyless(args.keyless_issuers, args.keyless_subjects)?;
+
+    Ok(CallbackRequestType::SigstoreKeylessVerify {
+        image: args.image,
+        keyless,
+        annotations: args.annotations,
+    })
 }
 
 pub(crate) fn keyless_prefix_verify_handler(
     eval_ctx: &Arc<EvaluationContext>,
     builder_map: &Value,
 ) -> Result<Value, String> {
-    let image = builder_map["image"]
-        .as_str()
-        .ok_or_else(|| "missing 'image'".to_string())?
-        .to_owned();
-
-    let issuers = str_array(builder_map, "keylessPrefixIssuers")?;
-    let urls = str_array(builder_map, "keylessPrefixUrls")?;
-
-    if issuers.len() != urls.len() {
-        return Err(format!(
-            "issuer/urlPrefix arrays have different lengths ({} vs {})",
-            issuers.len(),
-            urls.len()
-        ));
-    }
-
-    let keyless_prefix: Vec<KeylessPrefixInfo> = issuers
-        .into_iter()
-        .zip(urls)
-        .map(|(issuer, url_prefix)| KeylessPrefixInfo { issuer, url_prefix })
-        .collect();
-
-    let annotations = parse_annotations(builder_map);
-
     call_host(
         eval_ctx,
         "oci",
         "v2/verify",
-        CallbackRequestType::SigstoreKeylessPrefixVerify {
-            image,
-            keyless_prefix,
-            annotations,
-        },
+        parse_keyless_prefix_verify(builder_map)?,
     )
+}
+
+/// Fields of the builder map that
+/// `.keylessPrefix(issuer, urlPrefix).verify()` produces. See
+/// [`KeylessVerifyArgs`] for why the two parallel arrays are parsed in
+/// full before [`zip_keyless_prefix`] pairs them.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct KeylessPrefixVerifyArgs {
+    image: String,
+    #[serde(default)]
+    keyless_prefix_issuers: Vec<String>,
+    #[serde(default)]
+    keyless_prefix_urls: Vec<String>,
+    #[serde(default)]
+    annotations: Option<BTreeMap<String, String>>,
+}
+
+fn parse_keyless_prefix_verify(builder_map: &Value) -> Result<CallbackRequestType, String> {
+    let args: KeylessPrefixVerifyArgs = parse_builder_map(builder_map)?;
+    let keyless_prefix = zip_keyless_prefix(args.keyless_prefix_issuers, args.keyless_prefix_urls)?;
+
+    Ok(CallbackRequestType::SigstoreKeylessPrefixVerify {
+        image: args.image,
+        keyless_prefix,
+        annotations: args.annotations,
+    })
 }
 
 pub(crate) fn github_actions_verify_handler(
     eval_ctx: &Arc<EvaluationContext>,
     builder_map: &Value,
 ) -> Result<Value, String> {
-    let image = builder_map["image"]
-        .as_str()
-        .ok_or_else(|| "missing 'image'".to_string())?
-        .to_owned();
-
-    let owner = builder_map["owner"]
-        .as_str()
-        .ok_or_else(|| "missing 'owner'".to_string())?
-        .to_owned();
-
-    // `repo` is optional — only set by the 2-arg githubAction overload.
-    let repo = builder_map["repo"].as_str().map(str::to_owned);
-
-    let annotations = parse_annotations(builder_map);
-
     call_host(
         eval_ctx,
         "oci",
         "v2/verify",
-        CallbackRequestType::SigstoreGithubActionsVerify {
-            image,
-            owner,
-            repo,
-            annotations,
-        },
+        parse_github_actions_verify(builder_map)?,
     )
+}
+
+/// Fields of the builder map that `.githubAction(owner[, repo]).verify()`
+/// produces. `repo` is only set by the 2-arg overload; when the 1-arg
+/// overload was used, the key is entirely absent from the map and
+/// `repo` is `None`. `repo` uses [`reject_null`]: when the 2-arg
+/// overload was used, `repo` must be a string, and
+/// `.githubAction("org", null)` is rejected rather than treated the same
+/// as the 1-arg overload, so a `null` value from a CEL expression cannot
+/// silently drop the repository restriction.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GithubActionsVerifyArgs {
+    image: String,
+    owner: String,
+    #[serde(default, deserialize_with = "reject_null")]
+    repo: Option<String>,
+    #[serde(default)]
+    annotations: Option<BTreeMap<String, String>>,
+}
+
+fn parse_github_actions_verify(builder_map: &Value) -> Result<CallbackRequestType, String> {
+    let args: GithubActionsVerifyArgs = parse_builder_map(builder_map)?;
+
+    Ok(CallbackRequestType::SigstoreGithubActionsVerify {
+        image: args.image,
+        owner: args.owner,
+        repo: args.repo,
+        annotations: args.annotations,
+    })
 }
 
 pub(crate) fn certificate_verify_handler(
     eval_ctx: &Arc<EvaluationContext>,
     builder_map: &Value,
 ) -> Result<Value, String> {
-    let image = builder_map["image"]
-        .as_str()
-        .ok_or_else(|| "missing 'image'".to_string())?
-        .to_owned();
-
-    let cert_pem = builder_map["certificate"]
-        .as_str()
-        .ok_or_else(|| "missing 'certificate'".to_string())?;
-    let certificate: Vec<u8> = cert_pem.as_bytes().to_vec();
-
-    let certificate_chain: Option<Vec<Vec<u8>>> =
-        builder_map["certificateChain"].as_array().map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str())
-                .map(|pem| pem.as_bytes().to_vec())
-                .collect()
-        });
-    let certificate_chain = certificate_chain.filter(|v| !v.is_empty());
-
-    let require_rekor_bundle = builder_map["requireRekorBundle"].as_bool().unwrap_or(false);
-
-    let annotations = parse_annotations(builder_map);
-
     call_host(
         eval_ctx,
         "oci",
         "v2/verify",
-        CallbackRequestType::SigstoreCertificateVerify {
-            image,
-            certificate,
-            certificate_chain,
-            require_rekor_bundle,
-            annotations,
-        },
+        parse_certificate_verify(builder_map)?,
     )
+}
+
+/// Fields of the builder map that
+/// `.certificate(...).certificateChain(...).requireRekorBundle(...).verify()`
+/// produces.
+///
+/// `certificateChain` absent, or never called, means "no chain"; the
+/// underlying Sigstore verifier then treats the certificate itself as
+/// trusted. A present `certificateChain` element that is not a string is
+/// rejected instead: silently dropping it, as an empty array, would have
+/// the same "trust the certificate" effect for a policy author who meant
+/// to require a chain.
+///
+/// `requireRekorBundle` absent means `false`, the same default the
+/// `kw.crypto` and waPC/Wasi paths use. `requireRekorBundle` uses
+/// [`reject_null`]: a present value must be a boolean, and a `null` or a
+/// string like `"true"` is rejected instead of silently becoming
+/// `false`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CertificateVerifyArgs {
+    image: String,
+    certificate: String,
+    #[serde(default)]
+    certificate_chain: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "reject_null")]
+    require_rekor_bundle: Option<bool>,
+    #[serde(default)]
+    annotations: Option<BTreeMap<String, String>>,
+}
+
+fn parse_certificate_verify(builder_map: &Value) -> Result<CallbackRequestType, String> {
+    let args: CertificateVerifyArgs = parse_builder_map(builder_map)?;
+
+    Ok(CallbackRequestType::SigstoreCertificateVerify {
+        image: args.image,
+        certificate: args.certificate.into_bytes(),
+        certificate_chain: args
+            .certificate_chain
+            .map(|chain| chain.into_iter().map(String::into_bytes).collect()),
+        require_rekor_bundle: args.require_rekor_bundle.unwrap_or(false),
+        annotations: args.annotations,
+    })
 }
 
 /// `.digest()` -- no host call. Returns the `digest` field from the
@@ -435,37 +485,10 @@ pub(crate) fn digest_handler(args: &[Value]) -> Result<Value, String> {
 
 // ─── Private helpers ──────────────────────────────────────────────────────────
 
-/// Parse the optional `annotations` nested map from the builder state.
-fn parse_annotations(builder_map: &Value) -> Option<BTreeMap<String, String>> {
-    builder_map["annotations"].as_object().map(|obj| {
-        obj.iter()
-            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
-            .collect()
-    })
-}
-
-/// Extract a string array from a builder map field. Returns an empty Vec if
-/// the field is absent; errors if present but not an array of strings.
-fn str_array(map: &Value, key: &str) -> Result<Vec<String>, String> {
-    match &map[key] {
-        Value::Null => Ok(vec![]),
-        Value::Array(arr) => Ok(arr
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_owned))
-            .collect()),
-        other => Err(format!("field '{key}' is not an array (got {other})")),
-    }
-}
-
 /// Zip parallel `issuers` and `subjects` arrays into `Vec<KeylessInfo>`.
-fn zip_keyless(
-    map: &Value,
-    issuers_key: &str,
-    subjects_key: &str,
-) -> Result<Vec<KeylessInfo>, String> {
-    let issuers = str_array(map, issuers_key)?;
-    let subjects = str_array(map, subjects_key)?;
-
+/// Both arrays are already fully parsed at this point (see
+/// [`KeylessVerifyArgs`]), so this only pairs them up.
+fn zip_keyless(issuers: Vec<String>, subjects: Vec<String>) -> Result<Vec<KeylessInfo>, String> {
     if issuers.len() != subjects.len() {
         return Err(format!(
             "issuer/subject arrays have different lengths ({} vs {})",
@@ -479,4 +502,232 @@ fn zip_keyless(
         .zip(subjects)
         .map(|(issuer, subject)| KeylessInfo { issuer, subject })
         .collect())
+}
+
+/// Zip parallel `issuers` and `urlPrefixes` arrays into
+/// `Vec<KeylessPrefixInfo>`. Both arrays are already fully parsed at this
+/// point (see [`KeylessPrefixVerifyArgs`]), so this only pairs them up.
+fn zip_keyless_prefix(
+    issuers: Vec<String>,
+    url_prefixes: Vec<String>,
+) -> Result<Vec<KeylessPrefixInfo>, String> {
+    if issuers.len() != url_prefixes.len() {
+        return Err(format!(
+            "issuer/urlPrefix arrays have different lengths ({} vs {})",
+            issuers.len(),
+            url_prefixes.len()
+        ));
+    }
+
+    Ok(issuers
+        .into_iter()
+        .zip(url_prefixes)
+        .map(|(issuer, url_prefix)| KeylessPrefixInfo { issuer, url_prefix })
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use rstest::rstest;
+    use serde_json::json;
+
+    use super::*;
+
+    /// The `image` every case below parses from `"img:latest"`.
+    fn image() -> String {
+        "img:latest".to_owned()
+    }
+
+    /// `items` as `Vec<String>`, for a case row that only needs to name
+    /// the strings once.
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// `items` as the `Vec<Vec<u8>>` a certificate chain parses into.
+    fn byte_vecs(items: &[&str]) -> Vec<Vec<u8>> {
+        items.iter().map(|s| s.as_bytes().to_vec()).collect()
+    }
+
+    /// Every parse function accepts a well-formed builder map and
+    /// returns the exact `CallbackRequestType` its fields describe.
+    ///
+    /// `github_action_owner_only` has no `repo` at all: the 1-arg
+    /// overload never sets the key. `certificate_no_chain_and_no_rekor_bundle`
+    /// has neither `certificateChain` nor `requireRekorBundle`: neither
+    /// method was called, and both default to "no chain" / `false`, the
+    /// same defaults `kw.crypto` and the waPC/Wasi paths use.
+    #[rstest]
+    #[case::pub_key(
+        parse_pub_key_verify,
+        json!({
+            "image": "img:latest",
+            "pubKeys": ["key1", "key2"],
+            "annotations": {"env": "prod"}
+        }),
+        CallbackRequestType::SigstorePubKeyVerify {
+            image: image(),
+            pub_keys: strings(&["key1", "key2"]),
+            annotations: Some(BTreeMap::from([("env".to_owned(), "prod".to_owned())])),
+        }
+    )]
+    #[case::keyless(
+        parse_keyless_verify,
+        json!({
+            "image": "img:latest",
+            "keylessIssuers": ["issuer1", "issuer2"],
+            "keylessSubjects": ["subject1", "subject2"]
+        }),
+        CallbackRequestType::SigstoreKeylessVerify {
+            image: image(),
+            keyless: vec![
+                KeylessInfo { issuer: "issuer1".to_owned(), subject: "subject1".to_owned() },
+                KeylessInfo { issuer: "issuer2".to_owned(), subject: "subject2".to_owned() },
+            ],
+            annotations: None,
+        }
+    )]
+    #[case::keyless_prefix(
+        parse_keyless_prefix_verify,
+        json!({
+            "image": "img:latest",
+            "keylessPrefixIssuers": ["issuer1"],
+            "keylessPrefixUrls": ["https://github.com/myorg/"]
+        }),
+        CallbackRequestType::SigstoreKeylessPrefixVerify {
+            image: image(),
+            keyless_prefix: vec![KeylessPrefixInfo {
+                issuer: "issuer1".to_owned(),
+                url_prefix: "https://github.com/myorg/".to_owned(),
+            }],
+            annotations: None,
+        }
+    )]
+    #[case::github_action_owner_only(
+        parse_github_actions_verify,
+        json!({"image": "img:latest", "owner": "myorg"}),
+        CallbackRequestType::SigstoreGithubActionsVerify {
+            image: image(),
+            owner: "myorg".to_owned(),
+            repo: None,
+            annotations: None,
+        }
+    )]
+    #[case::github_action_owner_and_repo(
+        parse_github_actions_verify,
+        json!({"image": "img:latest", "owner": "myorg", "repo": "myrepo"}),
+        CallbackRequestType::SigstoreGithubActionsVerify {
+            image: image(),
+            owner: "myorg".to_owned(),
+            repo: Some("myrepo".to_owned()),
+            annotations: None,
+        }
+    )]
+    #[case::certificate_chain_and_rekor_bundle(
+        parse_certificate_verify,
+        json!({
+            "image": "img:latest",
+            "certificate": "cert-pem",
+            "certificateChain": ["chain1", "chain2"],
+            "requireRekorBundle": true
+        }),
+        CallbackRequestType::SigstoreCertificateVerify {
+            image: image(),
+            certificate: b"cert-pem".to_vec(),
+            certificate_chain: Some(byte_vecs(&["chain1", "chain2"])),
+            require_rekor_bundle: true,
+            annotations: None,
+        }
+    )]
+    #[case::certificate_no_chain_and_no_rekor_bundle(
+        parse_certificate_verify,
+        json!({"image": "img:latest", "certificate": "cert-pem"}),
+        CallbackRequestType::SigstoreCertificateVerify {
+            image: image(),
+            certificate: b"cert-pem".to_vec(),
+            certificate_chain: None,
+            require_rekor_bundle: false,
+            annotations: None,
+        }
+    )]
+    fn parse_accepts_a_well_formed_builder_map(
+        #[case] parse: fn(&Value) -> Result<CallbackRequestType, String>,
+        #[case] builder_map: Value,
+        #[case] expected: CallbackRequestType,
+    ) {
+        let result = parse(&builder_map).expect("expected a well-formed builder map to parse");
+        assert_eq!(result, expected);
+    }
+
+    /// Every parse function must reject a wrong-type argument rather than
+    /// drop it, whatever handler it belongs to: dropping it would fall
+    /// back to a default that removes whatever restriction the argument
+    /// controls. A `null` element inside an accumulated array (`pubKeys`,
+    /// `keylessIssuers`, `keylessPrefixUrls`, `certificateChain`) is
+    /// reported by index, so a bad element does not silently shift the
+    /// pairing of a later one. A `null` scalar argument
+    /// (`.githubAction("org", null)`) is rejected rather than treated the
+    /// same as never calling the method at all.
+    #[rstest]
+    #[case::pub_key_null_element(
+        parse_pub_key_verify,
+        json!({"image": "img:latest", "pubKeys": ["key1", null]}),
+        "pubKeys[1]"
+    )]
+    #[case::pub_key_non_string_annotation(
+        parse_pub_key_verify,
+        json!({"image": "img:latest", "pubKeys": ["key1"], "annotations": {"count": 5}}),
+        "annotations.count"
+    )]
+    #[case::keyless_null_issuer_by_index(
+        parse_keyless_verify,
+        json!({
+            "image": "img:latest",
+            "keylessIssuers": [null, "issuer2"],
+            "keylessSubjects": ["subject1", "subject2"]
+        }),
+        "keylessIssuers[0]"
+    )]
+    #[case::keyless_prefix_null_url(
+        parse_keyless_prefix_verify,
+        json!({
+            "image": "img:latest",
+            "keylessPrefixIssuers": ["issuer1"],
+            "keylessPrefixUrls": [null]
+        }),
+        "keylessPrefixUrls[0]"
+    )]
+    #[case::github_action_null_repo(
+        parse_github_actions_verify,
+        json!({"image": "img:latest", "owner": "myorg", "repo": null}),
+        "repo"
+    )]
+    #[case::github_action_non_string_repo(
+        parse_github_actions_verify,
+        json!({"image": "img:latest", "owner": "myorg", "repo": 1}),
+        "repo"
+    )]
+    #[case::certificate_null_chain_element(
+        parse_certificate_verify,
+        json!({"image": "img:latest", "certificate": "cert-pem", "certificateChain": [null]}),
+        "certificateChain[0]"
+    )]
+    #[case::certificate_non_boolean_require_rekor_bundle(
+        parse_certificate_verify,
+        json!({"image": "img:latest", "certificate": "cert-pem", "requireRekorBundle": "true"}),
+        "requireRekorBundle"
+    )]
+    fn parse_rejects_a_wrong_type_argument(
+        #[case] parse: fn(&Value) -> Result<CallbackRequestType, String>,
+        #[case] builder_map: Value,
+        #[case] needle: &str,
+    ) {
+        let err = parse(&builder_map).expect_err("expected an error");
+        assert!(
+            err.contains(needle),
+            "expected {needle:?} in the error, got: {err:?}"
+        );
+    }
 }

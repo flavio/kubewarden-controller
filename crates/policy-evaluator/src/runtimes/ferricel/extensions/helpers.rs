@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use serde::{Deserialize, Deserializer, de::DeserializeOwned};
 use serde_json::Value;
 
 use crate::{
@@ -15,6 +16,54 @@ pub(crate) fn str_field(map: &Value, key: &str) -> Result<String, String> {
         .as_str()
         .map(str::to_owned)
         .ok_or_else(|| format!("missing or non-string field '{key}' in builder map"))
+}
+
+/// Deserialize a ferricel builder map into `T`, with a field path (for
+/// example `pubKeys[1]` or `annotations.count`) on every error.
+///
+/// A handler declares `T` as a `#[derive(Deserialize)]` struct with one
+/// field per builder-map key (`#[serde(rename_all = "camelCase")]` on the
+/// struct matches the key names the compiler writes). This gives every
+/// field serde's own rules for free: a missing required field is an
+/// error, a present value of the wrong type is an error naming the type
+/// it got, and `#[serde(default)]` turns an absent key into an empty
+/// `Vec` or `None` without turning a *present* wrong-type value into the
+/// same default. The one gap serde leaves is a present `null` for an
+/// `Option<T>` field, which normally also means `None`; use
+/// [`reject_null`] as that field's `deserialize_with` when a `null`
+/// argument must be rejected instead (see its own docs for why).
+///
+/// The map itself may carry extra keys (`__type__`, or fields another
+/// overload of the same builder chain sets): serde ignores a key that
+/// `T` does not declare, so `T` only needs the fields it reads.
+pub(crate) fn parse_builder_map<T: DeserializeOwned>(map: &Value) -> Result<T, String> {
+    serde_path_to_error::deserialize(map).map_err(|e| e.to_string())
+}
+
+/// A `deserialize_with` function for an `Option<T>` field that must
+/// reject a present `null`, not treat it the same as an absent key.
+///
+/// Plain serde maps both "the key is absent" and "the key is present
+/// with a `null` value" to `None`. That default is wrong for a builder
+/// chain step that overwrites a single key from one CEL argument (unlike
+/// an accumulating step): the two cases are "the policy author never
+/// called this method" and "the policy author called it with a `null`
+/// argument" (for example `.githubAction("org", object.spec.repo)` where
+/// `repo` is `null`), and only the compiled module can tell them apart.
+/// Silently treating a `null` argument as "not called" would fall back
+/// to a default that removes whatever restriction the argument
+/// controls.
+///
+/// Pair this with `#[serde(default)]` on the field: `default` supplies
+/// `None` when the key is absent, so this function only ever runs on a
+/// value that is actually present, and a `null` there fails like any
+/// other wrong type.
+pub(crate) fn reject_null<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 /// Extract an optional field mask array from a builder map.
@@ -84,5 +133,82 @@ mod tests {
         #[case] expected: Option<String>,
     ) {
         assert_eq!(optional_namespace(&map), expected);
+    }
+
+    /// A struct with one field per rule that [`parse_builder_map`] and
+    /// [`reject_null`] must enforce together: `required` has no default,
+    /// `items` is a required-but-defaults-to-empty array, `optional` is
+    /// a plain `Option` (serde's own "absent or null both mean `None`"
+    /// rule), and `strict_optional` uses [`reject_null`] to turn a
+    /// present `null` into an error instead.
+    #[derive(Deserialize, Debug, PartialEq)]
+    struct Example {
+        required: String,
+        #[serde(default)]
+        items: Vec<String>,
+        #[serde(default)]
+        optional: Option<String>,
+        #[serde(default, deserialize_with = "reject_null")]
+        strict_optional: Option<String>,
+    }
+
+    /// An `Example` with `required: "value"` and the given `optional`
+    /// and `strict_optional`, for a table that only varies those two
+    /// fields.
+    fn example(optional: Option<&str>, strict_optional: Option<&str>) -> Example {
+        Example {
+            required: "value".to_string(),
+            items: vec![],
+            optional: optional.map(str::to_string),
+            strict_optional: strict_optional.map(str::to_string),
+        }
+    }
+
+    #[rstest]
+    #[case::all_fields_set(
+        json!({"required": "value", "optional": "a", "strict_optional": "b"}),
+        example(Some("a"), Some("b"))
+    )]
+    #[case::only_the_required_field(json!({"required": "value"}), example(None, None))]
+    // The map may carry extra keys (`__type__`, or fields another
+    // overload of the same builder chain sets): serde ignores a key that
+    // `Example` does not declare.
+    #[case::extra_key_is_ignored(
+        json!({"__type__": "kw.sigstore.VerifierBuilder", "required": "value"}),
+        example(None, None)
+    )]
+    // A plain `Option` field (`optional`) treats a present `null` the
+    // same as an absent key: only a `reject_null` field (`strict_optional`)
+    // tells the two apart.
+    #[case::plain_option_null_is_none(
+        json!({"required": "value", "optional": null}),
+        example(None, None)
+    )]
+    fn parse_builder_map_accepts_a_well_formed_map(#[case] map: Value, #[case] expected: Example) {
+        let result: Example = parse_builder_map(&map).expect("expected a well-formed map to parse");
+        assert_eq!(result, expected);
+    }
+
+    /// Every error [`parse_builder_map`] can produce names the field it
+    /// came from: a missing required field, a wrong-type array element
+    /// (by index, so a bad element does not silently shift the ones
+    /// after it), and a present `null` on a [`reject_null`] field (which
+    /// a plain `Option` field would have accepted as `None`).
+    #[rstest]
+    #[case::missing_required_field(json!({}), "required")]
+    #[case::wrong_type_array_element(
+        json!({"required": "value", "items": ["a", 1]}),
+        "items[1]"
+    )]
+    #[case::reject_null_rejects_a_present_null(
+        json!({"required": "value", "strict_optional": null}),
+        "strict_optional"
+    )]
+    fn parse_builder_map_names_the_field_in_the_error(#[case] map: Value, #[case] needle: &str) {
+        let err = parse_builder_map::<Example>(&map).expect_err("expected an error");
+        assert!(
+            err.contains(needle),
+            "expected {needle:?} in the error, got: {err:?}"
+        );
     }
 }
