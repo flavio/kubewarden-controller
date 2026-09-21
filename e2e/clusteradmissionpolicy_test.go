@@ -653,7 +653,7 @@ func TestClusterAdmissionPolicyController(t *testing.T) {
 		Assess("should remove old finalizer from upgrade scenario", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
 			// Create a new PolicyServer for the upgrade test
 			upgradePSName := policiesv1.NewPolicyServerFactory().Build().Name
-			upgradePolicyName := policiesv1.NewPolicyServerFactory().Build().Name
+			upgradePolicyName := policiesv1.NewClusterAdmissionPolicyFactory().Build().Name
 
 			policyServer := policiesv1.NewPolicyServerFactory().
 				WithName(upgradePSName).
