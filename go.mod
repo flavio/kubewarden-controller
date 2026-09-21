@@ -1,6 +1,6 @@
 module github.com/kubewarden/adm-controller
 
-go 1.27.0
+go 1.27.1
 
 replace github.com/opencontainers/runc => github.com/opencontainers/runc v1.5.1
 
