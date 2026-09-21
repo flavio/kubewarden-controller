@@ -49,7 +49,12 @@ helm-unittest:
 	helm unittest charts/admission-controller --file "tests/**/*_test.yaml"
 
 .PHONY: test-e2e
-test-e2e: controller-image audit-scanner-image policy-server-image
+test-e2e: controller-image audit-scanner-image policy-server-image test-e2e-run
+
+# Run the e2e tests against images that already exist in the local
+# docker daemon (for example, images that CI built and loaded).
+.PHONY: test-e2e-run
+test-e2e-run:
 	$(GO_BUILD_ENV) go test ./e2e/ -v
 
 .PHONY: test-all
