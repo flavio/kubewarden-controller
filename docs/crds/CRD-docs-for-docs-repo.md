@@ -324,6 +324,8 @@ _Appears in:_
 
 
 
+
+
 #### PolicyGroupMember
 
 
@@ -589,7 +591,7 @@ _Underlying type:_ _string_
 
 
 _Validation:_
-- Enum: [unscheduled scheduled pending active]
+- Enum: [unscheduled scheduled pending active rejected]
 
 _Appears in:_
 - [PolicyStatus](#policystatus)
@@ -600,6 +602,7 @@ _Appears in:_
 | `scheduled` | PolicyStatusScheduled is a transient state that will continue to<br />pending. This is the default state if a policy server is<br />assigned.<br /> |
 | `pending` | PolicyStatusPending informs that the policy server exists,<br />we are reconciling all resources.<br /> |
 | `active` | PolicyStatusActive informs that the k8s API server should be<br />forwarding admission review objects to the policy.<br /> |
+| `rejected` | PolicyStatusRejected means that the policy targets resources that<br />the cluster administrator does not allow for namespaced policies.<br />The controller does not deploy the policy. The PolicyActive<br />condition explains the reason.<br /> |
 
 
 
@@ -864,7 +867,7 @@ _Underlying type:_ _string_
 
 
 _Validation:_
-- Enum: [unscheduled scheduled pending active]
+- Enum: [unscheduled scheduled pending active rejected]
 
 _Appears in:_
 - [PolicyStatus](#policystatus)
@@ -875,6 +878,7 @@ _Appears in:_
 | `scheduled` | PolicyStatusScheduled is a transient state that will continue to<br />pending. This is the default state if a policy server is<br />assigned.<br /> |
 | `pending` | PolicyStatusPending informs that the policy server exists,<br />we are reconciling all resources.<br /> |
 | `active` | PolicyStatusActive informs that the k8s API server should be<br />forwarding admission review objects to the policy.<br /> |
+| `rejected` | PolicyStatusRejected means that the policy targets resources that<br />the cluster administrator does not allow for namespaced policies.<br />The controller does not deploy the policy. The PolicyActive<br />condition explains the reason.<br /> |
 
 
 

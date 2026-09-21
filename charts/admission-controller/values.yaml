@@ -152,6 +152,47 @@ preDeleteHook:
 # evaluations that could interfere with the Kubewarden stack running in the
 # admission controller namespace.
 alwaysAcceptAdmissionReviewsOnDeploymentsNamespace: true
+# namespacedPoliciesAllowedResources lists the resources that namespaced
+# policies (AdmissionPolicy and AdmissionPolicyGroup) can target.
+# A namespaced policy that targets a resource outside of this list is not
+# deployed. The controller sets the policy status to "rejected" and explains
+# the reason in the PolicyActive condition. ClusterAdmissionPolicy and
+# ClusterAdmissionPolicyGroup are not affected. A policy that targets both
+# permitted and not permitted resources is rejected as a whole.
+#
+# Each entry has the same shape as the apiGroups and resources fields of a
+# policy rule. Wildcards ("*") and subresources ("pods/exec") are not
+# permitted in this list. The controller skips these items and logs them.
+# A policy rule that targets a subresource of a permitted resource is
+# permitted. An empty list rejects every namespaced policy.
+#
+# The default list contains Kubernetes resources that are considered
+# safe to be validated or mutated by namespaced policies.
+namespacedPoliciesAllowedResources: # @schema type:[array, null]
+  - apiGroups: [""] # @schema minItems:1; required:true; item:string
+    resources: # @schema minItems:1; required:true; item:string
+      - pods
+      - replicationcontrollers
+      - configmaps
+      - secrets
+      - services
+      - persistentvolumeclaims
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - statefulsets
+      - replicasets
+      - daemonsets
+  - apiGroups: ["batch"]
+    resources:
+      - jobs
+      - cronjobs
+  - apiGroups: ["autoscaling"]
+    resources:
+      - horizontalpodautoscalers
+  - apiGroups: ["policy"]
+    resources:
+      - poddisruptionbudgets
 # affinity configures affinity rules for the controller pod.
 # This takes precedence over global.affinity when set.
 # When hostNetwork is enabled, users should set appropriate podAntiAffinity

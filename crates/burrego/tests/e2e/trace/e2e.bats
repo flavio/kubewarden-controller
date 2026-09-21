@@ -1,7 +1,7 @@
 #!/usr/bin/env bats
 
 @test "input message is not valid" {
-  run cargo run --example  cli -- -v eval policy.wasm -i '{ "message": "mondo" }'
+  run cargo run --example  cli -- -v eval ../../data/trace.wasm -i '{ "message": "mondo" }'
   # this prints the output when one the checks below fails
   echo "output = ${output}"
 
@@ -12,7 +12,7 @@
 }
 
 @test "input message is valid" {
-  run cargo run --example  cli -- -v eval policy.wasm -i '{ "message": "world" }'
+  run cargo run --example  cli -- -v eval ../../data/trace.wasm -i '{ "message": "world" }'
   # this prints the output when one the checks below fails
   echo "output = ${output}"
 

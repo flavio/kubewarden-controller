@@ -43,6 +43,7 @@ type policySubReconciler struct {
 	client.Client
 	Log                                        logr.Logger
 	deploymentsNamespace                       string
+	controllerConfigMapName                    string
 	featureGateAdmissionWebhookMatchConditions bool
 }
 
@@ -79,6 +80,14 @@ func (r *policySubReconciler) reconcilePolicy(ctx context.Context, policy polici
 			Message: "The policy webhook has not been created",
 		},
 	)
+	rejected, err := r.reconcileNamespacedPolicyAllowList(ctx, policy)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if rejected {
+		return ctrl.Result{}, nil
+	}
+
 	if policy.GetPolicyServer() == "" {
 		policy.SetStatus(policiesv1.PolicyStatusUnscheduled)
 		return ctrl.Result{}, nil
@@ -154,6 +163,50 @@ func (r *policySubReconciler) reconcilePolicy(ctx context.Context, policy polici
 	setPolicyAsActive(policy)
 
 	return ctrl.Result{}, nil
+}
+
+// reconcileNamespacedPolicyAllowList makes sure that a namespaced policy
+// targets only the resources that the cluster administrator allows. When
+// the policy targets other resources, the function removes the webhook
+// configuration of the policy, sets the policy status to rejected and
+// returns true. Cluster-wide policies are always allowed.
+func (r *policySubReconciler) reconcileNamespacedPolicyAllowList(ctx context.Context, policy policiesv1.Policy) (bool, error) {
+	if policy.GetNamespace() == "" {
+		return false, nil
+	}
+
+	config, err := loadControllerConfig(ctx, r.Client, r.deploymentsNamespace, r.controllerConfigMapName, r.Log)
+	if err != nil {
+		return false, err
+	}
+	allowed := config.NamespacedPoliciesAllowedResources
+
+	isAllowed, disallowed := isNamespacedPolicyAllowed(policy, allowed)
+	if isAllowed {
+		return false, nil
+	}
+
+	r.Log.Info("namespaced policy targets resources that are not in the allow list, the policy is rejected",
+		"policy", policy.GetUniqueName(), "disallowedResources", disallowed)
+
+	// Remove the webhook configuration. A policy that was active before
+	// the cluster administrator changed the allow list must stop.
+	if err = r.removePolicyWebhooksAndFinalizers(ctx, policy); err != nil {
+		return false, err
+	}
+
+	policy.SetStatus(policiesv1.PolicyStatusRejected)
+	apimeta.SetStatusCondition(
+		&policy.GetStatus().Conditions,
+		metav1.Condition{
+			Type:    string(policiesv1.PolicyActive),
+			Status:  metav1.ConditionFalse,
+			Reason:  string(policiesv1.PolicyReasonResourcesNotAllowed),
+			Message: namespacedPolicyRejectedMessage(disallowed, allowed, r.controllerConfigMapName),
+		},
+	)
+
+	return true, nil
 }
 
 // reconcilePolicyServerUnavailable handles the case where the PolicyServer is

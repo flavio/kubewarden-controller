@@ -23,15 +23,16 @@ const (
 )
 
 type AdmissionPolicyFactory struct {
-	name         string
-	namespace    string
-	policyServer string
-	mutating     bool
-	rules        []admissionregistrationv1.RuleWithOperations
-	module       string
-	matchConds   []admissionregistrationv1.MatchCondition
-	mode         PolicyMode
-	message      string
+	name              string
+	namespace         string
+	policyServer      string
+	mutating          bool
+	rules             []admissionregistrationv1.RuleWithOperations
+	module            string
+	matchConds        []admissionregistrationv1.MatchCondition
+	mode              PolicyMode
+	message           string
+	withoutFinalizers bool
 }
 
 func NewAdmissionPolicyFactory() *AdmissionPolicyFactory {
@@ -50,7 +51,7 @@ func NewAdmissionPolicyFactory() *AdmissionPolicyFactory {
 				Rule: admissionregistrationv1.Rule{
 					APIGroups:   []string{""},
 					APIVersions: []string{"v1"},
-					Resources:   []string{"Pods"}, //nolint:goconst
+					Resources:   []string{"pods"}, //nolint:goconst
 				},
 			},
 		},
@@ -102,17 +103,27 @@ func (f *AdmissionPolicyFactory) WithMessage(message string) *AdmissionPolicyFac
 	return f
 }
 
+func (f *AdmissionPolicyFactory) WithoutFinalizers() *AdmissionPolicyFactory {
+	f.withoutFinalizers = true
+	return f
+}
+
 func (f *AdmissionPolicyFactory) Build() *AdmissionPolicy {
+	var finalizers []string
+	if !f.withoutFinalizers {
+		finalizers = []string{
+			// Safety-net finalizer that prevents the API server from garbage-
+			// collecting the object during integration tests, so test assertions
+			// can observe the controller's behavior before deletion completes.
+			integrationTestsFinalizer,
+		}
+	}
+
 	policy := AdmissionPolicy{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      f.name,
-			Namespace: f.namespace,
-			Finalizers: []string{
-				// Safety-net finalizer that prevents the API server from garbage-
-				// collecting the object during integration tests, so test assertions
-				// can observe the controller's behavior before deletion completes.
-				integrationTestsFinalizer,
-			},
+			Name:       f.name,
+			Namespace:  f.namespace,
+			Finalizers: finalizers,
 		},
 		Spec: AdmissionPolicySpec{
 			PolicySpec: PolicySpec{
@@ -157,7 +168,7 @@ func NewClusterAdmissionPolicyFactory() *ClusterAdmissionPolicyFactory {
 				Rule: admissionregistrationv1.Rule{
 					APIGroups:   []string{""},
 					APIVersions: []string{"v1"},
-					Resources:   []string{"Pods"},
+					Resources:   []string{"pods"},
 				},
 			},
 		},
@@ -277,7 +288,7 @@ func NewAdmissionPolicyGroupFactory() *AdmissionPolicyGroupFactory {
 				Rule: admissionregistrationv1.Rule{
 					APIGroups:   []string{""},
 					APIVersions: []string{"v1"},
-					Resources:   []string{"Pods"},
+					Resources:   []string{"pods"},
 				},
 			},
 		},
@@ -378,7 +389,7 @@ func NewClusterAdmissionPolicyGroupFactory() *ClusterAdmissionPolicyGroupFactory
 				Rule: admissionregistrationv1.Rule{
 					APIGroups:   []string{""},
 					APIVersions: []string{"v1"},
-					Resources:   []string{"Pods"},
+					Resources:   []string{"pods"},
 				},
 			},
 		},

@@ -536,5 +536,319 @@ func TestAdmissionPolicyController(t *testing.T) {
 			return ctx
 		}).Feature()
 
-	testenv.Test(t, validatingFeature, mutatingFeature, scheduledFeature)
+	// The Helm chart installs a default allow list of resources that
+	// namespaced policies can target. NetworkPolicies are not in this list.
+	rejectedNamespacedPolicyFeature := features.New("Rejected AdmissionPolicy").
+		Setup(func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			err := createNamespaceWithRetry(ctx, cfg, policyNamespace)
+			require.NoError(t, err)
+
+			err = policiesv1.AddToScheme(cfg.Client().Resources().GetScheme())
+			require.NoError(t, err)
+
+			policyServerName := policiesv1.NewPolicyServerFactory().Build().Name
+			policyServer := policiesv1.NewPolicyServerFactory().
+				WithName(policyServerName).
+				Build()
+			err = createPolicyServerAndWaitForItsService(ctx, cfg, policyServer)
+			require.NoError(t, err)
+
+			policyName := policiesv1.NewAdmissionPolicyFactory().Build().Name
+			policy := policiesv1.NewAdmissionPolicyFactory().
+				WithName(policyName).
+				WithNamespace(policyNamespace).
+				WithPolicyServer(policyServerName).
+				// This test checks that the deleted policy disappears right
+				// away. Without this call, the safety-net finalizer keeps
+				// the object present.
+				WithoutFinalizers().
+				WithRules([]admissionregistrationv1.RuleWithOperations{
+					{
+						Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create},
+						Rule: admissionregistrationv1.Rule{
+							APIGroups:   []string{"networking.k8s.io"},
+							APIVersions: []string{"v1"},
+							Resources:   []string{"networkpolicies"},
+						},
+					},
+				}).
+				Build()
+			err = cfg.Client().Resources().Create(ctx, policy)
+			require.NoError(t, err)
+
+			ctx = context.WithValue(ctx, policyNameKey, policyName)
+			ctx = context.WithValue(ctx, policyKey, policy)
+
+			return ctx
+		}).
+		Assess("should set the policy status to rejected", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			policyName := ctx.Value(policyNameKey).(string)
+
+			err := wait.For(conditions.New(cfg.Client().Resources()).ResourceMatch(
+				&policiesv1.AdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: policyName, Namespace: policyNamespace}},
+				func(object k8s.Object) bool {
+					p := object.(*policiesv1.AdmissionPolicy)
+					return isPolicyRejectedFor(&p.Status, "networkpolicies.networking.k8s.io")
+				},
+			), wait.WithTimeout(testTimeout), wait.WithInterval(testPollInterval))
+			require.NoError(t, err, "Policy should have rejected status with a PolicyActive condition that lists the resources")
+
+			return ctx
+		}).
+		Assess("should not create the ValidatingWebhookConfiguration", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			policy := ctx.Value(policyKey).(*policiesv1.AdmissionPolicy)
+
+			webhook := &admissionregistrationv1.ValidatingWebhookConfiguration{}
+			err := cfg.Client().Resources().Get(ctx, policy.GetUniqueName(), "", webhook)
+			require.True(t, apierrors.IsNotFound(err), "ValidatingWebhookConfiguration must not exist for a rejected policy")
+
+			return ctx
+		}).
+		Assess("should delete the policy without waiting for a finalizer", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			policy := ctx.Value(policyKey).(*policiesv1.AdmissionPolicy)
+
+			var latestPolicy policiesv1.AdmissionPolicy
+			err := cfg.Client().Resources().Get(ctx, policy.GetName(), policy.GetNamespace(), &latestPolicy)
+			require.NoError(t, err)
+			require.False(t, containsFinalizer(latestPolicy.GetFinalizers(), constants.KubewardenFinalizer),
+				"the controller must not add its finalizer to a rejected policy")
+
+			err = cfg.Client().Resources().Delete(ctx, &latestPolicy)
+			require.NoError(t, err)
+
+			err = wait.For(conditions.New(cfg.Client().Resources()).ResourceDeleted(policy),
+				wait.WithTimeout(testTimeout), wait.WithInterval(testPollInterval))
+			require.NoError(t, err, "Rejected policy should be deleted")
+
+			return ctx
+		}).Feature()
+
+	// The allow list check does not look at spec.mutating. A mutating
+	// AdmissionPolicy that targets a resource outside the allow list is
+	// rejected the same way as a validating policy.
+	rejectedMutatingNamespacedPolicyFeature := features.New("Rejected mutating AdmissionPolicy").
+		Setup(func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			err := createNamespaceWithRetry(ctx, cfg, policyNamespace)
+			require.NoError(t, err)
+
+			err = policiesv1.AddToScheme(cfg.Client().Resources().GetScheme())
+			require.NoError(t, err)
+
+			policyServerName := policiesv1.NewPolicyServerFactory().Build().Name
+			policyServer := policiesv1.NewPolicyServerFactory().
+				WithName(policyServerName).
+				Build()
+			err = createPolicyServerAndWaitForItsService(ctx, cfg, policyServer)
+			require.NoError(t, err)
+
+			policyName := policiesv1.NewAdmissionPolicyFactory().Build().Name
+			policy := policiesv1.NewAdmissionPolicyFactory().
+				WithName(policyName).
+				WithNamespace(policyNamespace).
+				WithPolicyServer(policyServerName).
+				WithMutating(true).
+				// This test checks that the deleted policy disappears right
+				// away. Without this call, the safety-net finalizer keeps
+				// the object present.
+				WithoutFinalizers().
+				WithRules([]admissionregistrationv1.RuleWithOperations{
+					{
+						Operations: []admissionregistrationv1.OperationType{admissionregistrationv1.Create},
+						Rule: admissionregistrationv1.Rule{
+							APIGroups:   []string{"networking.k8s.io"},
+							APIVersions: []string{"v1"},
+							Resources:   []string{"networkpolicies"},
+						},
+					},
+				}).
+				Build()
+			err = cfg.Client().Resources().Create(ctx, policy)
+			require.NoError(t, err)
+
+			ctx = context.WithValue(ctx, policyNameKey, policyName)
+			ctx = context.WithValue(ctx, policyKey, policy)
+
+			return ctx
+		}).
+		Assess("should set the policy status to rejected", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			policyName := ctx.Value(policyNameKey).(string)
+
+			err := wait.For(conditions.New(cfg.Client().Resources()).ResourceMatch(
+				&policiesv1.AdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: policyName, Namespace: policyNamespace}},
+				func(object k8s.Object) bool {
+					p := object.(*policiesv1.AdmissionPolicy)
+					return isPolicyRejectedFor(&p.Status, "networkpolicies.networking.k8s.io")
+				},
+			), wait.WithTimeout(testTimeout), wait.WithInterval(testPollInterval))
+			require.NoError(t, err, "Mutating policy should have rejected status with a PolicyActive condition that lists the resources")
+
+			return ctx
+		}).
+		Assess("should not create the MutatingWebhookConfiguration", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			policy := ctx.Value(policyKey).(*policiesv1.AdmissionPolicy)
+
+			webhook := &admissionregistrationv1.MutatingWebhookConfiguration{}
+			err := cfg.Client().Resources().Get(ctx, policy.GetUniqueName(), "", webhook)
+			require.True(t, apierrors.IsNotFound(err), "MutatingWebhookConfiguration must not exist for a rejected policy")
+
+			return ctx
+		}).
+		Assess("should delete the policy without waiting for a finalizer", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			policy := ctx.Value(policyKey).(*policiesv1.AdmissionPolicy)
+
+			var latestPolicy policiesv1.AdmissionPolicy
+			err := cfg.Client().Resources().Get(ctx, policy.GetName(), policy.GetNamespace(), &latestPolicy)
+			require.NoError(t, err)
+			require.False(t, containsFinalizer(latestPolicy.GetFinalizers(), constants.KubewardenFinalizer),
+				"the controller must not add its finalizer to a rejected mutating policy")
+
+			err = cfg.Client().Resources().Delete(ctx, &latestPolicy)
+			require.NoError(t, err)
+
+			err = wait.For(conditions.New(cfg.Client().Resources()).ResourceDeleted(policy),
+				wait.WithTimeout(testTimeout), wait.WithInterval(testPollInterval))
+			require.NoError(t, err, "Rejected mutating policy should be deleted")
+
+			return ctx
+		}).Feature()
+
+	// The chart default allow list contains pods. The policy starts active
+	// with a webhook in place. The test removes pods from the allow list.
+	// The controller must then reject the policy, delete its webhook, and
+	// remove the policy from the PolicyServer configuration. The test then
+	// restores the allow list. The controller must deploy the policy again.
+	allowListChangeFeature := features.New("AdmissionPolicy rejected after its resource leaves the allow list").
+		Setup(func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			err := createNamespaceWithRetry(ctx, cfg, policyNamespace)
+			require.NoError(t, err)
+
+			err = policiesv1.AddToScheme(cfg.Client().Resources().GetScheme())
+			require.NoError(t, err)
+
+			originalControllerConfig, err := getControllerConfig(ctx, cfg)
+			require.NoError(t, err)
+			ctx = context.WithValue(ctx, controllerConfigKey, originalControllerConfig)
+
+			policyServerName := policiesv1.NewPolicyServerFactory().Build().Name
+			policyServer := policiesv1.NewPolicyServerFactory().
+				WithName(policyServerName).
+				Build()
+			err = createPolicyServerAndWaitForItsService(ctx, cfg, policyServer)
+			require.NoError(t, err)
+
+			// The default rule targets pods. The chart default allow list
+			// already permits pods. This test skips the safety-net finalizer,
+			// so the Teardown step does not leave a Terminating object behind.
+			policyName := policiesv1.NewAdmissionPolicyFactory().Build().Name
+			policy := policiesv1.NewAdmissionPolicyFactory().
+				WithName(policyName).
+				WithNamespace(policyNamespace).
+				WithPolicyServer(policyServerName).
+				WithoutFinalizers().
+				Build()
+			err = cfg.Client().Resources().Create(ctx, policy)
+			require.NoError(t, err)
+
+			ctx = context.WithValue(ctx, policyNameKey, policyName)
+			ctx = context.WithValue(ctx, policyKey, policy)
+			ctx = context.WithValue(ctx, policyServerNameKey, policyServerName)
+
+			return ctx
+		}).
+		Assess("should set the policy to active and create its webhook", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			policyName := ctx.Value(policyNameKey).(string)
+			policyServerName := ctx.Value(policyServerNameKey).(string)
+			policy := ctx.Value(policyKey).(*policiesv1.AdmissionPolicy)
+
+			err := waitForAdmissionPolicyActive(cfg, policyName, policyNamespace)
+			require.NoError(t, err, "Policy should transition to active status")
+
+			webhook := &admissionregistrationv1.ValidatingWebhookConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: policy.GetUniqueName()},
+			}
+			err = wait.For(conditions.New(cfg.Client().Resources()).ResourceMatch(webhook, func(object k8s.Object) bool {
+				w := object.(*admissionregistrationv1.ValidatingWebhookConfiguration)
+				return len(w.Webhooks) == 1
+			}), wait.WithTimeout(testTimeout), wait.WithInterval(testPollInterval))
+			require.NoError(t, err, "ValidatingWebhookConfiguration should be created")
+
+			err = waitForPolicyServerConfigMapPolicy(cfg, policyServerName, policy.GetUniqueName(), true)
+			require.NoError(t, err, "policy should be part of the PolicyServer configuration")
+
+			return ctx
+		}).
+		Assess("should reject the policy and remove its webhook once pods leave the allow list", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			policyName := ctx.Value(policyNameKey).(string)
+			policyServerName := ctx.Value(policyServerNameKey).(string)
+			policy := ctx.Value(policyKey).(*policiesv1.AdmissionPolicy)
+
+			err := setControllerConfig(ctx, cfg, `namespacedPoliciesAllowedResources:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+`)
+			require.NoError(t, err)
+
+			err = waitForAdmissionPolicyRejected(cfg, policyName, policyNamespace, "pods")
+			require.NoError(t, err, "Policy should transition to rejected status")
+
+			webhook := &admissionregistrationv1.ValidatingWebhookConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: policy.GetUniqueName()},
+			}
+			err = wait.For(conditions.New(cfg.Client().Resources()).ResourceDeleted(webhook),
+				wait.WithTimeout(testTimeout), wait.WithInterval(testPollInterval))
+			require.NoError(t, err, "ValidatingWebhookConfiguration should be deleted")
+
+			err = wait.For(conditions.New(cfg.Client().Resources()).ResourceMatch(
+				&policiesv1.AdmissionPolicy{ObjectMeta: metav1.ObjectMeta{Name: policyName, Namespace: policyNamespace}},
+				func(object k8s.Object) bool {
+					p := object.(*policiesv1.AdmissionPolicy)
+					return !containsFinalizer(p.Finalizers, constants.KubewardenFinalizer)
+				},
+			), wait.WithTimeout(testTimeout), wait.WithInterval(testPollInterval))
+			require.NoError(t, err, "the finalizer should be removed from the rejected policy")
+
+			err = waitForPolicyServerConfigMapPolicy(cfg, policyServerName, policy.GetUniqueName(), false)
+			require.NoError(t, err, "policy should be removed from the PolicyServer configuration")
+
+			return ctx
+		}).
+		Assess("should deploy the policy again once pods are back in the allow list", func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			policyName := ctx.Value(policyNameKey).(string)
+			policyServerName := ctx.Value(policyServerNameKey).(string)
+			policy := ctx.Value(policyKey).(*policiesv1.AdmissionPolicy)
+			originalControllerConfig := ctx.Value(controllerConfigKey).(string)
+
+			err := setControllerConfig(ctx, cfg, originalControllerConfig)
+			require.NoError(t, err)
+
+			err = waitForAdmissionPolicyActive(cfg, policyName, policyNamespace)
+			require.NoError(t, err, "Policy should transition to active status again")
+
+			webhook := &admissionregistrationv1.ValidatingWebhookConfiguration{
+				ObjectMeta: metav1.ObjectMeta{Name: policy.GetUniqueName()},
+			}
+			err = wait.For(conditions.New(cfg.Client().Resources()).ResourceMatch(webhook, func(object k8s.Object) bool {
+				w := object.(*admissionregistrationv1.ValidatingWebhookConfiguration)
+				return len(w.Webhooks) == 1
+			}), wait.WithTimeout(testTimeout), wait.WithInterval(testPollInterval))
+			require.NoError(t, err, "ValidatingWebhookConfiguration should be created again")
+
+			err = waitForPolicyServerConfigMapPolicy(cfg, policyServerName, policy.GetUniqueName(), true)
+			require.NoError(t, err, "policy should be part of the PolicyServer configuration again")
+
+			return ctx
+		}).
+		Teardown(func(ctx context.Context, t *testing.T, cfg *envconf.Config) context.Context {
+			if originalControllerConfig, ok := ctx.Value(controllerConfigKey).(string); ok {
+				_ = setControllerConfig(ctx, cfg, originalControllerConfig)
+			}
+
+			if policy, ok := ctx.Value(policyKey).(*policiesv1.AdmissionPolicy); ok {
+				_ = cfg.Client().Resources().Delete(ctx, policy)
+			}
+
+			return ctx
+		}).Feature()
+
+	testenv.Test(t, validatingFeature, mutatingFeature, scheduledFeature, rejectedNamespacedPolicyFeature, rejectedMutatingNamespacedPolicyFeature, allowListChangeFeature)
 }

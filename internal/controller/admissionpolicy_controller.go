@@ -27,6 +27,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -54,6 +55,7 @@ type AdmissionPolicyReconciler struct {
 	Log                                        logr.Logger
 	Scheme                                     *runtime.Scheme
 	DeploymentsNamespace                       string
+	ControllerConfigMapName                    string
 	FeatureGateAdmissionWebhookMatchConditions bool
 	policySubReconciler                        *policySubReconciler
 }
@@ -74,9 +76,10 @@ func (r *AdmissionPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 // SetupWithManager sets up the controller with the Manager.
 func (r *AdmissionPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.policySubReconciler = &policySubReconciler{
-		Client:               r.Client,
-		Log:                  r.Log,
-		deploymentsNamespace: r.DeploymentsNamespace,
+		Client:                  r.Client,
+		Log:                     r.Log,
+		deploymentsNamespace:    r.DeploymentsNamespace,
+		controllerConfigMapName: r.ControllerConfigMapName,
 		featureGateAdmissionWebhookMatchConditions: r.FeatureGateAdmissionWebhookMatchConditions,
 	}
 
@@ -93,6 +96,14 @@ func (r *AdmissionPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(
 			&admissionregistrationv1.ValidatingWebhookConfiguration{},
 			handler.EnqueueRequestsFromMapFunc(r.findAdmissionPolicyForWebhookConfiguration),
+		).
+		// The controller configuration ConfigMap holds the allow list of
+		// resources for namespaced policies. A change of the allow list
+		// can activate or reject every namespaced policy.
+		Watches(
+			&corev1.ConfigMap{},
+			handler.EnqueueRequestsFromMapFunc(r.findAllPoliciesForControllerConfigMap),
+			builder.WithPredicates(controllerConfigMapPredicate(r.DeploymentsNamespace, r.ControllerConfigMapName)),
 		).
 		Watches(
 			&admissionregistrationv1.MutatingWebhookConfiguration{},
@@ -137,4 +148,8 @@ func (r *AdmissionPolicyReconciler) findAdmissionPolicyForWebhookConfiguration(_
 			},
 		},
 	}
+}
+
+func (r *AdmissionPolicyReconciler) findAllPoliciesForControllerConfigMap(ctx context.Context, _ client.Object) []reconcile.Request {
+	return findAllAdmissionPolicies(ctx, r.Client, r.Log)
 }

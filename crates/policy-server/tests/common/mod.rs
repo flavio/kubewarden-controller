@@ -233,6 +233,7 @@ fn default_config() -> Config {
         ignore_kubernetes_connection_failure: true,
         always_accept_admission_reviews_on_namespace: None,
         policy_evaluation_limit_seconds: Some(2),
+        policy_memory_limit_bytes: Some(256 * 1024 * 1024),
         tls_config: None,
         pool_size: 2,
         metrics_enabled: false,

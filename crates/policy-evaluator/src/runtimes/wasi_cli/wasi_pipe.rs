@@ -6,6 +6,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use tracing::warn;
 use wasmtime_wasi::{
     cli::{IsTerminal, StdinStream},
     p2::{InputStream, Pollable, StreamError, StreamResult},
@@ -23,6 +24,20 @@ use crate::runtimes::wasi_cli::errors::WasiRuntimeError;
 /// When the buffer is empty, the guest sees EOF. Writing more data to the
 /// pipe makes it readable again. This is used by the host_call
 /// implementation to provide the host callback response to the guest.
+///
+/// The host_call protocol requires the guest to fully drain the pipe (down
+/// to a transient EOF, see below) before invoking another `host.call`: the
+/// initial payload must be read to EOF before the guest can even parse it,
+/// and each callback response must be read to EOF before the guest knows
+/// it's complete. As a consequence, at the point `send` is called the
+/// buffer is always expected to be empty for a well-behaved guest. `send`
+/// takes advantage of this invariant to protect the host from a guest that
+/// violates the protocol (e.g. by looping on `host.call` without ever
+/// reading the responses): it wipes any unread bytes before appending the
+/// new payload, rather than letting them accumulate without bound. This
+/// keeps the pipe's memory usage bounded by the size of the largest single
+/// payload (initial input or one callback response), with no need for an
+/// explicit capacity limit.
 #[derive(Clone, Default)]
 pub(crate) struct WasiPipe {
     // A plain `std::sync::Mutex` is used on purpose, instead of an async
@@ -58,11 +73,27 @@ impl WasiPipe {
     }
 
     /// Append data to the pipe, making it available to the WASI guest.
+    ///
+    /// Any data left unread from a previous payload is discarded first: a
+    /// well-behaved guest always drains the pipe to (transient) EOF before
+    /// the host has a chance to `send` again, so leftover bytes can only be
+    /// the result of a guest violating the host_call protocol. See the
+    /// type-level documentation for details.
     pub fn send(&self, data: &[u8]) -> Result<(), WasiRuntimeError> {
         let mut buffer = self
             .buffer
             .lock()
             .map_err(|_| WasiRuntimeError::WasiPipePoisonedLock)?;
+        if !buffer.is_empty() {
+            warn!(
+                discarded_bytes = buffer.len(),
+                "WASI guest did not drain stdin before the host wrote more data to it; \
+                 discarding unread bytes. This indicates the guest is violating the \
+                 host_call protocol (a host.call response, or the initial input, was \
+                 not fully read before another host.call was issued)."
+            );
+            buffer.clear();
+        }
         buffer.extend(data);
         Ok(())
     }
@@ -233,6 +264,33 @@ mod tests {
         assert_eq!(
             stream.read(100).unwrap(),
             Bytes::from_static(b"host response")
+        );
+        assert!(matches!(stream.read(10), Err(StreamError::Closed)));
+    }
+
+    // `send` protects the host from a guest that violates the host_call
+    // protocol by never draining a previous payload: instead of letting
+    // unread bytes accumulate without bound, it wipes them before
+    // appending the new payload. A well-behaved guest never observes this
+    // (it always drains to EOF first), but this guards against a
+    // misbehaving/malicious one holding the host hostage via unbounded
+    // memory growth.
+    #[test]
+    fn send_discards_unread_data() {
+        let pipe = WasiPipe::new(b"");
+        let mut stream = pipe.p2_stream();
+
+        // Guest never reads this first payload.
+        pipe.send(b"first payload, never read").unwrap();
+
+        // A second `send` (as would happen on a second `host.call` without
+        // the guest draining stdin in between) discards the first payload
+        // entirely rather than concatenating with it.
+        pipe.send(b"second payload").unwrap();
+
+        assert_eq!(
+            stream.read(100).unwrap(),
+            Bytes::from_static(b"second payload")
         );
         assert!(matches!(stream.read(10), Err(StreamError::Closed)));
     }

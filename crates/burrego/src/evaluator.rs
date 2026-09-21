@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use itertools::Itertools;
 use tracing::debug;
-use wasmtime::{Engine, Instance, Linker, Memory, MemoryType, Module, Store};
+use wasmtime::{Engine, Instance, Linker, Memory, MemoryType, Module, Store, StoreLimits};
 
 use crate::{
     builtins,
@@ -10,6 +10,7 @@ use crate::{
     host_callbacks::HostCallbacks,
     opa_host_functions,
     policy::Policy,
+    resource_limits::{self, ResourceLimits},
     stack_helper::StackHelper,
 };
 
@@ -22,8 +23,14 @@ macro_rules! set_epoch_deadline_and_call_guest {
     }};
 }
 
+/// Data associated with the `wasmtime::Store` used to run a Rego policy.
+pub(crate) struct StoreData {
+    pub(crate) stack_helper: Option<StackHelper>,
+    pub(crate) limits: StoreLimits,
+}
+
 struct EvaluatorStack {
-    store: Store<Option<StackHelper>>,
+    store: Store<StoreData>,
     instance: Instance,
     memory: Memory,
     policy: Policy,
@@ -32,7 +39,7 @@ struct EvaluatorStack {
 pub struct Evaluator {
     engine: Engine,
     module: Module,
-    store: Store<Option<StackHelper>>,
+    store: Store<StoreData>,
     instance: Instance,
     memory: Memory,
     policy: Policy,
@@ -41,6 +48,10 @@ pub struct Evaluator {
     /// interruption](https://docs.rs/wasmtime/latest/wasmtime/struct.Config.html#method.epoch_interruption)
     /// feature of wasmtime
     epoch_deadline: Option<u64>,
+    /// used to enforce a cap on the linear memory and table size the
+    /// policy is allowed to grow to, via wasmtime's `ResourceLimiter`
+    /// facility
+    resource_limits: Option<ResourceLimits>,
     entrypoints: HashMap<String, i32>,
     used_builtins: HashSet<String>,
 }
@@ -51,12 +62,14 @@ impl Evaluator {
         module: Module,
         host_callbacks: HostCallbacks,
         epoch_deadline: Option<u64>,
+        resource_limits: Option<ResourceLimits>,
     ) -> Result<Evaluator> {
         let stack = Self::setup(
             engine.clone(),
             module.clone(),
             host_callbacks.clone(),
             epoch_deadline,
+            resource_limits,
         )?;
         let mut store = stack.store;
         let instance = stack.instance;
@@ -90,6 +103,7 @@ impl Evaluator {
             policy,
             host_callbacks,
             epoch_deadline,
+            resource_limits,
             entrypoints,
             used_builtins,
         };
@@ -109,11 +123,16 @@ impl Evaluator {
         module: Module,
         host_callbacks: HostCallbacks,
         epoch_deadline: Option<u64>,
+        resource_limits: Option<ResourceLimits>,
     ) -> Result<EvaluatorStack> {
-        let mut linker = Linker::<Option<StackHelper>>::new(&engine);
+        let mut linker = Linker::<StoreData>::new(&engine);
 
-        let opa_data_helper: Option<StackHelper> = None;
-        let mut store = Store::new(&engine, opa_data_helper);
+        let store_data = StoreData {
+            stack_helper: None,
+            limits: resource_limits::store_limits(resource_limits),
+        };
+        let mut store = Store::new(&engine, store_data);
+        store.limiter(|data| &mut data.limits);
 
         let memory_ty = MemoryType::new(5, None);
         let memory = Memory::new(&mut store, memory_ty)
@@ -146,7 +165,7 @@ impl Evaluator {
             host_callbacks.opa_println,
         )?;
         let policy = Policy::new(&instance, &mut store, &memory)?;
-        _ = store.data_mut().insert(stack_helper);
+        store.data_mut().stack_helper = Some(stack_helper);
 
         Ok(EvaluatorStack {
             memory,
@@ -162,6 +181,7 @@ impl Evaluator {
             self.module.clone(),
             self.host_callbacks.clone(),
             self.epoch_deadline,
+            self.resource_limits,
         )?;
         self.store = stack.store;
         self.instance = stack.instance;

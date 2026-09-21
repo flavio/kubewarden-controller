@@ -187,6 +187,10 @@ impl PolicyServer {
             evaluation_environment_builder =
                 evaluation_environment_builder.with_global_policy_evaluation_limit_seconds(limit);
         }
+        if let Some(limit) = config.policy_memory_limit_bytes {
+            evaluation_environment_builder =
+                evaluation_environment_builder.with_policy_memory_limit(limit);
+        }
         let evaluation_environment = evaluation_environment_builder.build(&config.policies)?;
 
         if let Some(limit) = config.policy_evaluation_limit_seconds {
@@ -219,6 +223,15 @@ impl PolicyServer {
             });
         } else {
             info!("policy timeout protection is disabled");
+        }
+
+        if let Some(limit) = config.policy_memory_limit_bytes {
+            info!(
+                policy_memory_limit_bytes = limit,
+                "policy memory limit is enabled"
+            );
+        } else {
+            warn!("policy memory limit is disabled");
         }
 
         let state = Arc::new(ApiServerState {

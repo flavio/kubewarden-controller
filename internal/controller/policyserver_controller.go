@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/go-logr/logr"
@@ -32,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -66,6 +68,10 @@ type PolicyServerReconciler struct {
 	DeploymentsNamespace                               string
 	AlwaysAcceptAdmissionReviewsInDeploymentsNamespace bool
 	ClientCAConfigMapName                              string
+	// ControllerConfigMapName is the name of the ConfigMap that holds the
+	// controller configuration. The controller reads the allow list of
+	// resources for namespaced policies from it.
+	ControllerConfigMapName string
 	// ImagePullSecrets is the list of image pull secrets to add to every
 	// policy-server Deployment, sourced from the controller's own
 	// --image-pull-secrets flag.
@@ -130,6 +136,11 @@ func (r *PolicyServerReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	policies, err := r.getPolicies(ctx, &policyServer)
 	if err != nil {
 		return ctrl.Result{}, errors.Join(errors.New("could not get policies"), err)
+	}
+
+	policies, err = r.filterRejectedNamespacedPolicies(ctx, policies)
+	if err != nil {
+		return ctrl.Result{}, errors.Join(errors.New("could not filter rejected namespaced policies"), err)
 	}
 
 	if err = r.reconcilePolicyServerConfigMap(ctx, &policyServer, policies); err != nil {
@@ -248,6 +259,14 @@ func (r *PolicyServerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&policiesv1.AdmissionPolicyGroup{}, handler.EnqueueRequestsFromMapFunc(r.enqueueAdmissionPolicyGroup)).
 		Watches(&policiesv1.ClusterAdmissionPolicy{}, handler.EnqueueRequestsFromMapFunc(r.enqueueClusterAdmissionPolicy)).
 		Watches(&policiesv1.ClusterAdmissionPolicyGroup{}, handler.EnqueueRequestsFromMapFunc(r.enqueueClusterAdmissionPolicyGroup)).
+		// The controller configuration ConfigMap holds the allow list of
+		// resources for namespaced policies. A change of the allow list
+		// changes the set of policies served by every PolicyServer.
+		Watches(
+			&corev1.ConfigMap{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueAllPolicyServersForControllerConfigMap),
+			builder.WithPredicates(controllerConfigMapPredicate(r.DeploymentsNamespace, r.ControllerConfigMapName)),
+		).
 		Complete(r)
 	if err != nil {
 		return errors.Join(errors.New("failed enrolling controller with manager"), err)
@@ -333,6 +352,40 @@ func (r *PolicyServerReconciler) enqueueClusterAdmissionPolicyGroup(_ context.Co
 			},
 		},
 	}
+}
+
+func (r *PolicyServerReconciler) enqueueAllPolicyServersForControllerConfigMap(ctx context.Context, _ client.Object) []reconcile.Request {
+	return findAllPolicyServers(ctx, r.Client, r.Log)
+}
+
+// filterRejectedNamespacedPolicies removes from the list the namespaced
+// policies that target resources outside of the allow list. The
+// PolicyServer must not load these policies. The policy reconciler sets
+// the status of these policies to rejected.
+func (r *PolicyServerReconciler) filterRejectedNamespacedPolicies(ctx context.Context, policies []policiesv1.Policy) ([]policiesv1.Policy, error) {
+	hasNamespacedPolicies := slices.ContainsFunc(policies, func(policy policiesv1.Policy) bool {
+		return policy.GetNamespace() != ""
+	})
+	if !hasNamespacedPolicies {
+		return policies, nil
+	}
+
+	config, err := loadControllerConfig(ctx, r.Client, r.DeploymentsNamespace, r.ControllerConfigMapName, r.Log)
+	if err != nil {
+		return nil, err
+	}
+
+	filtered := make([]policiesv1.Policy, 0, len(policies))
+	for _, policy := range policies {
+		isAllowed, disallowed := isNamespacedPolicyAllowed(policy, config.NamespacedPoliciesAllowedResources)
+		if !isAllowed {
+			r.Log.Info("namespaced policy targets resources that are not in the allow list, the policy is not added to the PolicyServer configuration",
+				"policy", policy.GetUniqueName(), "disallowedResources", disallowed)
+			continue
+		}
+		filtered = append(filtered, policy)
+	}
+	return filtered, nil
 }
 
 // getPolicies returns all admission policies, cluster admission policies,
