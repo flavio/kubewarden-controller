@@ -50,7 +50,7 @@ helm-unittest:
 
 .PHONY: test-e2e
 test-e2e: controller-image audit-scanner-image policy-server-image
-	$(GO_BUILD_ENV) go test ./e2e/ -v
+	$(GO_BUILD_ENV) go test ./e2e/ -v -timeout 45m
 
 .PHONY: test-all
 test-all: test helm-unittest test-e2e
