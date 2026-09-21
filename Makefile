@@ -50,6 +50,12 @@ helm-unittest:
 
 .PHONY: test-e2e
 test-e2e: controller-image audit-scanner-image policy-server-image
+	$(MAKE) test-e2e-run
+
+# Run the e2e tests against images that already exist in the local
+# docker daemon (for example, images that CI built and loaded).
+.PHONY: test-e2e-run
+test-e2e-run:
 	$(GO_BUILD_ENV) go test ./e2e/ -v
 
 .PHONY: test-all
