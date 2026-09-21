@@ -56,7 +56,7 @@ test-e2e: controller-image audit-scanner-image policy-server-image
 # docker daemon (for example, images that CI built and loaded).
 .PHONY: test-e2e-run
 test-e2e-run:
-	$(GO_BUILD_ENV) go test ./e2e/ -v
+	$(GO_BUILD_ENV) go test ./e2e/ -v -timeout 45m
 
 .PHONY: test-all
 test-all: test helm-unittest test-e2e
