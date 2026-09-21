@@ -343,7 +343,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Prepare sigstore environment for testing
-        uses: ./.github/actions/setup-sigstore-env
+        uses: $/.github/actions/setup-sigstore-env
       - name: Run kwctl Sigstore E2E tests
         run: make -C crates/kwctl e2e-tests-sigstore
 
@@ -357,7 +357,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Prepare sigstore environment for testing
-        uses: ./.github/actions/setup-sigstore-env
+        uses: $/.github/actions/setup-sigstore-env
       - name: Run policy-server Sigstore E2E tests
         run: make -C crates/policy-server e2e-tests-sigstore
 
@@ -433,7 +433,7 @@ jobs:
       id-token: write
       attestations: write
       contents: read
-    uses: ./.github/workflows/build-kwctl.yml
+    uses: $/.github/workflows/build-kwctl.yml
     with:
       force_build: true
       build_only: true

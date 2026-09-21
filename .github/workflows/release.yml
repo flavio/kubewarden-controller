@@ -37,7 +37,7 @@ jobs:
 
   ci:
     needs: version-check
-    uses: ./.github/workflows/ci.yml
+    uses: $/.github/workflows/ci.yml
     # Specify all permissions explicitly - read for most, write for attestations
     permissions:
       actions: read
@@ -113,7 +113,7 @@ jobs:
 
   build-kwctl:
     name: Build kwctl binaries
-    uses: ./.github/workflows/build-kwctl.yml
+    uses: $/.github/workflows/build-kwctl.yml
     permissions:
       contents: read
       id-token: write
