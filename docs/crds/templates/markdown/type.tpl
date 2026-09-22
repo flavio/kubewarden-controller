@@ -18,7 +18,11 @@ _Validation:_
 {{ if $type.References -}}
 _Appears in:_
 {{- range $type.SortedReferences }}
+{{- if markdownShouldRenderType . }}
 - {{ markdownRenderTypeLink . }}
+{{- else }}
+- {{ .Name }}
+{{- end }}
 {{- end }}
 {{- end }}
 
@@ -58,7 +62,7 @@ _Appears in:_
 
 {{ end -}}
 
-{{ if $type.EnumValues -}} 
+{{ if $type.EnumValues -}}
 | Field | Description |
 | --- | --- |
 {{ range $type.EnumValues -}}

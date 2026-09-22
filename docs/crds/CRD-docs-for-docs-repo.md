@@ -552,7 +552,7 @@ ContextAwareResource identifies a Kubernetes resource.
 
 
 _Appears in:_
-- [ClusterAdmissionPolicyFactory](#clusteradmissionpolicyfactory)
+- ClusterAdmissionPolicyFactory
 - [ClusterAdmissionPolicySpec](#clusteradmissionpolicyspec)
 - [PolicyGroupMemberWithContext](#policygroupmemberwithcontext)
 
@@ -854,7 +854,7 @@ _Underlying type:_ _[map[string]PolicyGroupMember](#map[string]policygroupmember
 
 
 _Appears in:_
-- [AdmissionPolicyGroupFactory](#admissionpolicygroupfactory)
+- AdmissionPolicyGroupFactory
 - [PolicyGroupSpec](#policygroupspec)
 
 
@@ -868,7 +868,7 @@ _Underlying type:_ _[map[string]PolicyGroupMemberWithContext](#map[string]policy
 
 
 _Appears in:_
-- [ClusterAdmissionPolicyGroupFactory](#clusteradmissionpolicygroupfactory)
+- ClusterAdmissionPolicyGroupFactory
 - [ClusterPolicyGroupSpec](#clusterpolicygroupspec)
 
 
@@ -915,10 +915,10 @@ _Validation:_
 - Enum: [protect monitor]
 
 _Appears in:_
-- [AdmissionPolicyFactory](#admissionpolicyfactory)
-- [AdmissionPolicyGroupFactory](#admissionpolicygroupfactory)
-- [ClusterAdmissionPolicyFactory](#clusteradmissionpolicyfactory)
-- [ClusterAdmissionPolicyGroupFactory](#clusteradmissionpolicygroupfactory)
+- AdmissionPolicyFactory
+- AdmissionPolicyGroupFactory
+- ClusterAdmissionPolicyFactory
+- ClusterAdmissionPolicyGroupFactory
 - [GroupSpec](#groupspec)
 - [PolicySpec](#policyspec)
 
@@ -934,7 +934,7 @@ _Validation:_
 - Enum: [protect monitor unknown]
 
 _Appears in:_
-- [PolicyStatus](#policystatus)
+- PolicyStatus
 
 | Field | Description |
 | --- | --- |
@@ -1527,7 +1527,7 @@ _Validation:_
 - Enum: [unscheduled scheduled pending active rejected]
 
 _Appears in:_
-- [PolicyStatus](#policystatus)
+- PolicyStatus
 
 | Field | Description |
 | --- | --- |
@@ -1805,7 +1805,7 @@ _Validation:_
 - Enum: [protect monitor unknown]
 
 _Appears in:_
-- [PolicyStatus](#policystatus)
+- PolicyStatus
 
 | Field | Description |
 | --- | --- |
@@ -2141,7 +2141,7 @@ _Validation:_
 - Enum: [unscheduled scheduled pending active rejected]
 
 _Appears in:_
-- [PolicyStatus](#policystatus)
+- PolicyStatus
 
 | Field | Description |
 | --- | --- |
