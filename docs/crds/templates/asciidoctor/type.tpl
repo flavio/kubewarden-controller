@@ -5,7 +5,7 @@
 [id="{{ asciidocTypeID $type | asciidocRenderAnchorID }}"]
 ==== {{ $type.Name  }}
 
-{{ if $type.IsAlias }}_Underlying type:_ _{{ asciidocRenderTypeLink $type.UnderlyingType  }}_{{ end }}
+{{ if $type.IsAlias }}_Underlying type:_ _{{ asciidocRenderType $type.UnderlyingType  }}_{{ end }}
 
 {{ $type.Doc }}
 
@@ -20,7 +20,11 @@
 .Appears In:
 ****
 {{- range $type.SortedReferences }}
+{{- if asciidocShouldRenderType . }}
 - {{ asciidocRenderTypeLink . }}
+{{- else }}
+- {{ .Name }}
+{{- end }}
 {{- end }}
 ****
 {{- end }}
@@ -35,7 +39,10 @@
 {{ end -}}
 
 {{ range $type.Members -}}
-| *`{{ .Name  }}`* __{{ asciidocRenderType .Type }}__ | {{ template "type_members" . }} | {{ .Default }} | {{ range .Validation -}} {{ asciidocRenderValidation . }} +
+| *`{{ .Name  }}`* __{{ asciidocRenderType .Type }}__
+a| {{ template "type_members" . }}
+| {{ .Default }}
+| {{ range .Validation -}} {{ asciidocRenderValidation . }} +
 {{ end }}
 {{ end -}}
 |===

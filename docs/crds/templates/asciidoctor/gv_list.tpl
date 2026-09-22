@@ -4,7 +4,7 @@
 // Generated documentation. Please do not edit.
 :anchor_prefix: k8s-api
 
-[id="{p}-api-reference"]
+[id="{anchor_prefix}-api-reference"]
 == API Reference
 
 .Packages
