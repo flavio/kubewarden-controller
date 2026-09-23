@@ -200,19 +200,24 @@ func (r *policySubReconciler) namespaceSelector(policy policiesv1.Policy) *metav
 			return policy.GetNamespaceSelector()
 		}
 
-		namespaceSelector := &metav1.LabelSelector{
-			MatchExpressions: []metav1.LabelSelectorRequirement{
-				{
-					Key:      "kubernetes.io/metadata.name",
-					Operator: "NotIn",
-					Values:   []string{r.deploymentsNamespace},
-				},
-			},
+		excludeControllerNamespace := metav1.LabelSelectorRequirement{
+			Key:      "kubernetes.io/metadata.name",
+			Operator: metav1.LabelSelectorOpNotIn,
+			Values:   []string{r.deploymentsNamespace},
 		}
 
-		if policy.GetNamespaceSelector() != nil {
-			namespaceSelector.MatchExpressions = append(namespaceSelector.MatchExpressions, policy.GetNamespaceSelector().MatchExpressions...)
+		// Start from a copy of the user's selector so that both MatchLabels
+		// and MatchExpressions are preserved, then add the exclusion of the
+		// controller namespace. All the requirements are ANDed together.
+		namespaceSelector := &metav1.LabelSelector{}
+		if userSelector := policy.GetNamespaceSelector(); userSelector != nil {
+			namespaceSelector = userSelector.DeepCopy()
 		}
+
+		namespaceSelector.MatchExpressions = append(
+			[]metav1.LabelSelectorRequirement{excludeControllerNamespace},
+			namespaceSelector.MatchExpressions...,
+		)
 
 		return namespaceSelector
 

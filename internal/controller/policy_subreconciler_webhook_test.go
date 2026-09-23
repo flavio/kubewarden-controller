@@ -52,6 +52,36 @@ func TestNamespaceSelectorClusterAdmissionTypePolicies(t *testing.T) {
 			},
 		},
 		{
+			name:                                    "preserves MatchLabels and adds the NotIn expression when allowInsideAdmissionControllerNamespace is false",
+			allowInsideAdmissionControllerNamespace: false,
+			policyNSSel: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"kubernetes.io/metadata.name": "demo"},
+			},
+			expected: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"kubernetes.io/metadata.name": "demo"},
+				MatchExpressions: []metav1.LabelSelectorRequirement{
+					expectedExcludeExpr,
+				},
+			},
+		},
+		{
+			name:                                    "preserves both MatchLabels and MatchExpressions when allowInsideAdmissionControllerNamespace is false",
+			allowInsideAdmissionControllerNamespace: false,
+			policyNSSel: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"team": "platform"},
+				MatchExpressions: []metav1.LabelSelectorRequirement{
+					{Key: "env", Operator: metav1.LabelSelectorOpIn, Values: []string{"prod"}},
+				},
+			},
+			expected: &metav1.LabelSelector{
+				MatchLabels: map[string]string{"team": "platform"},
+				MatchExpressions: []metav1.LabelSelectorRequirement{
+					expectedExcludeExpr,
+					{Key: "env", Operator: metav1.LabelSelectorOpIn, Values: []string{"prod"}},
+				},
+			},
+		},
+		{
 			name:                                    "returns the policy NamespaceSelector unchanged when allowInsideAdmissionControllerNamespace is true",
 			allowInsideAdmissionControllerNamespace: true,
 			policyNSSel: &metav1.LabelSelector{
@@ -75,18 +105,20 @@ func TestNamespaceSelectorClusterAdmissionTypePolicies(t *testing.T) {
 				deploymentsNamespace: testDeploymentsNamespace,
 			}
 			policy := policiesv1.NewClusterAdmissionPolicyFactory().Build()
-			policy.Spec.NamespaceSelector = tc.policyNSSel
+			policy.Spec.NamespaceSelector = tc.policyNSSel.DeepCopy()
 			policy.Spec.AllowInsideAdmissionControllerNamespace = tc.allowInsideAdmissionControllerNamespace
 
 			got := r.namespaceSelector(policy)
 			require.Equal(t, tc.expected, got)
+			require.Equal(t, tc.policyNSSel, policy.Spec.NamespaceSelector, "the policy selector must not be mutated")
 
 			policyGroup := policiesv1.NewClusterAdmissionPolicyGroupFactory().Build()
-			policyGroup.Spec.NamespaceSelector = tc.policyNSSel
+			policyGroup.Spec.NamespaceSelector = tc.policyNSSel.DeepCopy()
 			policyGroup.Spec.AllowInsideAdmissionControllerNamespace = tc.allowInsideAdmissionControllerNamespace
 
 			got = r.namespaceSelector(policyGroup)
 			require.Equal(t, tc.expected, got)
+			require.Equal(t, tc.policyNSSel, policyGroup.Spec.NamespaceSelector, "the policy selector must not be mutated")
 		})
 	}
 }
