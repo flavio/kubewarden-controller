@@ -91,7 +91,7 @@ pub(crate) fn vap_interpreted(
             background_audit: true,
             context_aware_resources,
             failure_policy: None,
-            mode: None, // VAP policies are always in protect mode, which is the default for KW
+            mode: Some(vap_data.mode),
             settings,
         },
     })
@@ -104,7 +104,10 @@ mod tests {
     use k8s_openapi::api::admissionregistration::v1::{
         ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding,
     };
-    use policy_evaluator::policy_metadata::{ContextAwareResource, Rule};
+    use policy_evaluator::{
+        kubewarden_policy_sdk::crd::policies::common::PolicyMode,
+        policy_metadata::{ContextAwareResource, Rule},
+    };
     use rstest::*;
 
     use super::*;
@@ -205,7 +208,13 @@ mod tests {
             expected_failure_policy,
             cluster_admission_policy.spec.settings["failurePolicy"]
         );
-        assert!(cluster_admission_policy.spec.mode.is_none());
+        // Every VAP binding fixture used here sets `validationActions:
+        // [Deny]`, which maps to `mode: protect` (see
+        // `policy_mode_from_validation_actions`).
+        assert_eq!(
+            cluster_admission_policy.spec.mode,
+            Some(PolicyMode::Protect)
+        );
         assert_eq!(
             vap.clone()
                 .spec

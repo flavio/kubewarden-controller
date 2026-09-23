@@ -10,7 +10,10 @@ use k8s_openapi::{
     apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta},
 };
 use match_resources::merge_match_fields;
-use policy_evaluator::policy_metadata::{ContextAwareResource, Rule};
+use policy_evaluator::{
+    kubewarden_policy_sdk::crd::policies::common::PolicyMode,
+    policy_metadata::{ContextAwareResource, Rule},
+};
 use tracing::warn;
 
 pub(crate) fn vap(
@@ -164,6 +167,82 @@ fn cel_expressions(vap: &ValidatingAdmissionPolicy) -> impl Iterator<Item = &str
         .chain(match_conditions.iter().map(|m| m.expression.as_str()))
 }
 
+/// One value of a binding's `spec.validationActions`.
+///
+/// Kubernetes requires this field, and only these three values.
+/// `parse` names the exact bad value so [`policy_mode_from_validation_actions`]
+/// can build a clear error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValidationAction {
+    Deny,
+    Warn,
+    Audit,
+}
+
+impl ValidationAction {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "Deny" => Ok(Self::Deny),
+            "Warn" => Ok(Self::Warn),
+            "Audit" => Ok(Self::Audit),
+            other => Err(anyhow!(
+                "validationActions must contain only 'Deny', 'Warn', or 'Audit', got '{other}'"
+            )),
+        }
+    }
+}
+
+/// Map a binding's `spec.validationActions` to a Kubewarden [`PolicyMode`].
+///
+/// Kubernetes has three actions; Kubewarden has two modes. A binding whose
+/// `validationActions` includes `Deny` rejects a failing request, the same
+/// as Kubewarden's `protect` mode. A binding with only `Warn` and/or
+/// `Audit` admits a failing request and only reports it (as a client
+/// warning, an audit annotation, or both), which is closest to
+/// Kubewarden's `monitor` mode: it also admits every request and only
+/// logs the decision (see [`PolicyMode::Monitor`]'s doc). The match is
+/// not exact: `monitor` mode logs the decision on the policy server, but
+/// it emits neither an HTTP warning nor an audit annotation the way
+/// `Warn`/`Audit` would. The caller must tell the administrator about
+/// this gap; see the call site in [`VapData::new`].
+///
+/// The two error cases mirror the validation the Kubernetes API server
+/// itself applies to this field, so the scaffold never turns a binding
+/// Kubernetes would have rejected into a policy that looks valid:
+/// `validationActions` must set at least one value, and `Deny` and
+/// `Warn` cannot be used together (a request cannot be both rejected and
+/// admitted-with-a-warning for the same validation).
+fn policy_mode_from_validation_actions(
+    validation_actions: Option<&[String]>,
+) -> Result<PolicyMode> {
+    let actions = validation_actions
+        .filter(|actions| !actions.is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "ValidatingAdmissionPolicyBinding spec.validationActions must set at least one value"
+            )
+        })?;
+
+    let actions = actions
+        .iter()
+        .map(|a| ValidationAction::parse(a))
+        .collect::<Result<Vec<_>>>()?;
+
+    let has_deny = actions.contains(&ValidationAction::Deny);
+    let has_warn = actions.contains(&ValidationAction::Warn);
+    if has_deny && has_warn {
+        return Err(anyhow!(
+            "ValidatingAdmissionPolicyBinding spec.validationActions cannot contain both 'Deny' and 'Warn'"
+        ));
+    }
+
+    Ok(if has_deny {
+        PolicyMode::Protect
+    } else {
+        PolicyMode::Monitor
+    })
+}
+
 /// Data extracted from a VAP + binding pair, shared by both output paths.
 pub(crate) struct VapData {
     pub(crate) vap: ValidatingAdmissionPolicy,
@@ -189,6 +268,11 @@ pub(crate) struct VapData {
     /// falls back to this text-search result when that section can't be
     /// read.
     pub(crate) uses_namespace_object: bool,
+    /// The Kubewarden policy mode, derived from the binding's
+    /// `spec.validationActions` (see
+    /// [`policy_mode_from_validation_actions`]). Both output paths write
+    /// this into `spec.mode` of the generated `ClusterAdmissionPolicy`.
+    pub(crate) mode: PolicyMode,
 }
 
 impl VapData {
@@ -286,6 +370,14 @@ impl VapData {
 
         let uses_namespace_object = vap_uses_namespace_object(&vap);
 
+        let mode =
+            policy_mode_from_validation_actions(vap_binding_spec.validation_actions.as_deref())?;
+        if mode == PolicyMode::Monitor {
+            warn!(
+                "the binding's spec.validationActions does not include 'Deny', so the generated policy is set to mode: monitor. It will admit every request and only log the decision; unlike the binding, it will send no HTTP warning and write no audit annotation."
+            );
+        }
+
         Ok(VapData {
             vap,
             metadata: vap_binding.metadata,
@@ -296,6 +388,7 @@ impl VapData {
             settings,
             param_resource,
             uses_namespace_object,
+            mode,
         })
     }
 }
@@ -310,9 +403,10 @@ pub(crate) mod tests {
         },
         apimachinery::pkg::apis::meta::v1::LabelSelector,
     };
+    use policy_evaluator::kubewarden_policy_sdk::crd::policies::common::PolicyMode;
     use rstest::*;
 
-    use super::VapData;
+    use super::{VapData, policy_mode_from_validation_actions};
 
     pub(crate) const CEL_POLICY_MODULE: &str = "ghcr.io/kubewarden/policies/cel-policy:latest";
 
@@ -573,5 +667,53 @@ pub(crate) mod tests {
         };
 
         assert!(err.to_string().contains("objectSelector"), "{err}");
+    }
+
+    #[rstest]
+    #[case::deny_only(&["Deny"], PolicyMode::Protect)]
+    #[case::deny_and_audit(&["Deny", "Audit"], PolicyMode::Protect)]
+    #[case::warn_only(&["Warn"], PolicyMode::Monitor)]
+    #[case::audit_only(&["Audit"], PolicyMode::Monitor)]
+    #[case::warn_and_audit(&["Warn", "Audit"], PolicyMode::Monitor)]
+    fn policy_mode_from_validation_actions_maps_deny_to_protect(
+        #[case] validation_actions: &[&str],
+        #[case] expected: PolicyMode,
+    ) {
+        let validation_actions: Vec<String> =
+            validation_actions.iter().map(|s| s.to_string()).collect();
+
+        assert_eq!(
+            policy_mode_from_validation_actions(Some(&validation_actions)).unwrap(),
+            expected
+        );
+    }
+
+    #[rstest]
+    #[case::missing(None, "at least one value")]
+    #[case::empty(Some(&[][..]), "at least one value")]
+    #[case::deny_and_warn(Some(&["Deny", "Warn"][..]), "cannot contain both")]
+    #[case::unknown_value(Some(&["Bogus"][..]), "'Bogus'")]
+    fn policy_mode_from_validation_actions_rejects_an_invalid_set(
+        #[case] validation_actions: Option<&[&str]>,
+        #[case] expected_message: &str,
+    ) {
+        let validation_actions: Option<Vec<String>> =
+            validation_actions.map(|actions| actions.iter().map(|s| s.to_string()).collect());
+
+        let err = policy_mode_from_validation_actions(validation_actions.as_deref())
+            .expect_err("expected an error");
+        assert!(
+            err.to_string().contains(expected_message),
+            "expected {expected_message:?} in the error, got: {err}"
+        );
+    }
+
+    /// `VapData::new` must reach the same `PolicyMode::Monitor` result
+    /// through the full binding, not just the extracted
+    /// `validationActions` value: this pins the wiring between the two.
+    #[test]
+    fn new_maps_a_warn_only_binding_to_monitor_mode() {
+        let vap_data = open_vap_data("vap/vap-without-variables.yml", "vap/vap-binding-warn.yml");
+        assert_eq!(vap_data.mode, PolicyMode::Monitor);
     }
 }

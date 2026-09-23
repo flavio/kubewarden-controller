@@ -1177,6 +1177,64 @@ fn test_scaffold_vap_compile_to_wasm(
     }
 }
 
+/// The binding's `spec.validationActions` maps to the generated policy's
+/// `spec.mode`: `Deny` maps to `protect` (the fixture used everywhere
+/// else in this file), `Warn`/`Audit` alone map to `monitor`.
+#[rstest]
+#[case::deny_binding("vap/vap-binding.yml", "protect")]
+#[case::warn_binding("vap/vap-binding-warn.yml", "monitor")]
+fn test_scaffold_vap_compile_to_wasm_maps_validation_actions_to_mode(
+    #[case] vap_binding: &str,
+    #[case] expected_mode: &str,
+) {
+    let tempdir = tempdir().unwrap();
+    let wasm_output = tempdir.path().join("policy.wasm");
+
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("scaffold")
+        .arg("vap")
+        .arg("--policy")
+        .arg(test_data("vap/vap-with-variables.yml"))
+        .arg("--binding")
+        .arg(test_data(vap_binding))
+        .arg("--compile-to-wasm")
+        .arg(&wasm_output);
+
+    let output = cmd.output().unwrap();
+    assert!(output.status.success(), "command should succeed");
+
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let cap: serde_yaml::Value = serde_yaml::from_str(&stdout).unwrap();
+    assert_eq!(
+        cap["spec"]["mode"].as_str(),
+        Some(expected_mode),
+        "got: {stdout}"
+    );
+}
+
+/// Kubernetes itself rejects a binding whose `validationActions` names
+/// both `Deny` and `Warn`: a validation cannot both reject the request
+/// and only warn about it. The scaffold must refuse this binding rather
+/// than silently pick one of the two.
+#[test]
+fn test_scaffold_vap_rejects_a_binding_with_deny_and_warn() {
+    let tempdir = tempdir().unwrap();
+    let wasm_output = tempdir.path().join("policy.wasm");
+
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("scaffold")
+        .arg("vap")
+        .arg("--policy")
+        .arg(test_data("vap/vap-with-variables.yml"))
+        .arg("--binding")
+        .arg(test_data("vap/vap-binding-deny-warn.yml"))
+        .arg("--compile-to-wasm")
+        .arg(&wasm_output);
+
+    cmd.assert().failure();
+    cmd.assert().stderr(contains("cannot contain both"));
+}
+
 /// A compiled VAP that calls `kw.k8s.apiVersion(...).kind(...).get(...)` has
 /// no `paramKind`, so `spec.contextAwareResources` stays empty and every
 /// `kw.k8s` call would be denied at evaluation time unless the user edits

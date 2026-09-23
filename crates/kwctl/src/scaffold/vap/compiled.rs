@@ -222,7 +222,7 @@ pub(crate) fn vap_compiled(
             background_audit: true,
             context_aware_resources,
             failure_policy: None,
-            mode: None,
+            mode: Some(vap_data.mode),
             settings: vap_data.settings,
         },
     })
@@ -280,7 +280,9 @@ mod tests {
     use k8s_openapi::api::admissionregistration::v1::{
         ValidatingAdmissionPolicy, ValidatingAdmissionPolicyBinding,
     };
-    use policy_evaluator::policy_metadata::Rule;
+    use policy_evaluator::{
+        kubewarden_policy_sdk::crd::policies::common::PolicyMode, policy_metadata::Rule,
+    };
     use rstest::*;
     use tempfile::TempDir;
 
@@ -371,7 +373,10 @@ mod tests {
         // spec.failurePolicy: that field controls the webhook, not the
         // policy. See `VapData::new`.
         assert!(cap.spec.failure_policy.is_none());
-        assert!(cap.spec.mode.is_none());
+        // Every VAP binding fixture used here sets `validationActions:
+        // [Deny]`, which maps to `mode: protect` (see
+        // `policy_mode_from_validation_actions`).
+        assert_eq!(cap.spec.mode, Some(PolicyMode::Protect));
 
         // The CEL expressions live in the Wasm module, not in the settings.
         assert!(!cap.spec.settings.contains_key("validations"));
