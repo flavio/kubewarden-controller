@@ -2587,3 +2587,89 @@ spec:
         "expected {needle:?} in the rejection message, got: {message:?}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// kw.k8s: wrong-type dynamic arguments are rejected
+//
+// Same shape as the kw.sigstore/kw.crypto table above: each case passes a
+// value read from the admitted object, so the wrong type only exists at
+// evaluation time. A `null` or wrong-type `namespace`, `labelSelector`, or
+// `fieldSelector` must not widen the query (to all namespaces, or to no
+// filter); a `null` `fieldMasks` element must not be dropped.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[rstest]
+#[case::null_namespace(
+    "kw.k8s.apiVersion('v1').kind('ConfigMap').namespace(object.spec.ns).get('my-cm') == {'ok': true}",
+    json!({"ns": null}),
+    "namespace"
+)]
+#[case::non_string_namespace(
+    "kw.k8s.apiVersion('v1').kind('ConfigMap').namespace(object.spec.ns).list() == {'ok': true}",
+    json!({"ns": 1}),
+    "namespace"
+)]
+#[case::null_label_selector(
+    "kw.k8s.apiVersion('v1').kind('ConfigMap').labelSelector(object.spec.sel).list() == {'ok': true}",
+    json!({"sel": null}),
+    "labelSelector"
+)]
+#[case::non_string_field_selector(
+    "kw.k8s.apiVersion('v1').kind('ConfigMap').fieldSelector(object.spec.sel).list() == {'ok': true}",
+    json!({"sel": 1}),
+    "fieldSelector"
+)]
+#[case::null_field_mask_element(
+    "kw.k8s.apiVersion('v1').kind('ConfigMap').fieldMask('data').fieldMask(object.spec.mask).get('my-cm') == {'ok': true}",
+    json!({"mask": null}),
+    "fieldMasks[1]"
+)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_wrong_type_kubernetes_argument_from_object_is_rejected(
+    #[case] expression: &str,
+    #[case] extra_spec_fields: serde_json::Value,
+    #[case] needle: &str,
+) {
+    let vap = format!(
+        r#"
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: wrong-type-kubernetes-argument-from-object
+spec:
+  validations:
+    - expression: >-
+        {expression}
+      message: "unused: the validation errors before it evaluates"
+"#
+    );
+    let wasm = compile_vap(&vap);
+    let channel = spawn_direct_mock(|req| {
+        panic!("callback channel should not be reached when the argument is rejected: {req:?}")
+    });
+    let ctx_aware_resources = BTreeSet::from([ContextAwareResource {
+        api_version: "v1".to_owned(),
+        kind: "ConfigMap".to_owned(),
+    }]);
+    let mut evaluator = build_evaluator(&wasm, Some(channel), ctx_aware_resources);
+
+    let request = sigstore_request_with_spec("unused", extra_spec_fields);
+    let response = tokio::task::block_in_place(|| {
+        evaluator.validate(
+            ValidateRequest::AdmissionRequest(Box::new(request)),
+            &PolicySettings::default(),
+        )
+    });
+
+    assert!(!response.allowed, "expected rejection, got: {response:?}");
+    assert_eq!(response.status.as_ref().and_then(|s| s.code), Some(500));
+    let message = response
+        .status
+        .as_ref()
+        .and_then(|s| s.message.as_deref())
+        .unwrap_or("");
+    assert!(
+        message.contains(needle),
+        "expected {needle:?} in the rejection message, got: {message:?}"
+    );
+}
