@@ -18,25 +18,51 @@ _Validation:_
 {{ if $type.References -}}
 _Appears in:_
 {{- range $type.SortedReferences }}
+{{- if markdownShouldRenderType . }}
 - {{ markdownRenderTypeLink . }}
+{{- else }}
+- {{ .Name }}
+{{- end }}
 {{- end }}
 {{- end }}
 
 {{ if $type.Members -}}
-| Field | Description | Default | Validation |
-| --- | --- | --- | --- |
 {{ if $type.GVK -}}
-| `apiVersion` _string_ | `{{ $type.GVK.Group }}/{{ $type.GVK.Version }}` | | |
-| `kind` _string_ | `{{ $type.GVK.Kind }}` | | |
+##### `apiVersion`
+
+**Type:** _string_
+
+`{{ $type.GVK.Group }}/{{ $type.GVK.Version }}`
+
+##### `kind`
+
+**Type:** _string_
+
+`{{ $type.GVK.Kind }}`
 {{ end -}}
 
 {{ range $type.Members -}}
-| `{{ .Name  }}` _{{ markdownRenderType .Type }}_ | {{ template "type_members" . }} | {{ markdownRenderDefault .Default }} | {{ range .Validation -}} {{ markdownRenderFieldDoc . }} <br />{{ end }} |
+##### `{{ .Name }}`
+
+**Type:** _{{ markdownRenderType .Type }}_
+
+{{ if .Default -}}
+**Default:** {{ markdownRenderDefault .Default }}
+
+{{ end -}}
+{{ if .Validation -}}
+**Validation:**
+{{- range .Validation }}
+- {{ markdownRenderFieldDoc . }}
+{{- end }}
+
+{{ end -}}
+{{ template "type_members" . }}
 {{ end -}}
 
 {{ end -}}
 
-{{ if $type.EnumValues -}} 
+{{ if $type.EnumValues -}}
 | Field | Description |
 | --- | --- |
 {{ range $type.EnumValues -}}
