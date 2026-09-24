@@ -131,7 +131,37 @@ fn build_evaluator_with_epoch_deadline(
         .unwrap_or_else(|e| panic!("cannot rehydrate evaluator: {e}"))
 }
 
-/// Mock scenario that handles:
+/// Builds an evaluator and applies `resource_limits`, when given, with
+/// `PolicyEvaluatorBuilder::enable_resource_limits`. `None` leaves
+/// wasmtime's own defaults in place.
+///
+/// `policy-server` and `kwctl` always call `enable_resource_limits`. This
+/// helper matches that production path (see `create_policy_evaluator_pre`
+/// in `policy-server`).
+fn build_evaluator_with_resource_limits(
+    wasm: &[u8],
+    resource_limits: Option<policy_evaluator::policy_evaluator_builder::ResourceLimits>,
+) -> policy_evaluator::policy_evaluator::PolicyEvaluator {
+    let mut builder = PolicyEvaluatorBuilder::new()
+        .policy_contents(wasm)
+        .execution_mode(PolicyExecutionMode::Ferricel);
+    if let Some(limits) = resource_limits {
+        builder = builder.enable_resource_limits(limits);
+    }
+    let pre = builder
+        .build_pre()
+        .unwrap_or_else(|e| panic!("cannot build PolicyEvaluatorPre: {e}"));
+    let eval_ctx = EvaluationContext {
+        policy_id: "test-ferricel".to_owned(),
+        callback_channel: None,
+        ctx_aware_resources_allow_list: BTreeSet::new(),
+        epoch_deadline: None,
+        host_capabilities: HostCapabilities::AllowAll,
+    };
+    pre.rehydrate(&eval_ctx)
+        .unwrap_or_else(|e| panic!("cannot rehydrate evaluator: {e}"))
+}
+
 /// - GET /api/v1  -- API discovery requests made by the kube client on startup
 /// - GET /api/v1/namespaces/{name}  -- namespace fetch requests from ferricel runtime
 ///
@@ -567,6 +597,57 @@ async fn test_missing_epoch_deadline_on_interruption_enabled_engine_is_reported_
         msg.contains("exceeded the allowed execution time"),
         "expected message to mention the execution deadline, got: {msg:?}"
     );
+}
+
+/// A compiled ferricel module declares its own initial linear memory.
+/// `VAP_ALWAYS_ALLOW` needs 34 pages, no matter what its CEL expression
+/// does. A limit at or above that value lets the module instantiate. A
+/// limit below that value makes instantiation fail every time. This test
+/// needs no CEL expression that grows memory during evaluation.
+const WASM_PAGE_SIZE: usize = 65536;
+
+#[rstest]
+#[case::no_limit(None, true)]
+#[case::limit_above_the_modules_initial_memory(
+    Some(policy_evaluator::policy_evaluator_builder::ResourceLimits {
+        max_memory_size: Some(64 * WASM_PAGE_SIZE),
+        max_table_elements: None,
+    }),
+    true
+)]
+#[case::limit_below_the_modules_initial_memory(
+    Some(policy_evaluator::policy_evaluator_builder::ResourceLimits {
+        max_memory_size: Some(2 * WASM_PAGE_SIZE),
+        max_table_elements: None,
+    }),
+    false
+)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_resource_limits_are_applied_to_ferricel_policies(
+    #[case] resource_limits: Option<policy_evaluator::policy_evaluator_builder::ResourceLimits>,
+    #[case] expected_allowed: bool,
+) {
+    let wasm = compile_vap(VAP_ALWAYS_ALLOW);
+    let mut evaluator = build_evaluator_with_resource_limits(&wasm, resource_limits);
+
+    let response = evaluator.validate(
+        ValidateRequest::AdmissionRequest(Box::new(cluster_scoped_request())),
+        &PolicySettings::default(),
+    );
+
+    assert_eq!(
+        expected_allowed, response.allowed,
+        "unexpected outcome, got: {response:?}"
+    );
+    if !expected_allowed {
+        let status = response.status.as_ref().expect("expected a status");
+        assert_eq!(Some(500), status.code);
+        let msg = status.message.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("ferricel evaluation failed"),
+            "expected the rejection to name a ferricel evaluation failure, got: {msg:?}"
+        );
+    }
 }
 
 /// On DELETE, Kubernetes typically sends `object: null` (the resource being

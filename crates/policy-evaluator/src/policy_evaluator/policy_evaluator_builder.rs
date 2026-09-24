@@ -76,6 +76,15 @@ impl From<ResourceLimits> for wasmtime_provider::ResourceLimits {
     }
 }
 
+impl From<ResourceLimits> for ferricel_core::runtime::ResourceLimits {
+    fn from(limits: ResourceLimits) -> Self {
+        Self {
+            max_memory_size: limits.max_memory_size,
+            max_table_elements: limits.max_table_elements,
+        }
+    }
+}
+
 /// Helper Struct that creates a `PolicyEvaluator` object
 #[derive(Default)]
 pub struct PolicyEvaluatorBuilder {
@@ -257,8 +266,9 @@ impl PolicyEvaluatorBuilder {
             }
             PolicyExecutionMode::Ferricel => {
                 let vap_variables = self.ferricel_module_info()?;
-                let ferricel_stack_pre = ferricel::StackPre::new(engine, module, vap_variables)
-                    .map_err(PolicyEvaluatorBuilderError::NewFerricelStackPre)?;
+                let ferricel_stack_pre =
+                    ferricel::StackPre::new(engine, module, vap_variables, self.resource_limits)
+                        .map_err(PolicyEvaluatorBuilderError::NewFerricelStackPre)?;
                 StackPre::from(ferricel_stack_pre)
             }
         };

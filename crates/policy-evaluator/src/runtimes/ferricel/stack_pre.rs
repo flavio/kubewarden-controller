@@ -6,6 +6,7 @@ use wasmtime_provider::wasmtime;
 
 use crate::{
     evaluation_context::EvaluationContext,
+    policy_evaluator::policy_evaluator_builder::ResourceLimits,
     runtimes::ferricel::{errors::FerricelRuntimeError, extensions, logging},
 };
 
@@ -53,17 +54,27 @@ impl StackPre {
     /// [`ferricel_core::vap_variables_used`]) referenced by the compiled
     /// policy, or `None` if that information is not available (see the
     /// `vap_variables` field docs).
+    ///
+    /// `resource_limits`, when set, caps the linear memory and table growth
+    /// that the compiled module is allowed during evaluation (see
+    /// [`ResourceLimits`]). `None` leaves wasmtime's defaults in place, i.e.
+    /// no host-enforced cap.
     pub fn new(
         wasm_engine: wasmtime::Engine,
         module: wasmtime::Module,
         vap_variables: Option<BTreeSet<String>>,
+        resource_limits: Option<ResourceLimits>,
     ) -> Result<Self, FerricelRuntimeError> {
-        let engine_pre = ferricel_core::runtime::Builder::new()
+        let mut builder = ferricel_core::runtime::Builder::new()
             .with_engine(wasm_engine)
             .with_module(module)
             // Forward all guest log levels to the host tracing subscriber;
             // the subscriber's own filter decides what is actually recorded.
-            .with_log_level(LogLevel::Debug)
+            .with_log_level(LogLevel::Debug);
+        if let Some(limits) = resource_limits {
+            builder = builder.with_resource_limits(limits.into());
+        }
+        let engine_pre = builder
             .build_pre()
             .map_err(FerricelRuntimeError::EngineBuild)?;
         Ok(Self {
