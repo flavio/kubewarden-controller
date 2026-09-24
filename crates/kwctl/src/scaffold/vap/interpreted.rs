@@ -135,6 +135,7 @@ mod tests {
         false,
         true
     )]
+    #[case::vap_with_scope("vap/vap-with-scope.yml", "vap/vap-binding.yml", false, false)]
     fn from_vap_to_cluster_admission_policy(
         #[case] vap_yaml_path: &str,
         #[case] vap_binding_yaml_path: &str,
@@ -316,6 +317,27 @@ mod tests {
                 .is_empty(),
             "context_aware_resources should stay empty: kw.k8s targets are not statically derived, got: {:?}",
             cluster_admission_policy.spec.context_aware_resources
+        );
+    }
+
+    /// A VAP `resourceRules` entry that sets `scope` must reach
+    /// `spec.rules[].scope` unchanged: the webhook the controller builds
+    /// from a `ClusterAdmissionPolicy` matches on `scope` the same way
+    /// the original VAP does (see `NamedRuleWithOperations`).
+    #[test]
+    fn resource_rule_scope_reaches_the_generated_rules() {
+        let yaml_file = File::open(test_data("vap/vap-with-scope.yml")).unwrap();
+        let vap: ValidatingAdmissionPolicy = serde_yaml::from_reader(yaml_file).unwrap();
+        let yaml_file = File::open(test_data("vap/vap-binding.yml")).unwrap();
+        let vap_binding: ValidatingAdmissionPolicyBinding =
+            serde_yaml::from_reader(yaml_file).unwrap();
+
+        let vap_data = VapData::new(vap, vap_binding).unwrap();
+        let cluster_admission_policy = vap_interpreted(CEL_POLICY_MODULE, vap_data).unwrap();
+
+        assert_eq!(
+            cluster_admission_policy.spec.rules[0].scope,
+            Some(policy_evaluator::policy_metadata::Scope::Namespaced)
         );
     }
 

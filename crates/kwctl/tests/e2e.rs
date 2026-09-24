@@ -1235,6 +1235,33 @@ fn test_scaffold_vap_rejects_a_binding_with_deny_and_warn() {
     cmd.assert().stderr(contains("cannot contain both"));
 }
 
+/// `ClusterAdmissionPolicy` has no field that can hold a per-rule allow
+/// list of object names. A VAP `resourceRules` entry that sets
+/// `resourceNames` must fail the scaffold, rather than silently widen the
+/// generated policy to run on every object of that resource type.
+#[test]
+fn test_scaffold_vap_rejects_resource_names() {
+    let tempdir = tempdir().unwrap();
+    let wasm_output = tempdir.path().join("policy.wasm");
+
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("scaffold")
+        .arg("vap")
+        .arg("--policy")
+        .arg(test_data("vap/vap-with-resource-names.yml"))
+        .arg("--binding")
+        .arg(test_data("vap/vap-binding.yml"))
+        .arg("--compile-to-wasm")
+        .arg(&wasm_output);
+
+    cmd.assert().failure();
+    cmd.assert().stderr(contains("resourceNames"));
+    assert!(
+        !wasm_output.exists(),
+        "no file should have been written when resourceNames is rejected"
+    );
+}
+
 /// A compiled VAP that calls `kw.k8s.apiVersion(...).kind(...).get(...)` has
 /// no `paramKind`, so `spec.contextAwareResources` stays empty and every
 /// `kw.k8s` call would be denied at evaluation time unless the user edits

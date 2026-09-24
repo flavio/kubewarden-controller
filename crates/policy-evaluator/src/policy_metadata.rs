@@ -42,6 +42,32 @@ impl TryFrom<&str> for Operation {
     }
 }
 
+/// The scope of resources that a [`Rule`] matches: cluster-scoped resources
+/// (for example `Namespace`), namespaced resources (for example `Pod`), or
+/// both. Kubernetes defaults an unset scope to `All`.
+#[derive(Deserialize, Serialize, Debug, Clone, Hash, Eq, PartialEq)]
+pub enum Scope {
+    #[serde(rename = "Cluster")]
+    Cluster,
+    #[serde(rename = "Namespaced")]
+    Namespaced,
+    #[serde(rename = "*")]
+    All,
+}
+
+impl TryFrom<&str> for Scope {
+    type Error = &'static str;
+
+    fn try_from(scope: &str) -> Result<Self, Self::Error> {
+        match scope {
+            "Cluster" => Ok(Scope::Cluster),
+            "Namespaced" => Ok(Scope::Namespaced),
+            "*" => Ok(Scope::All),
+            _ => Err("unknown scope"),
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone, Validate, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Rule {
@@ -56,6 +82,10 @@ pub struct Rule {
         custom(function = "validate_asterisk_usage_inside_of_operations")
     )]
     pub operations: Vec<Operation>,
+    /// The scope of resources that this rule matches. `None` means the same
+    /// as Kubernetes' own default, `Scope::All`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<Scope>,
 }
 
 fn validate_asterisk_usage(data: &[String]) -> Result<(), ValidationError> {
@@ -149,12 +179,14 @@ impl TryFrom<&NamedRuleWithOperations> for Rule {
                 .collect::<Result<Vec<Operation>, Self::Error>>()?,
             None => Vec::new(),
         };
+        let scope = rule.scope.as_deref().map(Scope::try_from).transpose()?;
 
         Ok(Rule {
             operations,
             api_groups: rule.api_groups.clone().unwrap_or_default(),
             api_versions: rule.api_versions.clone().unwrap_or_default(),
             resources: rule.resources.clone().unwrap_or_default(),
+            scope,
         })
     }
 }
@@ -278,6 +310,7 @@ fn validate_metadata(metadata: &Metadata) -> Result<(), ValidationError> {
 #[cfg(test)]
 mod tests {
     use assert_json_diff::assert_json_eq;
+    use rstest::*;
     use serde_json::json;
 
     use super::*;
@@ -289,6 +322,7 @@ mod tests {
             api_versions: vec![String::from("v1")],
             resources: vec![String::from("pods")],
             operations: vec![Operation::Create],
+            scope: None,
         };
         let metadata = Metadata {
             protocol_version: Some(ProtocolVersion::V1),
@@ -308,6 +342,7 @@ mod tests {
             api_versions: vec![String::from("v1")],
             resources: vec![String::from("pods")],
             operations: vec![Operation::Create],
+            scope: None,
         };
         let protocol_version = Some(ProtocolVersion::V1);
 
@@ -326,6 +361,7 @@ mod tests {
             api_versions: vec![String::from("v1")],
             resources: vec![String::from("pods")],
             operations: vec![Operation::Create],
+            scope: None,
         };
         metadata.rules = vec![pod_rule];
         assert!(metadata.validate().is_err());
@@ -336,6 +372,7 @@ mod tests {
             api_versions: vec![String::from("v1")],
             resources: vec![String::from("pods")],
             operations: vec![Operation::All, Operation::Create],
+            scope: None,
         };
         metadata.rules = vec![pod_rule];
         assert!(metadata.validate().is_err());
@@ -346,6 +383,7 @@ mod tests {
             api_versions: vec![String::from("v1")],
             resources: vec![String::from("pods")],
             operations: vec![Operation::Create],
+            scope: None,
         };
         metadata = Metadata {
             rules: vec![pod_rule],
@@ -358,6 +396,7 @@ mod tests {
             api_versions: vec![String::from("v1")],
             resources: vec![String::from("pods")],
             operations: vec![Operation::Create],
+            scope: None,
         };
         metadata = Metadata {
             rules: vec![pod_rule],
@@ -465,6 +504,7 @@ mod tests {
             api_versions: vec![String::from("v1")],
             resources: vec![String::from("pods")],
             operations: vec![Operation::Create],
+            scope: None,
         };
 
         let mut annotations: BTreeMap<String, String> = BTreeMap::new();
@@ -519,6 +559,7 @@ mod tests {
                 String::from("*/b"),
             ],
             operations: vec![Operation::Create],
+            scope: None,
         };
 
         let mut annotations: BTreeMap<String, String> = BTreeMap::new();
@@ -546,6 +587,7 @@ mod tests {
             api_versions: vec![String::from("a")],
             resources: vec![String::from("*"), String::from("a")],
             operations: vec![Operation::Create],
+            scope: None,
         };
 
         let mut annotations: BTreeMap<String, String> = BTreeMap::new();
@@ -573,6 +615,7 @@ mod tests {
             api_versions: vec![String::from("a")],
             resources: vec![String::from("a/*"), String::from("a/x")],
             operations: vec![Operation::Create],
+            scope: None,
         };
 
         let mut annotations: BTreeMap<String, String> = BTreeMap::new();
@@ -599,6 +642,7 @@ mod tests {
             api_versions: vec![String::from("a")],
             resources: vec![String::from("a/*"), String::from("a")],
             operations: vec![Operation::Create],
+            scope: None,
         };
 
         let mut annotations: BTreeMap<String, String> = BTreeMap::new();
@@ -625,6 +669,7 @@ mod tests {
             api_versions: vec![String::from("a")],
             resources: vec![String::from("*/a"), String::from("x/a")],
             operations: vec![Operation::Create],
+            scope: None,
         };
 
         let mut annotations: BTreeMap<String, String> = BTreeMap::new();
@@ -651,6 +696,7 @@ mod tests {
             api_versions: vec![String::from("a")],
             resources: vec![String::from("*/*"), String::from("a")],
             operations: vec![Operation::Create],
+            scope: None,
         };
 
         let mut annotations: BTreeMap<String, String> = BTreeMap::new();
@@ -716,5 +762,53 @@ mod tests {
         };
 
         assert!(metadata.validate().is_err());
+    }
+
+    fn named_rule_with_scope(scope: Option<&str>) -> NamedRuleWithOperations {
+        NamedRuleWithOperations {
+            api_groups: Some(vec![String::new()]),
+            api_versions: Some(vec!["v1".to_string()]),
+            resources: Some(vec!["pods".to_string()]),
+            operations: Some(vec!["CREATE".to_string()]),
+            scope: scope.map(String::from),
+            resource_names: None,
+        }
+    }
+
+    #[rstest]
+    #[case::unset(None, None)]
+    #[case::cluster(Some("Cluster"), Some(Scope::Cluster))]
+    #[case::namespaced(Some("Namespaced"), Some(Scope::Namespaced))]
+    #[case::wildcard(Some("*"), Some(Scope::All))]
+    fn rule_try_from_reads_the_scope(#[case] input: Option<&str>, #[case] expected: Option<Scope>) {
+        let rule = Rule::try_from(&named_rule_with_scope(input)).expect("a valid rule");
+        assert_eq!(rule.scope, expected);
+    }
+
+    #[test]
+    fn rule_try_from_rejects_an_unknown_scope() {
+        let err = Rule::try_from(&named_rule_with_scope(Some("Regional")))
+            .expect_err("an unknown scope must be rejected");
+        assert_eq!(err, "unknown scope");
+    }
+
+    #[test]
+    fn rule_serializes_scope_only_when_set() {
+        let mut rule = Rule {
+            api_groups: vec![String::new()],
+            api_versions: vec!["v1".to_string()],
+            resources: vec!["pods".to_string()],
+            operations: vec![Operation::Create],
+            scope: None,
+        };
+        assert!(
+            !serde_yaml::to_string(&rule).unwrap().contains("scope"),
+            "an unset scope must not appear in the serialized rule"
+        );
+
+        rule.scope = Some(Scope::Cluster);
+        let yaml = serde_yaml::to_string(&rule).unwrap();
+        let round_tripped: Rule = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(round_tripped.scope, Some(Scope::Cluster));
     }
 }

@@ -452,6 +452,24 @@ mod tests {
         assert_eq!(cap.spec.rules, expected_rules);
     }
 
+    /// A VAP `resourceRules` entry that sets `scope` must reach
+    /// `spec.rules[].scope` unchanged: the webhook the controller builds
+    /// from a `ClusterAdmissionPolicy` matches on `scope` the same way
+    /// the original VAP does (see `NamedRuleWithOperations`).
+    #[test]
+    fn resource_rule_scope_reaches_the_generated_rules() {
+        let dir = TempDir::new().unwrap();
+        let wasm_path = dir.path().join("policy.wasm");
+
+        let vap_data = open_vap_data("vap/vap-with-scope.yml", "vap/vap-binding.yml");
+        let cap = vap_compiled(vap_data, &wasm_path, false).unwrap();
+
+        assert_eq!(
+            cap.spec.rules[0].scope,
+            Some(policy_evaluator::policy_metadata::Scope::Namespaced)
+        );
+    }
+
     /// A wasm output path containing a space (a reserved character in URIs)
     /// must still produce a `spec.module` that is a valid, parsable `file://`
     /// URI resolving back to the original path - i.e. the space must be

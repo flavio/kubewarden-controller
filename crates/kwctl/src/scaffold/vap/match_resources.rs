@@ -31,7 +31,8 @@ pub(crate) struct MatchFields {
 ///
 /// This function rejects every field it cannot represent:
 /// `excludeResourceRules` on either side, `resourceRules` on the binding,
-/// and a binding `matchPolicy` that differs from the VAP one. It merges
+/// `resourceNames` on a VAP `resourceRules` entry, and a binding
+/// `matchPolicy` that differs from the VAP one. It merges
 /// `namespaceSelector` with AND logic (see [`and_label_selectors`]) and
 /// rejects a VAP and binding pair that both set `objectSelector` (see
 /// [`combine_object_selectors`]).
@@ -64,6 +65,19 @@ pub(crate) fn merge_match_fields(
     {
         return Err(anyhow!(
             "ValidatingAdmissionPolicyBinding spec.matchResources.resourceRules is not supported. kwctl only translates spec.matchConstraints.resourceRules from the ValidatingAdmissionPolicy. Move the narrowing into the ValidatingAdmissionPolicy, or remove it from the binding"
+        ));
+    }
+    if vap_match_constraints
+        .resource_rules
+        .as_ref()
+        .is_some_and(|rules| {
+            rules
+                .iter()
+                .any(|rule| rule.resource_names.as_ref().is_some_and(|n| !n.is_empty()))
+        })
+    {
+        return Err(anyhow!(
+            "ValidatingAdmissionPolicy spec.matchConstraints.resourceRules[].resourceNames is not supported. ClusterAdmissionPolicy has no matching field. Remove resourceNames, and narrow the match with objectSelector instead"
         ));
     }
     if let Some(binding_match_policy) = binding_match_resources.match_policy.as_deref() {
@@ -503,6 +517,17 @@ mod tests {
         },
         Some("matchResources.resourceRules")
     )]
+    #[case::vap_resource_rules_resource_names(
+        MatchResources {
+            resource_rules: Some(vec![NamedRuleWithOperations {
+                resource_names: Some(vec!["cluster-config".to_string()]),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        },
+        MatchResources::default(),
+        Some("resourceNames")
+    )]
     #[case::binding_match_policy_differs_from_the_vap(
         // The VAP leaves `matchPolicy` unset. This field defaults to
         // "Equivalent". The binding sets `matchPolicy` to "Exact". The
@@ -635,6 +660,30 @@ mod tests {
                 .expect("object_selector should be present")
                 .match_labels,
             Some(BTreeMap::from([("app".to_string(), "web".to_string())]))
+        );
+    }
+
+    #[test]
+    fn merge_match_fields_keeps_the_scope_of_a_vap_resource_rule() {
+        let vap_match_constraints = MatchResources {
+            resource_rules: Some(vec![NamedRuleWithOperations {
+                api_groups: Some(vec![String::new()]),
+                api_versions: Some(vec!["v1".to_string()]),
+                resources: Some(vec!["pods".to_string()]),
+                operations: Some(vec!["CREATE".to_string()]),
+                scope: Some("Namespaced".to_string()),
+                resource_names: None,
+            }]),
+            ..Default::default()
+        };
+        let binding_match_resources = MatchResources::default();
+
+        let match_fields = merge_match_fields(vap_match_constraints, binding_match_resources)
+            .expect("merge_match_fields should succeed");
+
+        assert_eq!(
+            match_fields.rules[0].scope,
+            Some(policy_evaluator::policy_metadata::Scope::Namespaced)
         );
     }
 }
