@@ -13,7 +13,6 @@ use policy_evaluator::{
     policy_evaluator::PolicyExecutionMode,
     policy_metadata::{ContextAwareResource, Metadata, PolicyType},
 };
-use tempfile::NamedTempFile;
 use tracing::warn;
 
 use crate::scaffold::{
@@ -45,10 +44,24 @@ fn parent_dir_of(path: &Path) -> PathBuf {
 ///
 /// Unless `force` is set, the rename fails (leaving both the temp file
 /// cleaned up and `path` untouched) if `path` already exists.
+///
+/// Permissions: the temp file is created with mode `0o666`. That is the
+/// same mode that `fs::write` requests from the kernel. The kernel applies
+/// the caller's umask to that mode, so a restrictive umask (e.g. `077`)
+/// still gives a private file, the same as a plain `fs::write` call gives.
+/// Under `force`, when `path` already exists, the new file instead takes on
+/// that existing file's mode: an administrator who narrowed it on purpose
+/// (e.g. `chmod 600`) keeps that choice across a `--force` re-run.
 fn write_output_file(path: &Path, contents: &[u8], force: bool, what: &str) -> Result<()> {
     let dir = parent_dir_of(path);
 
-    let mut tmp = NamedTempFile::new_in(&dir).map_err(|e| {
+    let mut tmp_builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tmp_builder.permissions(fs::Permissions::from_mode(0o666));
+    }
+    let mut tmp = tmp_builder.tempfile_in(&dir).map_err(|e| {
         anyhow!(
             "cannot create temporary file for {what} in {}: {e}",
             dir.display()
@@ -59,14 +72,10 @@ fn write_output_file(path: &Path, contents: &[u8], force: bool, what: &str) -> R
         .and_then(|()| tmp.as_file().sync_all())
         .map_err(|e| anyhow!("cannot write {what} to {}: {e}", path.display()))?;
 
-    // NamedTempFile is created with 0600 permissions; restore the usual
-    // world-readable mode the previous fs::write()-based implementation
-    // produced for these output files.
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
+    if force && let Ok(existing) = fs::metadata(path) {
         tmp.as_file()
-            .set_permissions(fs::Permissions::from_mode(0o644))
+            .set_permissions(existing.permissions())
             .map_err(|e| anyhow!("cannot set permissions on {what}: {e}"))?;
     }
 
@@ -105,6 +114,20 @@ pub(crate) fn vap_compiled(
     force: bool,
 ) -> Result<ClusterAdmissionPolicy> {
     let metadata_path = metadata_path_for(wasm_path)?;
+
+    // `vap_compiled` always writes the metadata file at
+    // `<wasm_path's parent>/metadata.yml` (see `metadata_path_for`). So
+    // `wasm_path` collides with it exactly when its own file name is
+    // `metadata.yml`. Check this before any write. Without the check, the
+    // code below writes the Wasm module to that path, then
+    // `write_metadata_file` overwrites it with YAML. Do the check
+    // regardless of `force`: `force` cannot make the collision safe.
+    if wasm_path.file_name() == metadata_path.file_name() {
+        return Err(anyhow!(
+            "cannot write the Wasm module to {}: that path is reserved for the metadata.yml file written alongside it",
+            wasm_path.display()
+        ));
+    }
 
     if !force {
         if wasm_path.exists() {
@@ -727,6 +750,101 @@ mod tests {
             std::collections::BTreeSet::from(["out.txt".to_string()]),
             dir_entry_names(dir.path()),
             "no temporary staging file should be left behind after a forced replace"
+        );
+    }
+
+    /// Tests of the file mode that `write_output_file` produces. They read
+    /// and set Unix mode bits, so they only run on Unix.
+    #[cfg(unix)]
+    mod permissions {
+        use std::os::unix::fs::PermissionsExt;
+
+        use super::*;
+
+        /// The mode bits of `path`, ignoring the file-type bits.
+        fn file_mode(path: &Path) -> u32 {
+            fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        /// The mode a plain `File::create` gets in `dir`. Std has no
+        /// portable way to read or set the umask, so the tests below
+        /// compare against this reference file instead of a hardcoded
+        /// mode: `write_output_file` must produce the same mode as a
+        /// plain file creation, whatever the umask is for this test run.
+        fn reference_mode_in(dir: &Path) -> u32 {
+            let path = dir.join("reference");
+            File::create(&path).unwrap();
+            file_mode(&path)
+        }
+
+        #[test]
+        fn write_output_file_respects_the_umask() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("out.txt");
+
+            write_output_file(&path, b"content", false, "test file").unwrap();
+
+            assert_eq!(
+                reference_mode_in(dir.path()),
+                file_mode(&path),
+                "a new output file must get the same mode as a plain file creation, with the umask applied"
+            );
+        }
+
+        #[test]
+        fn write_output_file_force_keeps_the_mode_of_the_replaced_file() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("out.txt");
+            fs::write(&path, b"original").unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+            write_output_file(&path, b"replaced", true, "test file").unwrap();
+
+            assert_eq!(
+                0o600,
+                file_mode(&path),
+                "force must keep the mode of the file it replaces, not widen it"
+            );
+        }
+
+        #[test]
+        fn write_output_file_force_uses_the_umask_default_when_nothing_is_replaced() {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("out.txt");
+
+            write_output_file(&path, b"content", true, "test file").unwrap();
+
+            assert_eq!(
+                reference_mode_in(dir.path()),
+                file_mode(&path),
+                "force on a path with nothing to replace must still respect the umask"
+            );
+        }
+    }
+
+    /// A `wasm_path` named `metadata.yml` collides with the metadata file
+    /// that `vap_compiled` always writes alongside it. Reject this before
+    /// either file is written, regardless of `force`: `force` cannot make
+    /// the collision safe.
+    #[rstest]
+    #[case::without_force(false)]
+    #[case::with_force(true)]
+    fn vap_compiled_rejects_metadata_yml_as_the_wasm_path(#[case] force: bool) {
+        let dir = TempDir::new().unwrap();
+        let wasm_path = dir.path().join("metadata.yml");
+
+        let vap_data = open_vap_data("vap/vap-without-variables.yml", "vap/vap-binding.yml");
+        let err = vap_compiled(vap_data, &wasm_path, force)
+            .expect_err("metadata.yml must be rejected as the wasm output path");
+
+        assert!(
+            err.to_string().contains("reserved for the metadata.yml"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            dir_entry_names(dir.path()).is_empty(),
+            "expected no file to exist, got: {:?}",
+            dir_entry_names(dir.path())
         );
     }
 

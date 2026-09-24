@@ -1293,6 +1293,35 @@ fn test_scaffold_vap_compile_to_wasm_metadata_already_exists() {
     cmd.assert().stderr(contains("metadata.yml already exists"));
 }
 
+/// `metadata.yml` is always written alongside the Wasm module (see
+/// `metadata_path_for` in `scaffold/vap/compiled.rs`), so a `wasm_path`
+/// literally named `metadata.yml` collides with it. `--force` must still
+/// reject this: the two files can never coexist at that path.
+#[test]
+fn test_scaffold_vap_compile_to_wasm_rejects_metadata_yml_as_the_wasm_path() {
+    let tempdir = tempdir().unwrap();
+    let wasm_output = tempdir.path().join("metadata.yml");
+
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("scaffold")
+        .arg("vap")
+        .arg("--policy")
+        .arg(test_data("vap/vap-with-variables.yml"))
+        .arg("--binding")
+        .arg(test_data("vap/vap-binding.yml"))
+        .arg("--compile-to-wasm")
+        .arg(&wasm_output)
+        .arg("--force");
+
+    cmd.assert().failure();
+    cmd.assert()
+        .stderr(contains("reserved for the metadata.yml"));
+    assert!(
+        !wasm_output.exists(),
+        "expected no file to exist at the reserved path"
+    );
+}
+
 #[test]
 fn test_scaffold_vap_compile_to_wasm_conflicts_with_cel_policy() {
     let tempdir = tempdir().unwrap();
