@@ -54,7 +54,7 @@ url = { workspace = true }
 validator = { version = "0.21", features = ["derive"] }
 wapc = "2.1"
 wasmparser = "0.259"
-wasmtime-provider = { version = "2.25.0", features = ["cache"] }
+wasmtime-provider = { version = "2.26.0", features = ["cache"] }
 wasmtime-wasi = { workspace = true }
 webpki-roots = "1"
 
