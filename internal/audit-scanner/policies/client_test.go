@@ -11,6 +11,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/utils/ptr"
 
 	policiesv1 "github.com/kubewarden/adm-controller/api/policies/v1"
 	"github.com/kubewarden/adm-controller/internal/audit-scanner/testutils"
@@ -505,4 +506,180 @@ func TestGetClusterWidePolicies(t *testing.T) {
 	}
 
 	assert.Equal(t, expectedPolicies, policies)
+}
+
+// TestRuleScope makes sure that the audit scanner honors the `scope` field of a rule.
+// The API server never sends a resource to the webhook when the scope of the rule
+// does not match the scope of the resource. The scanner must not audit that resource.
+func TestRuleScope(t *testing.T) {
+	namespace := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test",
+		},
+	}
+
+	policyServer := &policiesv1.PolicyServer{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "default",
+		},
+	}
+
+	policyServerService := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: map[string]string{
+				"app.kubernetes.io/instance": "policy-server-default",
+			},
+			Name:      "policy-server-default",
+			Namespace: "kubewarden",
+		},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{
+				{
+					Name: "http",
+					Port: 443,
+				},
+			},
+		},
+	}
+
+	podsGVR := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "pods"}
+	namespacesGVR := schema.GroupVersionResource{Group: "", Version: "v1", Resource: "namespaces"}
+
+	// passExpectation describes the result of one scanner pass.
+	type passExpectation struct {
+		// gvrs lists the GVRs that the scanner audits the policy against.
+		// An empty list means that the scanner does not audit the policy.
+		gvrs []schema.GroupVersionResource
+		// skipped is true when the policy counts as skipped.
+		skipped bool
+	}
+
+	tests := []struct {
+		name        string
+		resources   []string
+		scope       *admissionregistrationv1.ScopeType
+		namespaced  passExpectation
+		clusterWide passExpectation
+	}{
+		{
+			name:        "pods, scope absent",
+			resources:   []string{"pods"},
+			scope:       nil,
+			namespaced:  passExpectation{gvrs: []schema.GroupVersionResource{podsGVR}},
+			clusterWide: passExpectation{},
+		},
+		{
+			name:        "pods, scope *",
+			resources:   []string{"pods"},
+			scope:       ptr.To(admissionregistrationv1.AllScopes),
+			namespaced:  passExpectation{gvrs: []schema.GroupVersionResource{podsGVR}},
+			clusterWide: passExpectation{},
+		},
+		{
+			name:        "pods, scope Namespaced",
+			resources:   []string{"pods"},
+			scope:       ptr.To(admissionregistrationv1.NamespacedScope),
+			namespaced:  passExpectation{gvrs: []schema.GroupVersionResource{podsGVR}},
+			clusterWide: passExpectation{},
+		},
+		{
+			name:        "pods, scope Cluster",
+			resources:   []string{"pods"},
+			scope:       ptr.To(admissionregistrationv1.ClusterScope),
+			namespaced:  passExpectation{skipped: true},
+			clusterWide: passExpectation{skipped: true},
+		},
+		{
+			name:        "namespaces, scope absent",
+			resources:   []string{"namespaces"},
+			scope:       nil,
+			namespaced:  passExpectation{},
+			clusterWide: passExpectation{gvrs: []schema.GroupVersionResource{namespacesGVR}},
+		},
+		{
+			name:        "namespaces, scope *",
+			resources:   []string{"namespaces"},
+			scope:       ptr.To(admissionregistrationv1.AllScopes),
+			namespaced:  passExpectation{},
+			clusterWide: passExpectation{gvrs: []schema.GroupVersionResource{namespacesGVR}},
+		},
+		{
+			name:        "namespaces, scope Cluster",
+			resources:   []string{"namespaces"},
+			scope:       ptr.To(admissionregistrationv1.ClusterScope),
+			namespaced:  passExpectation{},
+			clusterWide: passExpectation{gvrs: []schema.GroupVersionResource{namespacesGVR}},
+		},
+		{
+			name:        "namespaces, scope Namespaced",
+			resources:   []string{"namespaces"},
+			scope:       ptr.To(admissionregistrationv1.NamespacedScope),
+			namespaced:  passExpectation{skipped: true},
+			clusterWide: passExpectation{skipped: true},
+		},
+		{
+			name:        "pods and namespaces, scope Namespaced",
+			resources:   []string{"pods", "namespaces"},
+			scope:       ptr.To(admissionregistrationv1.NamespacedScope),
+			namespaced:  passExpectation{gvrs: []schema.GroupVersionResource{podsGVR}},
+			clusterWide: passExpectation{},
+		},
+		{
+			name:        "pods and namespaces, scope Cluster",
+			resources:   []string{"pods", "namespaces"},
+			scope:       ptr.To(admissionregistrationv1.ClusterScope),
+			namespaced:  passExpectation{},
+			clusterWide: passExpectation{gvrs: []schema.GroupVersionResource{namespacesGVR}},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			policy := testutils.
+				NewClusterAdmissionPolicyFactory().
+				Name("policy").
+				Rule(admissionregistrationv1.Rule{
+					APIGroups:   []string{""},
+					APIVersions: []string{"v1"},
+					Resources:   test.resources,
+					Scope:       test.scope,
+				}).
+				Build()
+
+			client, err := testutils.NewFakeClient(namespace, policyServer, policyServerService, policy)
+			require.NoError(t, err)
+
+			policiesClient := NewClient(client, "kubewarden", "", slog.Default())
+
+			expectedPolicy := &Policy{
+				Policy:       policy,
+				PolicyServer: &url.URL{Scheme: "https", Host: "policy-server-default.kubewarden.svc:443", Path: "/audit/kw.cap.policy"},
+			}
+
+			buildExpectedPolicies := func(expectation passExpectation) *Policies {
+				policiesByGVR := map[schema.GroupVersionResource][]*Policy{}
+				for _, gvr := range expectation.gvrs {
+					policiesByGVR[gvr] = []*Policy{expectedPolicy}
+				}
+
+				expectedPolicies := &Policies{PoliciesByGVR: policiesByGVR}
+				if len(expectation.gvrs) > 0 {
+					expectedPolicies.PolicyNum = 1
+				}
+				if expectation.skipped {
+					expectedPolicies.SkippedNum = 1
+				}
+
+				return expectedPolicies
+			}
+
+			namespacedPolicies, err := policiesClient.GetPoliciesByNamespace(t.Context(), namespace)
+			require.NoError(t, err)
+			assert.Equal(t, buildExpectedPolicies(test.namespaced), namespacedPolicies, "namespaced pass")
+
+			clusterWidePolicies, err := policiesClient.GetClusterWidePolicies(t.Context())
+			require.NoError(t, err)
+			assert.Equal(t, buildExpectedPolicies(test.clusterWide), clusterWidePolicies, "cluster-wide pass")
+		})
+	}
 }
