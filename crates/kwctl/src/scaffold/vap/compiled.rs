@@ -514,13 +514,20 @@ mod tests {
         let metadata_path = dir.path().join("metadata.yml");
         assert!(metadata_path.exists(), "metadata.yml should be created");
 
-        let metadata: Metadata =
-            serde_yaml::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
+        let metadata_yaml = fs::read_to_string(&metadata_path).unwrap();
+        let metadata: Metadata = serde_yaml::from_str(&metadata_yaml).unwrap();
         assert_eq!(metadata.execution_mode, PolicyExecutionMode::Ferricel);
         assert!(!metadata.mutating);
         assert!(metadata.background_audit);
         assert!(metadata.context_aware_resources.is_empty());
         assert!(metadata.protocol_version.is_none());
+        // protocolVersion is a waPC-only concept; a Ferricel policy has no
+        // meaningful value for it, so the key must be absent from the file
+        // rather than rendered as `protocolVersion: null`.
+        assert!(
+            !metadata_yaml.contains("protocolVersion"),
+            "metadata.yml should not contain protocolVersion for a Ferricel policy, got:\n{metadata_yaml}"
+        );
         assert!(!metadata.rules.is_empty());
         // No leftover staging file from either atomic rename.
         assert_eq!(

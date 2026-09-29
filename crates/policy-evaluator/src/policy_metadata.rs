@@ -232,6 +232,7 @@ impl Display for PolicyType {
 #[validate(schema(function = "validate_metadata", skip_on_field_errors = false))]
 pub struct Metadata {
     #[validate(required)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol_version: Option<ProtocolVersion>,
     #[validate(nested)]
     pub rules: Vec<Rule>,
