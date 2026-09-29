@@ -29,21 +29,33 @@ fn unknown_namespace(namespace: &str) -> Result<Vec<u8>, Box<dyn std::error::Err
     Err(format!("unknown namespace: {}", namespace).into())
 }
 
-fn host_capability_denied(
+/// Log a denied host-capability call and return the message for the guest.
+///
+/// Two callers use this function: the ferricel `ExtensionAuthorizer` in
+/// `runtimes::ferricel::extensions`, and the `host_callback` gate below. As
+/// a result, a policy sees one wording for a denial, whatever path it took.
+pub(crate) fn host_capability_denied_message(
     policy_id: &str,
     capability_path: &str,
     eval_ctx: &EvaluationContext,
-) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+) -> String {
     error!(
         policy = policy_id,
         capability = capability_path,
         allowed_capabilities = %eval_ctx.host_capabilities,
         "Policy tried to use a host capability it doesn't have access to"
     );
-    Err(format!(
+    format!(
         "Policy has not been granted access to the '{capability_path}' host capability. The violation has been reported."
     )
-    .into())
+}
+
+fn host_capability_denied(
+    policy_id: &str,
+    capability_path: &str,
+    eval_ctx: &EvaluationContext,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    Err(host_capability_denied_message(policy_id, capability_path, eval_ctx).into())
 }
 
 fn kubernetes_resource_denied(

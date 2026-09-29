@@ -8,8 +8,73 @@ use serde_json::Value;
 use crate::{
     callback_requests::CallbackRequestType,
     evaluation_context::EvaluationContext,
-    runtimes::ferricel::extensions::helpers::{call_host, parse_builder_map, reject_null},
+    runtimes::ferricel::extensions::helpers::{
+        ExtensionSpec, builder_arg, call_host, parse_builder_map, reject_null,
+    },
 };
+
+// ─── Host capabilities ────────────────────────────────────────────────────────
+
+/// All five verify variants go through the one `oci/v2/verify` host
+/// capability. The waPC and Wasi `host_callback` handles the same operation
+/// through the internally tagged `SigstoreVerificationInputV2` payload.
+const VERIFY_CAPABILITY: &str = "oci/v2/verify";
+
+/// The `kw.sigstore` extensions, with the capability each one needs.
+///
+/// `digest` is an in-Wasm accessor. It reads the `digest` field of the
+/// `VerificationResponse` that a verify call already returned to the guest.
+/// It makes no host call and lists no capability.
+pub(super) fn specs() -> Vec<ExtensionSpec> {
+    vec![
+        ExtensionSpec {
+            decl: pub_key_verify_extension(),
+            capabilities: &[VERIFY_CAPABILITY],
+            handler: |ctx, args| {
+                pub_key_verify_handler(ctx, builder_arg(args, "kw.sigstore.pubKeyVerify")?)
+            },
+        },
+        ExtensionSpec {
+            decl: keyless_verify_extension(),
+            capabilities: &[VERIFY_CAPABILITY],
+            handler: |ctx, args| {
+                keyless_verify_handler(ctx, builder_arg(args, "kw.sigstore.keylessVerify")?)
+            },
+        },
+        ExtensionSpec {
+            decl: keyless_prefix_verify_extension(),
+            capabilities: &[VERIFY_CAPABILITY],
+            handler: |ctx, args| {
+                keyless_prefix_verify_handler(
+                    ctx,
+                    builder_arg(args, "kw.sigstore.keylessPrefixVerify")?,
+                )
+            },
+        },
+        ExtensionSpec {
+            decl: github_actions_verify_extension(),
+            capabilities: &[VERIFY_CAPABILITY],
+            handler: |ctx, args| {
+                github_actions_verify_handler(
+                    ctx,
+                    builder_arg(args, "kw.sigstore.githubActionsVerify")?,
+                )
+            },
+        },
+        ExtensionSpec {
+            decl: certificate_verify_extension(),
+            capabilities: &[VERIFY_CAPABILITY],
+            handler: |ctx, args| {
+                certificate_verify_handler(ctx, builder_arg(args, "kw.sigstore.certificateVerify")?)
+            },
+        },
+        ExtensionSpec {
+            decl: digest_extension(),
+            capabilities: &[],
+            handler: |_ctx, args| digest_handler(args),
+        },
+    ]
+}
 
 /// `BuilderChainDecl` for the `kw.sigstore` library.
 ///
@@ -250,10 +315,8 @@ pub fn digest_extension() -> ExtensionDecl {
 
 // ─── Handlers ────────────────────────────────────────────────────────────────
 //
-// All five verify variants are dispatched under the "oci"/"v2/verify" host
-// capability (see `host_capabilities()` in `extensions.rs`), matching how the
-// waPC/Wasi `host_callback` handles the internally-tagged
-// `SigstoreVerificationInputV2` payload for the same operation.
+// Every verify handler calls the host with `VERIFY_CAPABILITY`. See its doc
+// comment above.
 
 pub(crate) fn pub_key_verify_handler(
     eval_ctx: &Arc<EvaluationContext>,
@@ -261,8 +324,7 @@ pub(crate) fn pub_key_verify_handler(
 ) -> Result<Value, String> {
     call_host(
         eval_ctx,
-        "oci",
-        "v2/verify",
+        VERIFY_CAPABILITY,
         parse_pub_key_verify(builder_map)?,
     )
 }
@@ -303,8 +365,7 @@ pub(crate) fn keyless_verify_handler(
 ) -> Result<Value, String> {
     call_host(
         eval_ctx,
-        "oci",
-        "v2/verify",
+        VERIFY_CAPABILITY,
         parse_keyless_verify(builder_map)?,
     )
 }
@@ -344,8 +405,7 @@ pub(crate) fn keyless_prefix_verify_handler(
 ) -> Result<Value, String> {
     call_host(
         eval_ctx,
-        "oci",
-        "v2/verify",
+        VERIFY_CAPABILITY,
         parse_keyless_prefix_verify(builder_map)?,
     )
 }
@@ -383,8 +443,7 @@ pub(crate) fn github_actions_verify_handler(
 ) -> Result<Value, String> {
     call_host(
         eval_ctx,
-        "oci",
-        "v2/verify",
+        VERIFY_CAPABILITY,
         parse_github_actions_verify(builder_map)?,
     )
 }
@@ -425,8 +484,7 @@ pub(crate) fn certificate_verify_handler(
 ) -> Result<Value, String> {
     call_host(
         eval_ctx,
-        "oci",
-        "v2/verify",
+        VERIFY_CAPABILITY,
         parse_certificate_verify(builder_map)?,
     )
 }

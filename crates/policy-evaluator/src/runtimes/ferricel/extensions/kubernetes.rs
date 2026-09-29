@@ -1,5 +1,6 @@
 use std::{collections::BTreeSet, sync::Arc};
 
+use ferricel_core::compiler::vap::{kw_k8s_get_extension, kw_k8s_list_extension};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -7,20 +8,47 @@ use crate::{
     callback_requests::CallbackRequestType,
     evaluation_context::EvaluationContext,
     runtimes::ferricel::extensions::helpers::{
-        call_host, empty_string_as_none, parse_builder_map, reject_null,
+        ExtensionSpec, builder_arg, call_host, empty_string_as_none, parse_builder_map, reject_null,
     },
 };
+
+// ─── Host capabilities ────────────────────────────────────────────────────────
+
+const GET_CAPABILITY: &str = "kubernetes/get_resource";
+const LIST_BY_NAMESPACE_CAPABILITY: &str = "kubernetes/list_resources_by_namespace";
+const LIST_ALL_CAPABILITY: &str = "kubernetes/list_resources_all";
+
+/// The `kw.k8s` extensions, with the capabilities each one needs.
+///
+/// The declarations come from ferricel-core, not from this module.
+/// ferricel-core registers the `kw.k8s` builder chain on the compiler on
+/// its own, and it declares these two extensions with it. This module
+/// reuses those declarations so that the runtime and the compiler cannot
+/// disagree on them.
+///
+/// `list` lists two capabilities. [`list_handler`] calls one of the two at
+/// evaluation time. It calls `LIST_BY_NAMESPACE_CAPABILITY` when the
+/// builder map names a namespace, and `LIST_ALL_CAPABILITY` otherwise.
+pub(super) fn specs() -> Vec<ExtensionSpec> {
+    vec![
+        ExtensionSpec {
+            decl: kw_k8s_get_extension(),
+            capabilities: &[GET_CAPABILITY],
+            handler: |ctx, args| get_handler(ctx, builder_arg(args, "kw.k8s.get")?),
+        },
+        ExtensionSpec {
+            decl: kw_k8s_list_extension(),
+            capabilities: &[LIST_BY_NAMESPACE_CAPABILITY, LIST_ALL_CAPABILITY],
+            handler: |ctx, args| list_handler(ctx, builder_arg(args, "kw.k8s.list")?),
+        },
+    ]
+}
 
 pub(crate) fn get_handler(
     eval_ctx: &Arc<EvaluationContext>,
     builder_map: &Value,
 ) -> Result<Value, String> {
-    call_host(
-        eval_ctx,
-        "kubernetes",
-        "get_resource",
-        parse_get(builder_map)?,
-    )
+    call_host(eval_ctx, GET_CAPABILITY, parse_get(builder_map)?)
 }
 
 /// Fields of the builder map that
@@ -68,8 +96,8 @@ pub(crate) fn list_handler(
     eval_ctx: &Arc<EvaluationContext>,
     builder_map: &Value,
 ) -> Result<Value, String> {
-    let (operation, request_type) = parse_list(builder_map)?;
-    call_host(eval_ctx, "kubernetes", operation, request_type)
+    let (capability, request_type) = parse_list(builder_map)?;
+    call_host(eval_ctx, capability, request_type)
 }
 
 /// Fields of the builder map that
@@ -101,7 +129,7 @@ fn parse_list(builder_map: &Value) -> Result<(&'static str, CallbackRequestType)
 
     Ok(match args.namespace {
         Some(namespace) => (
-            "list_resources_by_namespace",
+            LIST_BY_NAMESPACE_CAPABILITY,
             CallbackRequestType::KubernetesListResourceNamespace {
                 api_version: args.api_version,
                 kind: args.kind,
@@ -112,7 +140,7 @@ fn parse_list(builder_map: &Value) -> Result<(&'static str, CallbackRequestType)
             },
         ),
         None => (
-            "list_resources_all",
+            LIST_ALL_CAPABILITY,
             CallbackRequestType::KubernetesListResourceAll {
                 api_version: args.api_version,
                 kind: args.kind,
@@ -203,7 +231,7 @@ mod tests {
 
     #[test]
     fn parse_list_with_namespace_and_selectors_targets_the_namespace() {
-        let (operation, result) = parse_list(&json!({
+        let (capability, result) = parse_list(&json!({
             "apiVersion": "v1",
             "kind": "ConfigMap",
             "namespace": "team-a",
@@ -212,7 +240,7 @@ mod tests {
         }))
         .expect("expected a well-formed builder map to parse");
 
-        assert_eq!(operation, "list_resources_by_namespace");
+        assert_eq!(capability, LIST_BY_NAMESPACE_CAPABILITY);
         assert_eq!(
             result,
             CallbackRequestType::KubernetesListResourceNamespace {
@@ -231,14 +259,14 @@ mod tests {
     /// resource: this must still list across all namespaces.
     #[test]
     fn parse_list_with_an_empty_namespace_targets_all_namespaces() {
-        let (operation, result) = parse_list(&json!({
+        let (capability, result) = parse_list(&json!({
             "apiVersion": "v1",
             "kind": "ConfigMap",
             "namespace": ""
         }))
         .expect("expected a well-formed builder map to parse");
 
-        assert_eq!(operation, "list_resources_all");
+        assert_eq!(capability, LIST_ALL_CAPABILITY);
         assert_eq!(
             result,
             CallbackRequestType::KubernetesListResourceAll {
@@ -253,10 +281,10 @@ mod tests {
 
     #[test]
     fn parse_list_without_a_namespace_targets_all_namespaces() {
-        let (operation, result) = parse_list(&json!({"apiVersion": "v1", "kind": "ConfigMap"}))
+        let (capability, result) = parse_list(&json!({"apiVersion": "v1", "kind": "ConfigMap"}))
             .expect("expected a well-formed builder map to parse");
 
-        assert_eq!(operation, "list_resources_all");
+        assert_eq!(capability, LIST_ALL_CAPABILITY);
         assert_eq!(
             result,
             CallbackRequestType::KubernetesListResourceAll {

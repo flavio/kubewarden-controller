@@ -4,9 +4,23 @@ use ferricel_types::extensions::ExtensionDecl;
 use serde_json::Value;
 
 use crate::{
-    callback_requests::CallbackRequestType, evaluation_context::EvaluationContext,
-    runtimes::ferricel::extensions::helpers::call_host,
+    callback_requests::CallbackRequestType,
+    evaluation_context::EvaluationContext,
+    runtimes::ferricel::extensions::helpers::{ExtensionSpec, call_host},
 };
+
+// ─── Host capabilities ────────────────────────────────────────────────────────
+
+const LOOKUP_HOST_CAPABILITY: &str = "net/v1/dns_lookup_host";
+
+/// The `kw.net` extensions, with the capability each one needs.
+pub(super) fn specs() -> Vec<ExtensionSpec> {
+    vec![ExtensionSpec {
+        decl: lookup_host_extension(),
+        capabilities: &[LOOKUP_HOST_CAPABILITY],
+        handler: lookup_host_handler,
+    }]
+}
 
 /// `ExtensionDecl` for `kw.net.lookupHost`.
 ///
@@ -39,8 +53,7 @@ pub(crate) fn lookup_host_handler(
 
     let response = call_host(
         eval_ctx,
-        "net",
-        "v1/dns_lookup_host",
+        LOOKUP_HOST_CAPABILITY,
         CallbackRequestType::DNSLookupHost { host },
     )?;
 

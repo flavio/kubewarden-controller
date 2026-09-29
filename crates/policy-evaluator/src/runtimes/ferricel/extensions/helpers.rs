@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use ferricel_types::extensions::ExtensionDecl;
 use serde::{Deserialize, Deserializer, de::DeserializeOwned};
 use serde_json::Value;
 
@@ -8,7 +9,65 @@ use crate::{
     runtimes::callback::host_callback_typed,
 };
 
+// ─── Extension registration ───────────────────────────────────────────────────
+
+/// The host implementation of one extension, as the registry stores it.
+///
+/// The first argument is the evaluation context of the current request.
+/// The second argument is the argument list the guest sent. ferricel-core
+/// makes sure that the list has `ExtensionDecl::num_args` elements before
+/// it calls the handler.
+pub(crate) type ExtensionHandler = fn(&Arc<EvaluationContext>, &[Value]) -> Result<Value, String>;
+
+/// One ferricel extension: its declaration, the host capabilities it
+/// needs, and its handler.
+///
+/// Every extension module exposes a `specs()` function that returns its
+/// specs. `extensions::all_specs` collects them. Every other list that the
+/// module tree needs comes from that one list: the runtime registry, the
+/// declarations for the compiler, the `hostCapabilities` of a scaffolded
+/// policy, and the check that the `ExtensionAuthorizer` runs. As a result,
+/// a new extension gets its capability paths in the one place where it is
+/// declared, and the compiler rejects a registration without them.
+pub(crate) struct ExtensionSpec {
+    /// The declaration. The compiler and the runtime both read it.
+    pub(crate) decl: ExtensionDecl,
+
+    /// The Kubewarden host-capability paths a policy must hold to call this
+    /// extension, for example `oci/v1/oci_manifest`.
+    ///
+    /// Empty for an in-Wasm accessor (`isTrusted`, `reason`, `digest`). An
+    /// accessor reads a value the guest already holds. It makes no host
+    /// call and needs no capability.
+    ///
+    /// More than one path when the handler picks the exact path at call
+    /// time. `kw.k8s.list` lists two paths. The handler calls
+    /// `kubernetes/list_resources_by_namespace` when the builder map names
+    /// a namespace, and `kubernetes/list_resources_all` otherwise.
+    pub(crate) capabilities: &'static [&'static str],
+
+    /// The host implementation.
+    pub(crate) handler: ExtensionHandler,
+}
+
 // ─── Handler helpers ──────────────────────────────────────────────────────────
+
+/// Extract the first element (the builder map) from a guest-supplied
+/// argument list.
+///
+/// ferricel-core rejects a call whose `args.len()` does not match the
+/// registered `ExtensionDecl::num_args` before it calls the handler, so
+/// every handler can trust that `args` has the declared number of
+/// elements. This helper is a defense-in-depth guard, not the primary line
+/// of defense. It protects against a decl and handler mismatch from a
+/// future edit (for example, a handler added with the wrong `num_args`),
+/// and against a handler that a unit test calls directly. Every builder
+/// handler must go through this helper instead of indexing `args[0]`, so
+/// that a missing argument turns into an `Err` and not a host panic.
+pub(crate) fn builder_arg<'a>(args: &'a [Value], name: &str) -> Result<&'a Value, String> {
+    args.first()
+        .ok_or_else(|| format!("{name}: expected a builder map argument, got none"))
+}
 
 /// Extract a required string field from a builder map.
 pub(crate) fn str_field(map: &Value, key: &str) -> Result<String, String> {
@@ -91,6 +150,12 @@ where
 /// Authorize and dispatch a `CallbackRequestType` built from a ferricel
 /// extension handler, synchronously waiting for the response.
 ///
+/// `capability` is the host-capability path of the call, for example
+/// `oci/v1/oci_manifest`. It is the same string the handler's
+/// [`ExtensionSpec`] lists in `capabilities`, so the two cannot name
+/// different paths. The function splits it at the first `/` into the
+/// `namespace` and `operation` that the callback channel expects.
+///
 /// This routes through [`host_callback_typed`] -- the single authorization
 /// gate (host-capability + Kubernetes-resource checks) for the callback
 /// channel, which waPC/Wasi policies also reach via their `host_callback`
@@ -101,10 +166,12 @@ where
 /// waPC/Wasi guests get when no callback channel is available.
 pub(crate) fn call_host(
     eval_ctx: &Arc<EvaluationContext>,
-    namespace: &str,
-    operation: &str,
+    capability: &str,
     request_type: CallbackRequestType,
 ) -> Result<Value, String> {
+    let (namespace, operation) = capability.split_once('/').ok_or_else(|| {
+        format!("invalid host-capability path '{capability}': expected 'namespace/operation'")
+    })?;
     let payload = host_callback_typed(namespace, operation, request_type, eval_ctx)
         .map_err(|e| e.to_string())?;
 

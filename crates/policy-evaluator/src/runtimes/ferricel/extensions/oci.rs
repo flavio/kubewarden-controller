@@ -6,8 +6,39 @@ use serde_json::Value;
 use crate::{
     callback_requests::CallbackRequestType,
     evaluation_context::EvaluationContext,
-    runtimes::ferricel::extensions::helpers::{call_host, str_field},
+    runtimes::ferricel::extensions::helpers::{ExtensionSpec, builder_arg, call_host, str_field},
 };
+
+// ─── Host capabilities ────────────────────────────────────────────────────────
+
+const MANIFEST_CAPABILITY: &str = "oci/v1/oci_manifest";
+const MANIFEST_DIGEST_CAPABILITY: &str = "oci/v1/manifest_digest";
+const MANIFEST_CONFIG_CAPABILITY: &str = "oci/v1/oci_manifest_config";
+
+/// The `kw.oci` extensions, with the capability each one needs.
+pub(super) fn specs() -> Vec<ExtensionSpec> {
+    vec![
+        ExtensionSpec {
+            decl: manifest_extension(),
+            capabilities: &[MANIFEST_CAPABILITY],
+            handler: |ctx, args| manifest_handler(ctx, builder_arg(args, "kw.oci.manifest")?),
+        },
+        ExtensionSpec {
+            decl: manifest_digest_extension(),
+            capabilities: &[MANIFEST_DIGEST_CAPABILITY],
+            handler: |ctx, args| {
+                manifest_digest_handler(ctx, builder_arg(args, "kw.oci.manifestDigest")?)
+            },
+        },
+        ExtensionSpec {
+            decl: manifest_config_extension(),
+            capabilities: &[MANIFEST_CONFIG_CAPABILITY],
+            handler: |ctx, args| {
+                manifest_config_handler(ctx, builder_arg(args, "kw.oci.manifestConfig")?)
+            },
+        },
+    ]
+}
 
 /// `BuilderChainDecl` for the `kw.oci` library.
 ///
@@ -91,8 +122,7 @@ pub(crate) fn manifest_handler(
     let image = str_field(builder_map, "image")?;
     call_host(
         eval_ctx,
-        "oci",
-        "v1/oci_manifest",
+        MANIFEST_CAPABILITY,
         CallbackRequestType::OciManifest { image },
     )
 }
@@ -104,8 +134,7 @@ pub(crate) fn manifest_digest_handler(
     let image = str_field(builder_map, "image")?;
     call_host(
         eval_ctx,
-        "oci",
-        "v1/manifest_digest",
+        MANIFEST_DIGEST_CAPABILITY,
         CallbackRequestType::OciManifestDigest { image },
     )
 }
@@ -117,8 +146,7 @@ pub(crate) fn manifest_config_handler(
     let image = str_field(builder_map, "image")?;
     call_host(
         eval_ctx,
-        "oci",
-        "v1/oci_manifest_config",
+        MANIFEST_CONFIG_CAPABILITY,
         CallbackRequestType::OciManifestAndConfig { image },
     )
 }

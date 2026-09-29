@@ -11,8 +11,41 @@ use serde_json::Value;
 use crate::{
     callback_requests::CallbackRequestType,
     evaluation_context::EvaluationContext,
-    runtimes::ferricel::extensions::helpers::{call_host, parse_builder_map, reject_null},
+    runtimes::ferricel::extensions::helpers::{
+        ExtensionSpec, builder_arg, call_host, parse_builder_map, reject_null,
+    },
 };
+
+// ─── Host capabilities ────────────────────────────────────────────────────────
+
+const VERIFY_CAPABILITY: &str = "crypto/v1/is_certificate_trusted";
+
+/// The `kw.crypto` extensions, with the capability each one needs.
+///
+/// `isTrusted` and `reason` are in-Wasm accessors. They read a field of the
+/// response map that `verify` already returned to the guest. They make no
+/// host call and list no capability. `kw.sigstore` shares them: its
+/// `VerificationResponse` has an `is_trusted` field that `isTrusted` also
+/// reads.
+pub(super) fn specs() -> Vec<ExtensionSpec> {
+    vec![
+        ExtensionSpec {
+            decl: verify_extension(),
+            capabilities: &[VERIFY_CAPABILITY],
+            handler: |ctx, args| verify_handler(ctx, builder_arg(args, "kw.crypto.verify")?),
+        },
+        ExtensionSpec {
+            decl: is_trusted_extension(),
+            capabilities: &[],
+            handler: |_ctx, args| is_trusted_handler(args),
+        },
+        ExtensionSpec {
+            decl: reason_extension(),
+            capabilities: &[],
+            handler: |_ctx, args| reason_handler(args),
+        },
+    ]
+}
 
 /// `BuilderChainDecl` for the `kw.crypto` library.
 ///
@@ -97,12 +130,7 @@ pub(crate) fn verify_handler(
     eval_ctx: &Arc<EvaluationContext>,
     builder_map: &Value,
 ) -> Result<Value, String> {
-    call_host(
-        eval_ctx,
-        "crypto",
-        "v1/is_certificate_trusted",
-        parse_verify(builder_map)?,
-    )
+    call_host(eval_ctx, VERIFY_CAPABILITY, parse_verify(builder_map)?)
 }
 
 /// Fields of the builder map that
