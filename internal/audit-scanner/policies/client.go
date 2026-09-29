@@ -239,6 +239,7 @@ func policyMatchesNamespace(policy policiesv1.Policy, namespace *corev1.Namespac
 // groupPoliciesByGVR groups policies by GVR.
 // If namespaced is true, it will skip cluster-wide resources, otherwise it will skip namespaced resources.
 // If the policy targets an unknown GVR or the policy server URL cannot be constructed, the policy will be counted as errored.
+// If the scope of the rules does not match the scope of any resource they target, the policy will be counted as skipped.
 func (f *Client) groupPoliciesByGVR(ctx context.Context, policies []policiesv1.Policy, namespaced bool) (*Policies, error) {
 	policiesByGVR := make(map[schema.GroupVersionResource][]*Policy)
 	auditablePolicies := map[string]struct{}{}
@@ -262,7 +263,7 @@ func (f *Client) groupPoliciesByGVR(ctx context.Context, policies []policiesv1.P
 			continue
 		}
 
-		groupVersionResources, err := f.getGroupVersionResources(rules, namespaced)
+		scopedResources, err := f.getScopedGroupVersionResources(rules)
 		if err != nil {
 			erroredPolicies[policy.GetUniqueName()] = struct{}{}
 			f.logger.ErrorContext(ctx, "failed to obtain unknown GroupVersion resources. The policy may be misconfigured, skipping as error...",
@@ -271,6 +272,18 @@ func (f *Client) groupPoliciesByGVR(ctx context.Context, policies []policiesv1.P
 			continue
 		}
 
+		// The API server never sends a resource to the webhook when the scope of the rule
+		// does not match the scope of the resource. For example, a rule with `scope: Cluster`
+		// that targets `pods` matches nothing. The scanner must not audit that resource.
+		if len(scopedResources) == 0 {
+			skippedPolicies[policy.GetUniqueName()] = struct{}{}
+			f.logger.DebugContext(ctx, "the scope of the rules does not match the scope of the resources they target, skipping...",
+				slog.String("policy", policy.GetUniqueName()))
+
+			continue
+		}
+
+		groupVersionResources := filterGroupVersionResourcesByScope(scopedResources, namespaced)
 		if len(groupVersionResources) == 0 {
 			f.logger.DebugContext(ctx, "the policy does not target resources within the selected scope",
 				slog.String("policy", policy.GetUniqueName()),
@@ -351,32 +364,75 @@ func getRuleGVRs(rule admissionregistrationv1.RuleWithOperations) []schema.Group
 	return gvrs
 }
 
-// getGroupVersionResources returns a list of GroupVersionResource from a list of policies.
-// if namespaced is true, it will skip cluster-wide resources, otherwise it will skip namespaced resources.
-func (f *Client) getGroupVersionResources(rules []admissionregistrationv1.RuleWithOperations, namespaced bool) ([]schema.GroupVersionResource, error) {
-	var groupVersionResources []schema.GroupVersionResource
+// scopedGroupVersionResource is a GroupVersionResource and its scope. The REST mapper reports the scope.
+type scopedGroupVersionResource struct {
+	schema.GroupVersionResource
+	namespaced bool
+}
+
+// getScopedGroupVersionResources expands the rules into a list of GroupVersionResource.
+// It asks the REST mapper for the scope of each resource.
+// It drops a resource when the scope of its rule does not match the scope of the resource.
+// A rule with scope `*`, or with no scope, keeps all of its resources.
+func (f *Client) getScopedGroupVersionResources(rules []admissionregistrationv1.RuleWithOperations) ([]scopedGroupVersionResource, error) {
+	var scopedResources []scopedGroupVersionResource
 
 	for _, rule := range rules {
-		gvrs := getRuleGVRs(rule)
-		for _, gvr := range gvrs {
+		for _, gvr := range getRuleGVRs(rule) {
 			isNamespaced, err := f.isNamespacedResource(gvr)
 			if err != nil {
 				return nil, err
 			}
-			if namespaced && !isNamespaced {
-				// continue if resource is clusterwide
-				continue
-			}
-			if !namespaced && isNamespaced {
-				// continue if resource is namespaced
+
+			if !ruleScopeMatchesResource(rule.Scope, isNamespaced) {
 				continue
 			}
 
-			groupVersionResources = append(groupVersionResources, gvr)
+			scopedResources = append(scopedResources, scopedGroupVersionResource{
+				GroupVersionResource: gvr,
+				namespaced:           isNamespaced,
+			})
 		}
 	}
 
-	return groupVersionResources, nil
+	return scopedResources, nil
+}
+
+// ruleScopeMatchesResource returns true when a rule with the given scope can match the resource.
+// isNamespaced is the scope of the resource, as the REST mapper reports it.
+// A nil scope means `*`.
+func ruleScopeMatchesResource(scope *admissionregistrationv1.ScopeType, isNamespaced bool) bool {
+	if scope == nil {
+		return true
+	}
+
+	switch *scope {
+	case admissionregistrationv1.ClusterScope:
+		return !isNamespaced
+	case admissionregistrationv1.NamespacedScope:
+		return isNamespaced
+	case admissionregistrationv1.AllScopes:
+		return true
+	default:
+		// An unknown value is the same as `*`.
+		return true
+	}
+}
+
+// filterGroupVersionResourcesByScope returns the resources that belong to the selected scope.
+// If namespaced is true, it drops the cluster-wide resources. If namespaced is false, it drops the namespaced resources.
+func filterGroupVersionResourcesByScope(scopedResources []scopedGroupVersionResource, namespaced bool) []schema.GroupVersionResource {
+	var groupVersionResources []schema.GroupVersionResource
+
+	for _, resource := range scopedResources {
+		if resource.namespaced != namespaced {
+			continue
+		}
+
+		groupVersionResources = append(groupVersionResources, resource.GroupVersionResource)
+	}
+
+	return groupVersionResources
 }
 
 // isNamespacedResource checks if the given resource is namespaced or not.
