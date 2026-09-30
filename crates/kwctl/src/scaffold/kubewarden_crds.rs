@@ -1,10 +1,13 @@
 use std::collections::BTreeSet;
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
-use policy_evaluator::policy_metadata::{ContextAwareResource, Rule};
+use policy_evaluator::{
+    kubewarden_policy_sdk::crd::policies::common::PolicyMode,
+    policy_metadata::{ContextAwareResource, Rule},
+};
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ClusterAdmissionPolicy {
     pub api_version: String,
@@ -13,7 +16,7 @@ pub(crate) struct ClusterAdmissionPolicy {
     pub spec: ClusterAdmissionPolicySpec,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Debug)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ClusterAdmissionPolicySpec {
     pub module: String,
@@ -29,7 +32,7 @@ pub(crate) struct ClusterAdmissionPolicySpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_policy: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mode: Option<String>,
+    pub mode: Option<PolicyMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub match_policy: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -42,7 +45,7 @@ fn is_true(b: &bool) -> bool {
     *b
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AdmissionPolicy {
     pub api_version: String,
@@ -51,7 +54,7 @@ pub(crate) struct AdmissionPolicy {
     pub spec: AdmissionPolicySpec,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AdmissionPolicySpec {
     pub module: String,
