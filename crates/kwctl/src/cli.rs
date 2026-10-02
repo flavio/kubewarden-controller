@@ -212,6 +212,7 @@ fn subcommand_push() -> Command {
         Arg::new("force")
             .short('f')
             .long("force")
+            .action(ArgAction::SetTrue)
             .help("Push also a policy that is not annotated"),
         Arg::new("output")
             .long("output")

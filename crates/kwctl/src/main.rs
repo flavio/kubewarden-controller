@@ -177,7 +177,7 @@ async fn main() -> Result<()> {
                     "policy push"
                 );
 
-                let force = matches.contains_id("force");
+                let force = matches.get_flag("force");
 
                 let immutable_ref = push::push(wasm_path, &uri, sources.as_ref(), force).await?;
 

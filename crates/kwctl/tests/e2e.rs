@@ -975,6 +975,26 @@ fn test_push() {
         .stdout(contains("my-pod-privileged-policy:v0.1.10"));
 }
 
+/// `push --force` is a flag with no value. It must not take the next
+/// argument as its value, otherwise `<policy>` and `<uri>` shift by one
+/// and clap reports a missing `<uri>`. The policy here does not exist on
+/// purpose: the test only asserts that clap parsed the two positionals.
+#[test]
+fn test_push_force_is_a_flag_without_a_value() {
+    let tempdir = tempdir().unwrap();
+
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("push")
+        .arg("--force")
+        .arg("missing.wasm")
+        .arg("registry://localhost:5000/missing:v0.1.0");
+
+    cmd.assert()
+        .failure()
+        .stderr(contains("Cannot find policy with uri: missing.wasm"))
+        .stderr(contains("required arguments were not provided").not());
+}
+
 #[rstest]
 #[case::pull_policies_before_scaffold(true)]
 #[case::pull_policies_on_demand(false)]

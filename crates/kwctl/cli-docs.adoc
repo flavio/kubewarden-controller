@@ -321,7 +321,7 @@ It respects standard proxy environment variables when downloading policies:
 === *Options:*
 
 * `--docker-config-json-path <PATH>` — Path to a directory containing the Docker 'config.json' file. Can be used to indicate registry authentication details
-* `-f`, `--force <FORCE>` — Push also a policy that is not annotated
+* `-f`, `--force` — Push also a policy that is not annotated
 * `-o`, `--output <PATH>` — Output format
 +
 Default value: `text`
