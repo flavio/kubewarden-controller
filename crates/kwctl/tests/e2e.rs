@@ -1387,6 +1387,7 @@ fn test_annotate_host_capabilities(#[case] metadata_path: &str, #[case] expect_w
     let mut cmd = setup_command(tempdir.path());
     cmd.arg("--no-color")
         .arg("annotate")
+        .arg("--force")
         .arg("-m")
         .arg(test_data(metadata_path))
         .arg(&wasm_path)
@@ -1451,6 +1452,77 @@ fn test_annotate_rego(
     } else {
         cmd.assert().failure();
         cmd.assert().stderr(predicate);
+    }
+}
+
+#[rstest]
+#[case::without_force(false)]
+#[case::with_force(true)]
+fn test_annotate_already_annotated_policy(#[case] force: bool) {
+    let tempdir = tempdir().unwrap();
+    let annotated_wasm = tempdir.path().join("annotated.wasm");
+
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("annotate")
+        .arg("-m")
+        .arg(test_data("rego-annotate/metadata-correct.yml"))
+        .arg(test_data("rego-annotate/no-default-namespace-rego.wasm"))
+        .arg("-o")
+        .arg(&annotated_wasm);
+    cmd.assert().success();
+
+    // A second, distinct metadata file: the title changes so that the
+    // --force assertions below can tell "overwrote" apart from "kept the
+    // original and dropped the new one".
+    let new_title = "re-annotated-title";
+    let new_metadata = std::fs::read_to_string(test_data("rego-annotate/metadata-correct.yml"))
+        .unwrap()
+        .replace("disallow-service-loadbalancer", new_title);
+    let new_metadata_path = tempdir.path().join("metadata-new.yml");
+    std::fs::write(&new_metadata_path, new_metadata).unwrap();
+
+    let re_annotated_wasm = tempdir.path().join("re-annotated.wasm");
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("annotate");
+    if force {
+        cmd.arg("--force");
+    }
+    cmd.arg("-m")
+        .arg(&new_metadata_path)
+        .arg(&annotated_wasm)
+        .arg("-o")
+        .arg(&re_annotated_wasm);
+
+    if force {
+        cmd.assert().success().stderr(contains(
+            "policy is already annotated, overwriting existing metadata",
+        ));
+
+        let wasm_bytes = std::fs::read(&re_annotated_wasm).unwrap();
+        let module = walrus::Module::from_buffer(&wasm_bytes).unwrap();
+        let metadata_sections = module
+            .customs
+            .iter()
+            .filter(|(_, section)| section.name() == "io.kubewarden.metadata")
+            .count();
+        assert_eq!(metadata_sections, 1);
+
+        let metadata = policy_metadata::Metadata::from_path(&re_annotated_wasm)
+            .expect("cannot read metadata back")
+            .expect("metadata must be present");
+        assert_eq!(
+            metadata
+                .annotations
+                .unwrap()
+                .get("io.kubewarden.policy.title"),
+            Some(&new_title.to_string()),
+        );
+    } else {
+        cmd.assert().failure().stderr(contains("already annotated"));
+        assert!(
+            !re_annotated_wasm.exists(),
+            "no output file should be written when the command fails"
+        );
     }
 }
 

@@ -231,7 +231,14 @@ async fn main() -> Result<()> {
                 let usage_file = matches
                     .get_one::<String>("usage-path")
                     .map(|output| PathBuf::from_str(output).unwrap());
-                annotate::write_annotation(wasm_path, metadata_file, destination, usage_file)?;
+                let force = matches.get_flag("force");
+                annotate::write_annotation(
+                    wasm_path,
+                    metadata_file,
+                    destination,
+                    usage_file,
+                    force,
+                )?;
             }
             Ok(())
         }

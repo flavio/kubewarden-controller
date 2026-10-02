@@ -415,6 +415,11 @@ fn subcommand_annotate() -> Command {
             .required(true)
             .value_name("PATH")
             .help("Output file"),
+        Arg::new("force")
+            .short('f')
+            .long("force")
+            .action(ArgAction::SetTrue)
+            .help("Overwrite the metadata of a policy that is already annotated"),
     ];
     args.sort_by(|a, b| a.get_id().cmp(b.get_id()));
     args.push(

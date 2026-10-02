@@ -21,6 +21,7 @@ pub(crate) fn write_annotation(
     metadata_path: PathBuf,
     destination: PathBuf,
     usage_path: Option<PathBuf>,
+    force: bool,
 ) -> Result<()> {
     let usage = usage_path
         .map(|path| {
@@ -34,12 +35,46 @@ pub(crate) fn write_annotation(
     let mut module = walrus::Module::from_buffer(&wasm_bytes)
         .map_err(|e| anyhow!("Error parsing wasm module: {}", e))?;
 
+    remove_existing_metadata(&mut module, force)?;
+
     let detected_capabilities =
         wasm_scanner::scan(&module).map_err(|e| anyhow!("Error scanning wasm module: {}", e))?;
 
     let backend_detector = BackendDetector::default();
     let metadata = prepare_metadata(wasm_path, metadata_path, backend_detector, usage.as_deref())?;
     write_annotated_wasm_file(&mut module, destination, metadata, &detected_capabilities)
+}
+
+/// Checks whether `module` already carries a Kubewarden metadata custom
+/// section.
+///
+/// If none is present, this is a no-op. If one or more are present and
+/// `force` is `false`, this returns an error asking the user to pass
+/// `--force`. If one or more are present and `force` is `true`, all of them
+/// are removed so that a single, fresh metadata section can be added later.
+fn remove_existing_metadata(module: &mut walrus::Module, force: bool) -> Result<()> {
+    if module
+        .customs
+        .iter()
+        .all(|(_, section)| section.name() != KUBEWARDEN_CUSTOM_SECTION_METADATA)
+    {
+        return Ok(());
+    }
+
+    if !force {
+        return Err(anyhow!(
+            "The policy is already annotated. Use `annotate --force` to overwrite the existing metadata"
+        ));
+    }
+
+    warn!("policy is already annotated, overwriting existing metadata");
+    while module
+        .customs
+        .remove_raw(KUBEWARDEN_CUSTOM_SECTION_METADATA)
+        .is_some()
+    {}
+
+    Ok(())
 }
 
 fn prepare_metadata(
@@ -323,6 +358,55 @@ mod tests {
             .collect();
         assert_eq!(mismatch.used_but_undeclared, expected_used);
         assert_eq!(mismatch.declared_but_unused, expected_unused);
+    }
+
+    fn module_with_metadata_sections(count: usize) -> walrus::Module {
+        let mut module = walrus::Module::default();
+        for _ in 0..count {
+            module.customs.add(walrus::RawCustomSection {
+                name: String::from(KUBEWARDEN_CUSTOM_SECTION_METADATA),
+                data: b"{}".to_vec(),
+            });
+        }
+        module
+    }
+
+    fn metadata_section_count(module: &walrus::Module) -> usize {
+        module
+            .customs
+            .iter()
+            .filter(|(_, section)| section.name() == KUBEWARDEN_CUSTOM_SECTION_METADATA)
+            .count()
+    }
+
+    #[test]
+    fn remove_existing_metadata_is_a_noop_when_none_is_present() {
+        let mut module = module_with_metadata_sections(0);
+
+        assert!(remove_existing_metadata(&mut module, false).is_ok());
+        assert_eq!(metadata_section_count(&module), 0);
+    }
+
+    #[rstest]
+    #[case::single_existing_section(1)]
+    #[case::already_double_annotated(2)]
+    fn remove_existing_metadata_without_force_fails(#[case] existing_sections: usize) {
+        let mut module = module_with_metadata_sections(existing_sections);
+
+        let err = remove_existing_metadata(&mut module, false).unwrap_err();
+        assert!(err.to_string().contains("already annotated"));
+        // The module must be left untouched.
+        assert_eq!(metadata_section_count(&module), existing_sections);
+    }
+
+    #[rstest]
+    #[case::single_existing_section(1)]
+    #[case::already_double_annotated(2)]
+    fn remove_existing_metadata_with_force_removes_all(#[case] existing_sections: usize) {
+        let mut module = module_with_metadata_sections(existing_sections);
+
+        assert!(remove_existing_metadata(&mut module, true).is_ok());
+        assert_eq!(metadata_section_count(&module), 0);
     }
 
     fn mock_protocol_version_detector_v1(_wasm_path: PathBuf) -> Result<ProtocolVersion> {

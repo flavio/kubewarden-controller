@@ -73,6 +73,7 @@ Add Kubewarden metadata to a WebAssembly module
 
 === *Options:*
 
+* `-f`, `--force` — Overwrite the metadata of a policy that is already annotated
 * `-m`, `--metadata-path <PATH>` — File containing the metadata
 * `-o`, `--output-path <PATH>` — Output file
 * `-u`, `--usage-path <PATH>` — File containing the usage information of the policy
