@@ -1471,9 +1471,9 @@ fn test_annotate_already_annotated_policy(#[case] force: bool) {
         .arg(&annotated_wasm);
     cmd.assert().success();
 
-    // A second, distinct metadata file: the title changes so that the
-    // --force assertions below can tell "overwrote" apart from "kept the
-    // original and dropped the new one".
+    // A second metadata file, with a different title. This lets the
+    // assertions below tell apart "overwrote" from "kept the old metadata
+    // and dropped the new one".
     let new_title = "re-annotated-title";
     let new_metadata = std::fs::read_to_string(test_data("rego-annotate/metadata-correct.yml"))
         .unwrap()
@@ -1524,6 +1524,168 @@ fn test_annotate_already_annotated_policy(#[case] force: bool) {
             "no output file should be written when the command fails"
         );
     }
+}
+
+#[test]
+fn test_annotate_patch_a_single_annotation_on_an_already_annotated_policy() {
+    let tempdir = tempdir().unwrap();
+    let annotated_wasm = tempdir.path().join("annotated.wasm");
+
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("annotate")
+        .arg("-m")
+        .arg(test_data("rego-annotate/metadata-correct.yml"))
+        .arg(test_data("rego-annotate/no-default-namespace-rego.wasm"))
+        .arg("-o")
+        .arg(&annotated_wasm);
+    cmd.assert().success();
+
+    // No --metadata-path and no --force. Patching one annotation on an
+    // already annotated policy must succeed anyway.
+    let patched_wasm = tempdir.path().join("patched.wasm");
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("annotate")
+        .arg("-a")
+        .arg("io.kubewarden.policy.title=patched-via-annotation")
+        .arg(&annotated_wasm)
+        .arg("-o")
+        .arg(&patched_wasm);
+    // `title` is already set by the fixture, so overwriting it must warn.
+    cmd.assert()
+        .success()
+        .stderr(contains("overwriting an existing annotation"));
+
+    let wasm_bytes = std::fs::read(&patched_wasm).unwrap();
+    let module = walrus::Module::from_buffer(&wasm_bytes).unwrap();
+    let metadata_sections = module
+        .customs
+        .iter()
+        .filter(|(_, section)| section.name() == "io.kubewarden.metadata")
+        .count();
+    assert_eq!(metadata_sections, 1);
+
+    let metadata = policy_metadata::Metadata::from_path(&patched_wasm)
+        .expect("cannot read metadata back")
+        .expect("metadata must be present");
+    let annotations = metadata.annotations.unwrap();
+    // The targeted annotation changed.
+    assert_eq!(
+        annotations.get("io.kubewarden.policy.title"),
+        Some(&String::from("patched-via-annotation")),
+    );
+    // Every other annotation, and the rules, stayed the same.
+    assert_eq!(
+        annotations.get("io.kubewarden.policy.author"),
+        Some(&String::from("Flavio Castelli")),
+    );
+    assert_eq!(metadata.rules.len(), 1);
+}
+
+#[test]
+fn test_annotate_metadata_path_and_annotation_combined() {
+    let tempdir = tempdir().unwrap();
+    let wasm_path = tempdir.path().join("annotated.wasm");
+
+    // A call like a CI pipeline would make: a static metadata.yml, plus
+    // one value that is only known at release time.
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("annotate")
+        .arg("-m")
+        .arg(test_data("rego-annotate/metadata-correct.yml"))
+        .arg("-a")
+        .arg("io.kubewarden.policy.version=v9.9.9")
+        .arg(test_data("rego-annotate/no-default-namespace-rego.wasm"))
+        .arg("-o")
+        .arg(&wasm_path);
+    // `version` is absent from the fixture, so no key is overwritten.
+    cmd.assert()
+        .success()
+        .stderr(contains("overwriting an existing annotation").not());
+
+    let metadata = policy_metadata::Metadata::from_path(&wasm_path)
+        .expect("cannot read metadata back")
+        .expect("metadata must be present");
+    let annotations = metadata.annotations.unwrap();
+    assert_eq!(
+        annotations.get("io.kubewarden.policy.version"),
+        Some(&String::from("v9.9.9")),
+    );
+    // kwctl keeps the annotations that came from the file.
+    assert_eq!(
+        annotations.get("io.kubewarden.policy.title"),
+        Some(&String::from("disallow-service-loadbalancer")),
+    );
+}
+
+#[test]
+fn test_annotate_annotation_alone_requires_an_already_annotated_policy() {
+    let tempdir = tempdir().unwrap();
+
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("annotate")
+        .arg("-a")
+        .arg("io.kubewarden.policy.title=x")
+        .arg(test_data("rego-annotate/no-default-namespace-rego.wasm"))
+        .arg("-o")
+        .arg(tempdir.path().join("out.wasm"));
+
+    cmd.assert()
+        .failure()
+        .stderr(contains("not annotated"))
+        .stderr(contains("--metadata-path"));
+}
+
+#[test]
+fn test_annotate_rejects_a_malformed_annotation() {
+    let tempdir = tempdir().unwrap();
+
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("annotate")
+        .arg("-m")
+        .arg(test_data("rego-annotate/metadata-correct.yml"))
+        .arg("-a")
+        .arg("novalue")
+        .arg(test_data("rego-annotate/no-default-namespace-rego.wasm"))
+        .arg("-o")
+        .arg(tempdir.path().join("out.wasm"));
+
+    cmd.assert()
+        .failure()
+        .stderr(contains("expected KEY=VALUE or KEY=@PATH"));
+}
+
+#[test]
+fn test_annotate_annotation_value_from_file() {
+    let tempdir = tempdir().unwrap();
+    let usage_content = "line one\nline two\n";
+    let usage_file = tempdir.path().join("usage.md");
+    std::fs::write(&usage_file, usage_content).unwrap();
+
+    let wasm_path = tempdir.path().join("annotated.wasm");
+    let mut cmd = setup_command(tempdir.path());
+    cmd.arg("annotate")
+        .arg("-m")
+        .arg(test_data("rego-annotate/metadata-correct.yml"))
+        .arg("-a")
+        .arg(format!(
+            "io.kubewarden.policy.usage=@{}",
+            usage_file.display()
+        ))
+        .arg(test_data("rego-annotate/no-default-namespace-rego.wasm"))
+        .arg("-o")
+        .arg(&wasm_path);
+    cmd.assert().success();
+
+    let metadata = policy_metadata::Metadata::from_path(&wasm_path)
+        .expect("cannot read metadata back")
+        .expect("metadata must be present");
+    assert_eq!(
+        metadata
+            .annotations
+            .unwrap()
+            .get("io.kubewarden.policy.usage"),
+        Some(&String::from(usage_content)),
+    );
 }
 
 #[rstest]

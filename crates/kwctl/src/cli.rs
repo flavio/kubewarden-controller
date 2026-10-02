@@ -401,9 +401,20 @@ fn subcommand_annotate() -> Command {
         Arg::new("metadata-path")
             .long("metadata-path")
             .short('m')
-            .required(true)
+            .required_unless_present_any(["annotation", "usage-path"])
             .value_name("PATH")
             .help("File containing the metadata"),
+        Arg::new("annotation")
+            .long("annotation")
+            .short('a')
+            .action(ArgAction::Append)
+            .number_of_values(1)
+            .value_name("KEY=VALUE")
+            .help(
+                "Set a single metadata annotation. KEY=@PATH reads the value from a file. \
+                 Can be repeated. Without --metadata-path, the policy must already be \
+                 annotated",
+            ),
         Arg::new("usage-path")
             .long("usage-path")
             .short('u')
