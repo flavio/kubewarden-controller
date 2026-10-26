@@ -24,7 +24,6 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/api/validation"
 	validationutils "k8s.io/apimachinery/pkg/util/validation"
@@ -159,7 +158,7 @@ func (v *policyServerValidator) validate(ctx context.Context, policyServer *Poli
 		return nil
 	}
 
-	return apierrors.NewInvalid(GroupVersion.WithKind("PolicyServer").GroupKind(), policyServer.Name, allErrs)
+	return prepareInvalidAPIError(policyServer, allErrs)
 }
 
 // validateImagePullSecret validates that the specified PolicyServer imagePullSecret exists and is of type kubernetes.io/dockerconfigjson.
