@@ -29,6 +29,7 @@ import (
 	"k8s.io/apiserver/pkg/admission/plugin/webhook/matchconditions"
 	"k8s.io/apiserver/pkg/cel"
 	"k8s.io/apiserver/pkg/cel/environment"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/kubewarden/adm-controller/internal/constants"
 )
@@ -218,11 +219,11 @@ func validatePolicyModeField(oldPolicy, newPolicy Policy) *field.Error {
 	return nil
 }
 
-// prepareInvalidAPIError is a shorthand for generating an invalid apierrors.StatusError with data from a policy.
-func prepareInvalidAPIError(policy Policy, errorList field.ErrorList) *apierrors.StatusError {
+// prepareInvalidAPIError is a shorthand for generating an invalid apierrors.StatusError with data from an object.
+func prepareInvalidAPIError(obj client.Object, errorList field.ErrorList) *apierrors.StatusError {
 	return apierrors.NewInvalid(
-		policy.GetObjectKind().GroupVersionKind().GroupKind(),
-		policy.GetName(),
+		obj.GetObjectKind().GroupVersionKind().GroupKind(),
+		obj.GetName(),
 		errorList,
 	)
 }
