@@ -61,21 +61,9 @@ func injectCABundle(ctx context.Context, c client.Client, log logr.Logger, webho
 		return fmt.Errorf("cannot copy webhook configuration %q", webhookConfiguration.GetName())
 	}
 
-	var kind string
-	var clientConfigs []*admissionregistrationv1.WebhookClientConfig
-	switch typed := webhookConfiguration.(type) {
-	case *admissionregistrationv1.ValidatingWebhookConfiguration:
-		kind = "ValidatingWebhookConfiguration"
-		for i := range typed.Webhooks {
-			clientConfigs = append(clientConfigs, &typed.Webhooks[i].ClientConfig)
-		}
-	case *admissionregistrationv1.MutatingWebhookConfiguration:
-		kind = "MutatingWebhookConfiguration"
-		for i := range typed.Webhooks {
-			clientConfigs = append(clientConfigs, &typed.Webhooks[i].ClientConfig)
-		}
-	default:
-		return fmt.Errorf("cannot inject a CA bundle into %T", webhookConfiguration)
+	kind, clientConfigs, err := webhookClientConfigs(webhookConfiguration)
+	if err != nil {
+		return err
 	}
 
 	changed := false
@@ -91,10 +79,30 @@ func injectCABundle(ctx context.Context, c client.Client, log logr.Logger, webho
 
 	// The merge patch replaces the whole webhooks list. The optimistic lock makes a concurrent change of the object
 	// fail with a conflict, so that the reconcile runs again on the new object instead of overwriting it.
-	if err := c.Patch(ctx, webhookConfiguration, client.MergeFromWithOptions(original, client.MergeFromWithOptimisticLock{})); err != nil {
+	if err = c.Patch(ctx, webhookConfiguration, client.MergeFromWithOptions(original, client.MergeFromWithOptimisticLock{})); err != nil {
 		return fmt.Errorf("cannot patch the CA bundle of %s %q: %w", kind, webhookConfiguration.GetName(), err)
 	}
 	log.Info("Injected the CA bundle", "kind", kind, "name", webhookConfiguration.GetName())
 
 	return nil
+}
+
+// webhookClientConfigs returns the kind of a validating or a mutating webhook configuration, and a pointer to the
+// client configuration of each of its webhooks.
+func webhookClientConfigs(webhookConfiguration client.Object) (string, []*admissionregistrationv1.WebhookClientConfig, error) {
+	var clientConfigs []*admissionregistrationv1.WebhookClientConfig
+	switch typed := webhookConfiguration.(type) {
+	case *admissionregistrationv1.ValidatingWebhookConfiguration:
+		for i := range typed.Webhooks {
+			clientConfigs = append(clientConfigs, &typed.Webhooks[i].ClientConfig)
+		}
+		return "ValidatingWebhookConfiguration", clientConfigs, nil
+	case *admissionregistrationv1.MutatingWebhookConfiguration:
+		for i := range typed.Webhooks {
+			clientConfigs = append(clientConfigs, &typed.Webhooks[i].ClientConfig)
+		}
+		return "MutatingWebhookConfiguration", clientConfigs, nil
+	default:
+		return "", nil, fmt.Errorf("%T is not a webhook configuration", webhookConfiguration)
+	}
 }
