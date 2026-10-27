@@ -14,6 +14,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	policiesv1 "github.com/kubewarden/adm-controller/api/policies/v1"
+	"github.com/kubewarden/adm-controller/internal/certs"
 	"github.com/kubewarden/adm-controller/internal/constants"
 )
 
@@ -62,7 +63,7 @@ func (r *policySubReconciler) reconcileValidatingWebhookConfiguration(
 				Name: policy.GetUniqueName() + constants.WebhookNameSuffix,
 				ClientConfig: admissionregistrationv1.WebhookClientConfig{
 					Service:  &service,
-					CABundle: admissionSecret.Data[constants.CARootCert],
+					CABundle: certs.CABundleFromSecret(admissionSecret),
 				},
 				Rules:                   policy.GetRules(),
 				FailurePolicy:           policy.GetFailurePolicy(),
@@ -149,7 +150,7 @@ func (r *policySubReconciler) reconcileMutatingWebhookConfiguration(
 				Name: policy.GetUniqueName() + constants.WebhookNameSuffix,
 				ClientConfig: admissionregistrationv1.WebhookClientConfig{
 					Service:  &service,
-					CABundle: admissionSecret.Data[constants.CARootCert],
+					CABundle: certs.CABundleFromSecret(admissionSecret),
 				},
 				Rules:                   policy.GetRules(),
 				FailurePolicy:           policy.GetFailurePolicy(),
@@ -191,6 +192,25 @@ func (r *policySubReconciler) reconcileMutatingWebhookConfigurationDeletion(ctx 
 	}
 
 	return nil
+}
+
+// reconcileWebhookConfigurationCABundle writes the CA bundle of the CA root secret into the existing webhook
+// configuration of the policy, if its caBundle differs. It does not create the webhook configuration, and it does not
+// change its other fields. Unlike reconcileWebhookConfiguration, it does not wait until the policy server is uniquely
+// reachable. During a stalled rollout, the pods that still serve load the certificates that a new CA root signs, and
+// the webhook configuration must trust that CA root.
+func (r *policySubReconciler) reconcileWebhookConfigurationCABundle(ctx context.Context, policy policiesv1.Policy, caRootSecret *corev1.Secret) error {
+	var webhook client.Object = &admissionregistrationv1.ValidatingWebhookConfiguration{}
+	if policy.IsMutating() {
+		webhook = &admissionregistrationv1.MutatingWebhookConfiguration{}
+	}
+	if err := r.Get(ctx, types.NamespacedName{Name: policy.GetUniqueName()}, webhook); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("cannot retrieve webhook configuration: %w", err)
+	}
+	return injectCABundle(ctx, r.Client, r.Log, webhook, certs.CABundleFromSecret(caRootSecret))
 }
 
 func (r *policySubReconciler) namespaceSelector(policy policiesv1.Policy) *metav1.LabelSelector {
