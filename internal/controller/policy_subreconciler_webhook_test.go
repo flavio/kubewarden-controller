@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -64,6 +65,54 @@ var _ = Describe("Policy webhook configuration CA bundle", func() {
 		})
 		Expect(mutatingWebhookConfiguration.Webhooks).To(HaveLen(1))
 		Expect(mutatingWebhookConfiguration.Webhooks[0].ClientConfig.CABundle).To(Equal(expectedCABundle))
+	})
+
+	It("should refresh only the CA bundle of an existing webhook configuration, and create none", func() {
+		caCert, _, err := certs.GenerateCA(time.Now(), time.Now().Add(constants.CACertExpiration))
+		Expect(err).ToNot(HaveOccurred())
+		oldCACert, _, err := certs.GenerateCA(time.Now().Add(-constants.CACertExpiration), time.Now().Add(constants.CertLookahead))
+		Expect(err).ToNot(HaveOccurred())
+		caRootSecret := &corev1.Secret{Data: map[string][]byte{constants.CARootCert: caCert}}
+		rotatedCARootSecret := &corev1.Secret{Data: map[string][]byte{
+			constants.CARootCert:    caCert,
+			constants.OldCARootCert: oldCACert,
+		}}
+
+		r := &policySubReconciler{
+			Client:               k8sClient,
+			deploymentsNamespace: deploymentsNamespace,
+		}
+		// The rules match a resource that does not exist, so that the webhook configurations do not intercept the
+		// requests of the other specs.
+		rules := []admissionregistrationv1.RuleWithOperations{
+			newRule([]string{"cabundle.kubewarden.test"}, []string{"nothings"}),
+		}
+
+		By("refreshing the CA bundle of an existing mutating webhook configuration")
+		mutatingPolicy := policiesv1.NewClusterAdmissionPolicyFactory().WithRules(rules).WithMutating(true).Build()
+		Expect(r.reconcileMutatingWebhookConfiguration(ctx, mutatingPolicy, caRootSecret, "policy-server-cabundle")).To(Succeed())
+		before := &admissionregistrationv1.MutatingWebhookConfiguration{}
+		Expect(k8sClient.Get(ctx, client.ObjectKey{Name: mutatingPolicy.GetUniqueName()}, before)).To(Succeed())
+		DeferCleanup(func() {
+			Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, before))).To(Succeed())
+		})
+
+		Expect(r.reconcileWebhookConfigurationCABundle(ctx, mutatingPolicy, rotatedCARootSecret)).To(Succeed())
+
+		after := &admissionregistrationv1.MutatingWebhookConfiguration{}
+		Expect(k8sClient.Get(ctx, client.ObjectKey{Name: mutatingPolicy.GetUniqueName()}, after)).To(Succeed())
+		Expect(after.Webhooks).To(HaveLen(1))
+		Expect(after.Webhooks[0].ClientConfig.CABundle).To(Equal(certs.CABundleFromSecret(rotatedCARootSecret)))
+		Expect(after.Webhooks[0].ClientConfig.Service).To(Equal(before.Webhooks[0].ClientConfig.Service))
+		Expect(after.Webhooks[0].Rules).To(Equal(before.Webhooks[0].Rules))
+		Expect(after.Labels).To(Equal(before.Labels))
+		Expect(after.Annotations).To(Equal(before.Annotations))
+
+		By("not creating a webhook configuration for a policy that has none")
+		validatingPolicy := policiesv1.NewClusterAdmissionPolicyFactory().WithRules(rules).Build()
+		Expect(r.reconcileWebhookConfigurationCABundle(ctx, validatingPolicy, rotatedCARootSecret)).To(Succeed())
+		err = k8sClient.Get(ctx, client.ObjectKey{Name: validatingPolicy.GetUniqueName()}, &admissionregistrationv1.ValidatingWebhookConfiguration{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
 	})
 })
 

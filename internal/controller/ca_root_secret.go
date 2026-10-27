@@ -2,7 +2,12 @@ package controller
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 
+	"github.com/go-logr/logr"
+
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -45,4 +50,51 @@ func caRootSecretPredicate(namespace, name string) predicate.Funcs {
 			return false
 		},
 	}
+}
+
+// injectCABundle sets caBundle in every webhook of a validating or a mutating webhook configuration. If a value
+// changed, it patches the object and logs the change. It is the only code that writes caBundle into an existing
+// webhook configuration.
+func injectCABundle(ctx context.Context, c client.Client, log logr.Logger, webhookConfiguration client.Object, caBundle []byte) error {
+	original, ok := webhookConfiguration.DeepCopyObject().(client.Object)
+	if !ok {
+		return fmt.Errorf("cannot copy webhook configuration %q", webhookConfiguration.GetName())
+	}
+
+	var kind string
+	var clientConfigs []*admissionregistrationv1.WebhookClientConfig
+	switch typed := webhookConfiguration.(type) {
+	case *admissionregistrationv1.ValidatingWebhookConfiguration:
+		kind = "ValidatingWebhookConfiguration"
+		for i := range typed.Webhooks {
+			clientConfigs = append(clientConfigs, &typed.Webhooks[i].ClientConfig)
+		}
+	case *admissionregistrationv1.MutatingWebhookConfiguration:
+		kind = "MutatingWebhookConfiguration"
+		for i := range typed.Webhooks {
+			clientConfigs = append(clientConfigs, &typed.Webhooks[i].ClientConfig)
+		}
+	default:
+		return fmt.Errorf("cannot inject a CA bundle into %T", webhookConfiguration)
+	}
+
+	changed := false
+	for _, clientConfig := range clientConfigs {
+		if !bytes.Equal(clientConfig.CABundle, caBundle) {
+			clientConfig.CABundle = caBundle
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+
+	// The merge patch replaces the whole webhooks list. The optimistic lock makes a concurrent change of the object
+	// fail with a conflict, so that the reconcile runs again on the new object instead of overwriting it.
+	if err := c.Patch(ctx, webhookConfiguration, client.MergeFromWithOptions(original, client.MergeFromWithOptimisticLock{})); err != nil {
+		return fmt.Errorf("cannot patch the CA bundle of %s %q: %w", kind, webhookConfiguration.GetName(), err)
+	}
+	log.Info("Injected the CA bundle", "kind", kind, "name", webhookConfiguration.GetName())
+
+	return nil
 }

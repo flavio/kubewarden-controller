@@ -113,6 +113,17 @@ func (r *policySubReconciler) reconcilePolicy(ctx context.Context, policy polici
 		return ctrl.Result{}, errors.Join(errors.New("could not read policy server Deployment"), err)
 	}
 
+	secret := corev1.Secret{}
+	if err = r.Get(ctx, types.NamespacedName{Namespace: r.deploymentsNamespace, Name: constants.CARootSecretName}, &secret); err != nil {
+		return ctrl.Result{}, errors.Join(errors.New("cannot find policy server secret"), err)
+	}
+
+	// The check of the reachability below guards the creation and the activation of the webhook configuration. A
+	// rotation of the CA root must not wait for it.
+	if err = r.reconcileWebhookConfigurationCABundle(ctx, policy, &secret); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	if !r.isPolicyUniquelyReachable(ctx, &policyServerDeployment, policy.GetUniqueName()) {
 		apimeta.SetStatusCondition(
 			&policy.GetStatus().Conditions,
@@ -135,11 +146,6 @@ func (r *policySubReconciler) reconcilePolicy(ctx context.Context, policy polici
 			Message: "The latest replica set is uniquely reachable",
 		},
 	)
-
-	secret := corev1.Secret{}
-	if err = r.Get(ctx, types.NamespacedName{Namespace: r.deploymentsNamespace, Name: constants.CARootSecretName}, &secret); err != nil {
-		return ctrl.Result{}, errors.Join(errors.New("cannot find policy server secret"), err)
-	}
 
 	// Add the controller's finalizer here to avoid webhook orphans
 	if !controllerutil.ContainsFinalizer(policy, constants.KubewardenFinalizer) {

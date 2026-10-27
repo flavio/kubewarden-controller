@@ -1,7 +1,6 @@
 package controller
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -96,86 +95,33 @@ func (r *WebhookCABundleReconciler) Reconcile(ctx context.Context, _ ctrl.Reques
 	}
 	caBundle := certs.CABundleFromSecret(caRootSecret)
 
-	if err := r.reconcileValidatingWebhookConfigurations(ctx, caBundle); err != nil {
-		return ctrl.Result{}, err
+	validatingWebhookConfigurations := &admissionregistrationv1.ValidatingWebhookConfigurationList{}
+	if err := r.List(ctx, validatingWebhookConfigurations); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to list validating webhook configurations: %w", err)
 	}
-	if err := r.reconcileMutatingWebhookConfigurations(ctx, caBundle); err != nil {
-		return ctrl.Result{}, err
+	mutatingWebhookConfigurations := &admissionregistrationv1.MutatingWebhookConfigurationList{}
+	if err := r.List(ctx, mutatingWebhookConfigurations); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to list mutating webhook configurations: %w", err)
+	}
+
+	webhookConfigurations := make([]client.Object, 0, len(validatingWebhookConfigurations.Items)+len(mutatingWebhookConfigurations.Items))
+	for i := range validatingWebhookConfigurations.Items {
+		webhookConfigurations = append(webhookConfigurations, &validatingWebhookConfigurations.Items[i])
+	}
+	for i := range mutatingWebhookConfigurations.Items {
+		webhookConfigurations = append(webhookConfigurations, &mutatingWebhookConfigurations.Items[i])
+	}
+
+	for _, webhookConfiguration := range webhookConfigurations {
+		if !r.injectsCABundle(webhookConfiguration) {
+			continue
+		}
+		if err := injectCABundle(ctx, r.Client, r.Log, webhookConfiguration, caBundle); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	return ctrl.Result{}, nil
-}
-
-//nolint:dupl // This function is similar to reconcileMutatingWebhookConfigurations
-func (r *WebhookCABundleReconciler) reconcileValidatingWebhookConfigurations(ctx context.Context, caBundle []byte) error {
-	webhookConfigurations := &admissionregistrationv1.ValidatingWebhookConfigurationList{}
-	if err := r.List(ctx, webhookConfigurations); err != nil {
-		return fmt.Errorf("failed to list validating webhook configurations: %w", err)
-	}
-
-	for i := range webhookConfigurations.Items {
-		webhookConfiguration := &webhookConfigurations.Items[i]
-		if !r.injectsCABundle(webhookConfiguration) {
-			continue
-		}
-
-		original := webhookConfiguration.DeepCopy()
-		changed := false
-		for j := range webhookConfiguration.Webhooks {
-			if !bytes.Equal(webhookConfiguration.Webhooks[j].ClientConfig.CABundle, caBundle) {
-				webhookConfiguration.Webhooks[j].ClientConfig.CABundle = caBundle
-				changed = true
-			}
-		}
-		if !changed {
-			continue
-		}
-
-		// The merge patch replaces the whole webhooks list. The optimistic lock makes a concurrent change of the
-		// object fail with a conflict, so that the reconcile runs again on the new object instead of overwriting it.
-		if err := r.Patch(ctx, webhookConfiguration, client.MergeFromWithOptions(original, client.MergeFromWithOptimisticLock{})); err != nil {
-			return fmt.Errorf("failed to patch validating webhook configuration %q: %w", webhookConfiguration.Name, err)
-		}
-		r.Log.Info("Injected the CA bundle", "kind", "ValidatingWebhookConfiguration", "name", webhookConfiguration.Name)
-	}
-
-	return nil
-}
-
-//nolint:dupl // This function is similar to reconcileValidatingWebhookConfigurations
-func (r *WebhookCABundleReconciler) reconcileMutatingWebhookConfigurations(ctx context.Context, caBundle []byte) error {
-	webhookConfigurations := &admissionregistrationv1.MutatingWebhookConfigurationList{}
-	if err := r.List(ctx, webhookConfigurations); err != nil {
-		return fmt.Errorf("failed to list mutating webhook configurations: %w", err)
-	}
-
-	for i := range webhookConfigurations.Items {
-		webhookConfiguration := &webhookConfigurations.Items[i]
-		if !r.injectsCABundle(webhookConfiguration) {
-			continue
-		}
-
-		original := webhookConfiguration.DeepCopy()
-		changed := false
-		for j := range webhookConfiguration.Webhooks {
-			if !bytes.Equal(webhookConfiguration.Webhooks[j].ClientConfig.CABundle, caBundle) {
-				webhookConfiguration.Webhooks[j].ClientConfig.CABundle = caBundle
-				changed = true
-			}
-		}
-		if !changed {
-			continue
-		}
-
-		// The merge patch replaces the whole webhooks list. The optimistic lock makes a concurrent change of the
-		// object fail with a conflict, so that the reconcile runs again on the new object instead of overwriting it.
-		if err := r.Patch(ctx, webhookConfiguration, client.MergeFromWithOptions(original, client.MergeFromWithOptimisticLock{})); err != nil {
-			return fmt.Errorf("failed to patch mutating webhook configuration %q: %w", webhookConfiguration.Name, err)
-		}
-		r.Log.Info("Injected the CA bundle", "kind", "MutatingWebhookConfiguration", "name", webhookConfiguration.Name)
-	}
-
-	return nil
 }
 
 // injectsCABundle returns true if the annotation kubewarden.io/inject-ca-from of the object names the CA root secret.
