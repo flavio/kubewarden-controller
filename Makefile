@@ -54,9 +54,11 @@ test-e2e: controller-image audit-scanner-image policy-server-image
 
 # Run the e2e tests against images that already exist in the local
 # docker daemon (for example, images that CI built and loaded).
+# Each e2e package creates its own kind cluster. -p 1 runs the packages one
+# after the other, so that only one cluster runs at a time.
 .PHONY: test-e2e-run
 test-e2e-run:
-	$(GO_BUILD_ENV) go test ./e2e/ -v -timeout 45m
+	$(GO_BUILD_ENV) go test ./e2e/... -v -timeout 45m -p 1
 
 .PHONY: test-all
 test-all: test helm-unittest test-e2e
